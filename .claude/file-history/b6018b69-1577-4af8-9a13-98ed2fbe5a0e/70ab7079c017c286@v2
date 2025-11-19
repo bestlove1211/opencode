@@ -1,0 +1,68 @@
+const express = require('express');
+const router = express.Router();
+const { body, param, validationResult } = require('express-validator');
+const accountController = require('../controllers/accountController');
+
+// Validation middleware
+const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  next();
+};
+
+/**
+ * GET /api/accounts/:walletAddress
+ * Get account information for a wallet address
+ */
+router.get(
+  '/:walletAddress',
+  [
+    param('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid Ethereum address')
+  ],
+  validate,
+  accountController.getAccountInfo
+);
+
+/**
+ * GET /api/accounts/:walletAddress/:tokenAddress
+ * Get specific token account information
+ */
+router.get(
+  '/:walletAddress/:tokenAddress',
+  [
+    param('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid Ethereum address'),
+    param('tokenAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid token address')
+  ],
+  validate,
+  accountController.getTokenAccountInfo
+);
+
+/**
+ * POST /api/accounts/sync
+ * Sync account data from blockchain
+ */
+router.post(
+  '/sync',
+  [
+    body('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid Ethereum address')
+  ],
+  validate,
+  accountController.syncAccount
+);
+
+/**
+ * GET /api/accounts/:walletAddress/interest
+ * Calculate pending interest for all accounts
+ */
+router.get(
+  '/:walletAddress/interest',
+  [
+    param('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid Ethereum address')
+  ],
+  validate,
+  accountController.getPendingInterest
+);
+
+module.exports = router;

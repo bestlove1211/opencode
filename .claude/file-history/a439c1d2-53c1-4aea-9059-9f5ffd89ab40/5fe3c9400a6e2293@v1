@@ -1,0 +1,425 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/ICollateralManager.sol";
+
+/**
+ * @title CollateralManager
+ * @notice Manages collateral for loans in the Bancafi Credit platform
+ * @dev Handles locking, releasing, and liquidating collateral with price oracle integration
+ */
+contract CollateralManager is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    ICollateralManager
+{
+    using SafeERC20 for IERC20;
+
+    // ============ Structs ============
+
+    struct CollateralLock {
+        uint256 id;
+        address user;
+        address asset;
+        uint256 amount;
+        uint256 lockedAt;
+        bool isActive;
+    }
+
+    struct AssetConfig {
+        bool isSupported;
+        uint256 liquidationThreshold; // in basis points (8000 = 80%)
+        uint256 minCollateralRatio; // in basis points (15000 = 150%)
+        address priceOracle;
+    }
+
+    // ============ State Variables ============
+
+    uint256 public nextLockId;
+    uint256 public constant BASIS_POINTS = 10000;
+
+    mapping(uint256 => CollateralLock) public collateralLocks;
+    mapping(address => mapping(address => uint256)) public userCollateralBalance; // user => asset => amount
+    mapping(address => uint256[]) public userLocks;
+    mapping(address => AssetConfig) public assetConfigs;
+    mapping(address => bool) public authorizedCallers; // Contracts that can manage collateral
+
+    // Simple price storage (in production, use Chainlink or similar oracle)
+    mapping(address => uint256) public assetPrices; // asset => price in USD (18 decimals)
+
+    // ============ Events ============
+    // (Inherited from ICollateralManager)
+
+    event AuthorizedCallerUpdated(address indexed caller, bool authorized);
+    event AssetConfigured(
+        address indexed asset,
+        bool isSupported,
+        uint256 liquidationThreshold,
+        uint256 minCollateralRatio
+    );
+    event AssetPriceUpdated(address indexed asset, uint256 oldPrice, uint256 newPrice);
+
+    // ============ Modifiers ============
+
+    modifier onlyAuthorized() {
+        require(
+            authorizedCallers[msg.sender] || msg.sender == owner(),
+            "Not authorized"
+        );
+        _;
+    }
+
+    modifier validAsset(address asset) {
+        require(assetConfigs[asset].isSupported, "Asset not supported");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize() public initializer {
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        nextLockId = 1;
+    }
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Lock collateral for a loan
+     * @param user User address
+     * @param asset Collateral asset address
+     * @param amount Amount to lock
+     * @return lockId Unique identifier for this collateral lock
+     */
+    function lockCollateral(
+        address user,
+        address asset,
+        uint256 amount
+    ) external override onlyAuthorized whenNotPaused validAsset(asset) returns (uint256) {
+        require(user != address(0), "Invalid user address");
+        require(amount > 0, "Amount must be positive");
+
+        uint256 lockId = nextLockId++;
+
+        collateralLocks[lockId] = CollateralLock({
+            id: lockId,
+            user: user,
+            asset: asset,
+            amount: amount,
+            lockedAt: block.timestamp,
+            isActive: true
+        });
+
+        userCollateralBalance[user][asset] += amount;
+        userLocks[user].push(lockId);
+
+        emit CollateralLocked(user, asset, amount, lockId);
+
+        return lockId;
+    }
+
+    /**
+     * @notice Release locked collateral
+     * @param user User address
+     * @param asset Collateral asset address
+     * @param amount Amount to release
+     */
+    function releaseCollateral(
+        address user,
+        address asset,
+        uint256 amount
+    ) external override onlyAuthorized nonReentrant {
+        require(user != address(0), "Invalid user address");
+        require(amount > 0, "Amount must be positive");
+        require(userCollateralBalance[user][asset] >= amount, "Insufficient collateral");
+
+        userCollateralBalance[user][asset] -= amount;
+
+        // Find and deactivate corresponding lock(s)
+        _deactivateLocks(user, asset, amount);
+
+        IERC20(asset).safeTransfer(user, amount);
+
+        emit CollateralReleased(user, asset, amount, 0); // lockId can be tracked if needed
+    }
+
+    /**
+     * @notice Liquidate collateral
+     * @param user User address
+     * @param recipient Recipient of liquidated collateral
+     * @param asset Collateral asset address
+     * @param amount Amount to liquidate
+     */
+    function liquidateCollateral(
+        address user,
+        address recipient,
+        address asset,
+        uint256 amount
+    ) external override onlyAuthorized nonReentrant {
+        require(user != address(0), "Invalid user address");
+        require(recipient != address(0), "Invalid recipient address");
+        require(amount > 0, "Amount must be positive");
+        require(userCollateralBalance[user][asset] >= amount, "Insufficient collateral");
+
+        userCollateralBalance[user][asset] -= amount;
+
+        // Find and deactivate corresponding lock(s)
+        _deactivateLocks(user, asset, amount);
+
+        IERC20(asset).safeTransfer(recipient, amount);
+
+        emit CollateralLiquidated(user, recipient, asset, amount);
+    }
+
+    /**
+     * @notice Get collateral value in USD
+     * @param asset Collateral asset address
+     * @param amount Amount of collateral
+     * @return value Value in USD (18 decimals)
+     */
+    function getCollateralValue(
+        address asset,
+        uint256 amount
+    ) external view override returns (uint256) {
+        uint256 price = assetPrices[asset];
+        require(price > 0, "Price not set");
+
+        // Assuming asset has 18 decimals
+        return (amount * price) / 1e18;
+    }
+
+    /**
+     * @notice Get user's total locked collateral
+     * @param user User address
+     * @param asset Asset address
+     * @return Total locked amount
+     */
+    function getUserCollateral(
+        address user,
+        address asset
+    ) external view override returns (uint256) {
+        return userCollateralBalance[user][asset];
+    }
+
+    /**
+     * @notice Check if user has sufficient collateral
+     * @param user User address
+     * @param asset Asset address
+     * @param requiredAmount Required amount
+     * @return Whether user has sufficient collateral
+     */
+    function hasSufficientCollateral(
+        address user,
+        address asset,
+        uint256 requiredAmount
+    ) external view override returns (bool) {
+        return userCollateralBalance[user][asset] >= requiredAmount;
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get user's lock IDs
+     * @param user User address
+     * @return Array of lock IDs
+     */
+    function getUserLocks(address user) external view returns (uint256[] memory) {
+        return userLocks[user];
+    }
+
+    /**
+     * @notice Get collateral lock details
+     * @param lockId Lock ID
+     * @return CollateralLock struct
+     */
+    function getCollateralLock(uint256 lockId) external view returns (CollateralLock memory) {
+        return collateralLocks[lockId];
+    }
+
+    /**
+     * @notice Get asset configuration
+     * @param asset Asset address
+     * @return AssetConfig struct
+     */
+    function getAssetConfig(address asset) external view returns (AssetConfig memory) {
+        return assetConfigs[asset];
+    }
+
+    /**
+     * @notice Calculate required collateral amount for a loan
+     * @param loanAsset Loan asset address
+     * @param loanAmount Loan amount
+     * @param collateralAsset Collateral asset address
+     * @return Required collateral amount
+     */
+    function calculateRequiredCollateral(
+        address loanAsset,
+        uint256 loanAmount,
+        address collateralAsset
+    ) external view returns (uint256) {
+        uint256 loanValue = (loanAmount * assetPrices[loanAsset]) / 1e18;
+        uint256 collateralPrice = assetPrices[collateralAsset];
+        require(collateralPrice > 0, "Collateral price not set");
+
+        AssetConfig memory config = assetConfigs[collateralAsset];
+        uint256 requiredValue = (loanValue * config.minCollateralRatio) / BASIS_POINTS;
+
+        return (requiredValue * 1e18) / collateralPrice;
+    }
+
+    /**
+     * @notice Check if position is healthy (not under-collateralized)
+     * @param loanAsset Loan asset address
+     * @param loanAmount Loan amount
+     * @param collateralAsset Collateral asset address
+     * @param collateralAmount Collateral amount
+     * @return Whether position is healthy
+     */
+    function isPositionHealthy(
+        address loanAsset,
+        uint256 loanAmount,
+        address collateralAsset,
+        uint256 collateralAmount
+    ) external view returns (bool) {
+        uint256 loanValue = (loanAmount * assetPrices[loanAsset]) / 1e18;
+        uint256 collateralValue = (collateralAmount * assetPrices[collateralAsset]) / 1e18;
+
+        AssetConfig memory config = assetConfigs[collateralAsset];
+        uint256 minCollateralValue = (loanValue * config.minCollateralRatio) / BASIS_POINTS;
+
+        return collateralValue >= minCollateralValue;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Configure asset parameters
+     * @param asset Asset address
+     * @param isSupported Whether asset is supported
+     * @param liquidationThreshold Liquidation threshold in basis points
+     * @param minCollateralRatio Minimum collateral ratio in basis points
+     * @param priceOracle Price oracle address (for future use)
+     */
+    function configureAsset(
+        address asset,
+        bool isSupported,
+        uint256 liquidationThreshold,
+        uint256 minCollateralRatio,
+        address priceOracle
+    ) external onlyOwner {
+        require(asset != address(0), "Invalid asset address");
+        require(liquidationThreshold <= BASIS_POINTS, "Invalid liquidation threshold");
+        require(minCollateralRatio >= BASIS_POINTS, "Collateral ratio must be >= 100%");
+
+        assetConfigs[asset] = AssetConfig({
+            isSupported: isSupported,
+            liquidationThreshold: liquidationThreshold,
+            minCollateralRatio: minCollateralRatio,
+            priceOracle: priceOracle
+        });
+
+        emit AssetConfigured(asset, isSupported, liquidationThreshold, minCollateralRatio);
+    }
+
+    /**
+     * @notice Update asset price (temporary - use oracle in production)
+     * @param asset Asset address
+     * @param price Price in USD (18 decimals)
+     */
+    function updateAssetPrice(address asset, uint256 price) external onlyOwner {
+        require(asset != address(0), "Invalid asset address");
+        require(price > 0, "Price must be positive");
+
+        uint256 oldPrice = assetPrices[asset];
+        assetPrices[asset] = price;
+
+        emit AssetPriceUpdated(asset, oldPrice, price);
+        emit CollateralValueUpdated(asset, oldPrice, price);
+    }
+
+    /**
+     * @notice Set authorized caller status
+     * @param caller Address to authorize/deauthorize
+     * @param authorized Authorization status
+     */
+    function setAuthorizedCaller(address caller, bool authorized) external onlyOwner {
+        require(caller != address(0), "Invalid caller address");
+        authorizedCallers[caller] = authorized;
+        emit AuthorizedCallerUpdated(caller, authorized);
+    }
+
+    /**
+     * @notice Pause the contract
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @notice Emergency withdrawal function
+     * @param asset Asset address
+     * @param amount Amount to withdraw
+     * @param recipient Recipient address
+     */
+    function emergencyWithdraw(
+        address asset,
+        uint256 amount,
+        address recipient
+    ) external onlyOwner {
+        require(recipient != address(0), "Invalid recipient");
+        IERC20(asset).safeTransfer(recipient, amount);
+    }
+
+    // ============ Internal Functions ============
+
+    function _deactivateLocks(address user, address asset, uint256 amount) internal {
+        uint256[] memory locks = userLocks[user];
+        uint256 remaining = amount;
+
+        for (uint256 i = 0; i < locks.length && remaining > 0; i++) {
+            CollateralLock storage lock = collateralLocks[locks[i]];
+
+            if (lock.isActive && lock.asset == asset) {
+                if (lock.amount <= remaining) {
+                    remaining -= lock.amount;
+                    lock.isActive = false;
+                } else {
+                    lock.amount -= remaining;
+                    remaining = 0;
+                }
+            }
+        }
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    /**
+     * @dev Reserved storage space for future versions
+     */
+    uint256[50] private __gap;
+}

@@ -1,0 +1,394 @@
+# Bancafi Savings Account - User Guide
+
+## What is Bancafi Savings Account?
+
+Bancafi Savings Account is a blockchain-based savings platform that works just like a traditional bank savings account, but with cryptocurrency. You can deposit your crypto, earn interest automatically, and withdraw anytime.
+
+## Key Benefits
+
+- **Earn 4.5% - 7% APY**: Competitive interest rates on your crypto
+- **No Lock-up Period**: Withdraw anytime without penalties
+- **Automatic Interest**: Your interest compounds automatically
+- **Secure & Transparent**: Protected by blockchain technology
+- **Multi-Token Support**: Save in your preferred cryptocurrency
+
+---
+
+## Getting Started
+
+### Step 1: Connect Your Wallet
+
+1. Visit the Bancafi Savings platform
+2. Click "Connect Wallet"
+3. Choose your wallet (MetaMask, WalletConnect, etc.)
+4. Approve the connection
+
+### Step 2: Choose Your Token
+
+Select which cryptocurrency you want to save:
+- USDC
+- USDT
+- DAI
+- (Other supported tokens)
+
+### Step 3: Make Your First Deposit
+
+1. Click "Deposit"
+2. Enter the amount (minimum 10 tokens)
+3. Approve the transaction in your wallet
+4. Wait for confirmation
+
+Congratulations! You're now earning interest!
+
+---
+
+## Understanding Interest Rates
+
+### Base Rate: 4.5% APY
+
+All accounts start earning 4.5% annual interest from day one.
+
+**Example:**
+- Deposit: $1,000
+- After 1 year: $1,045
+- Interest earned: $45
+
+### Loyalty Bonus: +2.5% APY
+
+After 90 days, you earn a bonus rate, bringing your total to 7% APY!
+
+**Example:**
+- Deposit: $1,000
+- After 1 year (with bonus): $1,070
+- Interest earned: $70
+
+### When Does Interest Get Paid?
+
+Interest is automatically added to your balance whenever you:
+- Make a new deposit
+- Withdraw funds
+- Manually claim interest
+
+**Important:** Interest is calculated every second, but only added to your balance during these actions.
+
+---
+
+## How to Use Your Account
+
+### Making Deposits
+
+1. Go to your Dashboard
+2. Click "Deposit"
+3. Select token and enter amount
+4. Approve two transactions:
+   - Token approval (one-time per token)
+   - Deposit transaction
+5. Wait for confirmation
+
+**Tips:**
+- Minimum deposit: 10 tokens
+- You can deposit multiple times
+- Each deposit triggers interest claim on previous balance
+
+### Withdrawing Funds
+
+1. Go to your Dashboard
+2. Click "Withdraw"
+3. Enter amount (or select "Withdraw All")
+4. Approve transaction
+5. Funds sent to your wallet
+
+**Important:**
+- No withdrawal fees
+- No penalties for early withdrawal
+- Interest is automatically added before withdrawal
+
+### Checking Your Balance
+
+Your dashboard shows:
+- **Current Balance**: Your total (deposits + interest)
+- **Total Interest Earned**: Cumulative interest
+- **Current APY**: Your interest rate (4.5% or 7%)
+- **Pending Interest**: Interest earned since last update
+- **Account Age**: Days since account opened
+
+### Claiming Interest
+
+You can manually claim interest without withdrawing:
+
+1. Click "Claim Interest"
+2. Approve transaction
+3. Interest is added to your balance
+
+**When to claim:**
+- You want to compound interest sooner
+- You want to see updated balance
+- Before making financial decisions
+
+---
+
+## Understanding Your Dashboard
+
+### Account Overview
+
+```
+┌─────────────────────────────────────────┐
+│ Your Savings Account                     │
+├─────────────────────────────────────────┤
+│ Token: USDC                              │
+│ Balance: 1,045.50 USDC                   │
+│ Interest Earned: 45.50 USDC              │
+│ Current APY: 4.5%                        │
+│ Pending Interest: 0.15 USDC              │
+│ Account Age: 45 days                     │
+│                                          │
+│ [Deposit] [Withdraw] [Claim Interest]   │
+└─────────────────────────────────────────┘
+```
+
+### Transaction History
+
+See all your activity:
+- Deposits
+- Withdrawals
+- Interest payments
+
+Each transaction shows:
+- Date & time
+- Type
+- Amount
+- Transaction hash (blockchain proof)
+
+---
+
+## Frequently Asked Questions
+
+### General Questions
+
+**Q: Is my money safe?**
+A: Yes. Your funds are protected by:
+- Audited smart contracts
+- Blockchain security
+- No central point of failure
+- You always control your wallet
+
+**Q: Can I lose money?**
+A: Your principal is safe. The main risks are:
+- Smart contract risks (minimized through audits)
+- Token price volatility (if using volatile tokens)
+- Network risks (blockchain downtime)
+
+**Q: How is this different from a bank?**
+A:
+- Higher interest rates
+- No bank fees
+- 24/7 access
+- Complete transparency
+- You control your funds
+
+### Deposits & Withdrawals
+
+**Q: What's the minimum deposit?**
+A: 10 tokens per deposit.
+
+**Q: Is there a maximum deposit?**
+A: No maximum limit.
+
+**Q: Can I withdraw anytime?**
+A: Yes, withdraw anytime with no penalties.
+
+**Q: How long do transactions take?**
+A: Usually 15 seconds to 5 minutes, depending on network congestion.
+
+**Q: Are there withdrawal fees?**
+A: No platform fees. You only pay blockchain gas fees.
+
+### Interest & APY
+
+**Q: When is interest calculated?**
+A: Every second, automatically.
+
+**Q: When do I get the 7% rate?**
+A: After your account is 90 days old.
+
+**Q: Does interest compound?**
+A: Yes! Interest earns interest, maximizing your returns.
+
+**Q: How often should I claim interest?**
+A: Not necessary - it claims automatically on deposits/withdrawals. Manual claiming is optional.
+
+**Q: Can the APY change?**
+A: The protocol owner can adjust rates, but will always maintain competitive rates.
+
+### Technical Questions
+
+**Q: Which blockchains are supported?**
+A: Currently:
+- Ethereum
+- Binance Smart Chain
+- Polygon
+- Arbitrum
+
+**Q: Which tokens are supported?**
+A: Check the "Supported Tokens" page for current list. Commonly:
+- Stablecoins (USDC, USDT, DAI)
+- Major tokens (may vary)
+
+**Q: What wallets can I use?**
+A: Any Web3 wallet:
+- MetaMask
+- WalletConnect
+- Coinbase Wallet
+- Trust Wallet
+- Rainbow Wallet
+
+**Q: Do I need crypto experience?**
+A: Basic knowledge helps, but the interface is designed to be user-friendly.
+
+---
+
+## Tips for Maximizing Returns
+
+### 1. Keep Funds for 90+ Days
+
+Hold for 90 days to unlock the 7% APY bonus rate.
+
+### 2. Compound Regularly
+
+While interest auto-compounds on interactions, making occasional small deposits triggers compounding more frequently.
+
+### 3. Use Stablecoins
+
+Save in stablecoins (USDC, USDT, DAI) to avoid price volatility.
+
+### 4. Monitor Gas Fees
+
+Make larger transactions when gas fees are lower (usually weekends).
+
+### 5. Set It and Forget It
+
+The platform works automatically - no need to check daily.
+
+---
+
+## Security Best Practices
+
+### Protecting Your Account
+
+1. **Never share your private keys or seed phrase**
+2. **Use a hardware wallet** for large amounts
+3. **Verify contract address** before interacting
+4. **Check transaction details** before approving
+5. **Bookmark the official site** to avoid phishing
+6. **Enable 2FA** on your email/accounts
+7. **Keep wallet software updated**
+
+### Red Flags
+
+Never trust:
+- Unsolicited messages asking for keys
+- Websites with slightly different URLs
+- Promises of guaranteed returns above advertised rates
+- Requests to send crypto for "verification"
+
+### Official Channels Only
+
+- Website: https://bancafi.com
+- Support: support@bancafi.com
+- Discord: https://discord.gg/bancafi
+- Twitter: @Bancafi
+
+---
+
+## Getting Help
+
+### Support Options
+
+1. **Documentation**: Check our full docs at docs.bancafi.com
+2. **FAQ**: Most questions answered above
+3. **Discord Community**: Ask the community
+4. **Email Support**: support@bancafi.com
+5. **Video Tutorials**: YouTube channel
+
+### Before Contacting Support
+
+Have ready:
+- Your wallet address (public only!)
+- Transaction hash (if applicable)
+- Description of issue
+- Screenshots (helpful)
+
+**Never share:**
+- Private keys
+- Seed phrases
+- Passwords
+
+---
+
+## Glossary
+
+- **APY**: Annual Percentage Yield - the annual return rate
+- **Compound Interest**: Interest earning interest
+- **Gas Fees**: Blockchain transaction costs
+- **Smart Contract**: Self-executing code on blockchain
+- **Wallet**: Software that stores your crypto keys
+- **Token**: Digital asset on blockchain
+- **Stablecoin**: Cryptocurrency pegged to stable assets (like USD)
+- **DeFi**: Decentralized Finance
+
+---
+
+## Example Scenarios
+
+### Scenario 1: Short-Term Saver
+
+**Profile:** Sarah, saving for 6 months
+
+- Initial deposit: $5,000 USDC
+- APY: 4.5% (first 90 days), then 7%
+- Duration: 180 days
+
+**Results:**
+- After 90 days: $5,055.62 (4.5% APY)
+- After 180 days: $5,168.42 (7% APY for second 90 days)
+- **Total earned: $168.42**
+
+### Scenario 2: Long-Term Holder
+
+**Profile:** John, saving for 1 year
+
+- Initial deposit: $10,000 USDC
+- APY: 4.5% (first 90 days), then 7%
+- Duration: 365 days
+
+**Results:**
+- After 90 days: $10,111 (4.5% APY)
+- After 365 days: $10,673 (7% APY after threshold)
+- **Total earned: $673**
+
+### Scenario 3: Regular Saver
+
+**Profile:** Maria, adding monthly
+
+- Initial: $1,000, then $100/month
+- APY: Gradually earning bonus
+- Duration: 12 months
+
+**Results:**
+- Principal invested: $2,200
+- Interest earned: ~$85
+- **Final balance: ~$2,285**
+
+---
+
+## Conclusion
+
+Bancafi Savings Account makes earning interest on crypto simple and secure. Start saving today and watch your balance grow automatically!
+
+**Ready to start?** Connect your wallet and make your first deposit!
+
+---
+
+**Need Help?** Contact support@bancafi.com
+**Version:** 1.0.0
+**Last Updated:** 2024

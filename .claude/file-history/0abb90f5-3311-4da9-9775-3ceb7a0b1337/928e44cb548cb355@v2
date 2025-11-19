@@ -1,0 +1,234 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("🚀 BANCAFI ENHANCED FEATURES DEMO\n");
+  console.log("=" .repeat(70));
+
+  // Contract addresses
+  const addresses = {
+    assetToken: "0xDC11f7E700A4c898AE5CAddB1082cFfa76512aDD",
+    bailout: "0x36b58F5C1969B7b6591D752ea6F5486D069010AB",
+    rentalIncome: "0x0355B7B8cb128fA5692729Ab3AAa199C1753f726"
+  };
+
+  const [deployer, company, investor1, investor2, investor3] = await ethers.getSigners();
+
+  console.log("👥 PARTICIPANTS:");
+  console.log("  Deployer/Admin:", deployer.address);
+  console.log("  Company:", company.address);
+  console.log("  Investor 1:", investor1.address);
+  console.log("  Investor 2:", investor2.address);
+  console.log("  Investor 3:", investor3.address);
+  console.log("=" .repeat(70) + "\n");
+
+  // Get contract instances
+  const assetToken = await ethers.getContractAt("BancafiAssetToken", addresses.assetToken);
+  const bailout = await ethers.getContractAt("BancafiBailout", addresses.bailout);
+  const rentalIncome = await ethers.getContractAt("BancafiRentalIncome", addresses.rentalIncome);
+
+  console.log("PART 1: COMPLETE BAILOUT APPROVAL & DISBURSEMENT FLOW");
+  console.log("=" .repeat(70) + "\n");
+
+  // Step 1: Tokenize collateral
+  console.log("📋 STEP 1: Company Tokenizes Office Building");
+  await assetToken.tokenizeAsset(
+    company.address,
+    0, // RealEstate
+    ethers.parseEther("5000000"), // $5M
+    "Tech Campus, Silicon Valley",
+    "ipfs://QmOfficeBuilding123"
+  );
+  const tokenId = await assetToken.totalSupply();
+  await assetToken.verifyAsset(tokenId);
+  console.log("✅ Office Building Tokenized & Verified! Token ID:", tokenId.toString());
+  console.log("   Valuation: $5,000,000\n");
+
+  // Add more treasury funds first (using investor with full balance)
+  console.log("📋 STEP 1.5: Add Funds to Treasury");
+  await bailout.connect(investor3).depositToTreasury({ value: ethers.parseEther("2000") });
+  const treasuryBal = await bailout.treasuryBalance();
+  console.log("✅ Treasury Balance:", ethers.formatEther(treasuryBal), "ETH\n");
+
+  // Step 2: Request bailout
+  console.log("📋 STEP 2: Company Requests Emergency Bailout");
+  await bailout.connect(company).requestBailout(
+    ethers.parseEther("500"), // 500 ETH
+    "Cash flow crisis - need emergency funding",
+    "ipfs://QmSolvencyProof",
+    tokenId,
+    24 // 24 months
+  );
+  console.log("✅ Bailout Requested!");
+  console.log("   Amount: 500 ETH");
+  console.log("   Collateral: Token ID", tokenId.toString());
+  console.log("   Repayment: 24 months\n");
+
+  // Step 3: Approve bailout
+  console.log("📋 STEP 3: DAO/Admin Approves Bailout");
+  await bailout.approveBailout(1, 500); // 5% interest
+  const request1 = await bailout.bailoutRequests(1);
+  console.log("✅ Bailout Approved!");
+  console.log("   Interest Rate: 5%");
+  console.log("   Approver:", request1.approver);
+  console.log("   Status:", ["Pending", "Approved", "Disbursed"][request1.status], "\n");
+
+  // Step 4: Disburse funds
+  console.log("📋 STEP 4: Disbursing Bailout Funds");
+  const balBefore = await ethers.provider.getBalance(company.address);
+  await bailout.disburseBailout(1, 24); // 24 installments
+  const balAfter = await ethers.provider.getBalance(company.address);
+  console.log("✅ Funds Disbursed!");
+  console.log("   Company received:", ethers.formatEther(balAfter - balBefore), "ETH");
+
+  const schedule = await bailout.repaymentSchedules(1);
+  console.log("\n📊 Repayment Schedule:");
+  console.log("   Total Due:", ethers.formatEther(schedule.totalAmount), "ETH");
+  console.log("   Installments:", schedule.installmentCount.toString());
+  console.log("   Per Installment:", ethers.formatEther(schedule.installmentAmount), "ETH\n");
+
+  // Step 5: Make repayments
+  console.log("📋 STEP 5: Company Makes Repayments");
+  const installment = schedule.installmentAmount;
+
+  await bailout.connect(company).repayBailout(1, { value: installment });
+  console.log("✅ Payment 1 Complete!");
+
+  await bailout.connect(company).repayBailout(1, { value: installment });
+  console.log("✅ Payment 2 Complete!");
+
+  await bailout.connect(company).repayBailout(1, { value: installment });
+  console.log("✅ Payment 3 Complete!");
+
+  const scheduleUpdated = await bailout.repaymentSchedules(1);
+  console.log("\n📊 Repayment Progress:");
+  console.log("   Paid:", ethers.formatEther(scheduleUpdated.amountPaid), "ETH");
+  console.log("   Remaining:", ethers.formatEther(scheduleUpdated.totalAmount - scheduleUpdated.amountPaid), "ETH");
+  console.log("   Progress:", ((scheduleUpdated.amountPaid * 100n) / scheduleUpdated.totalAmount).toString() + "%\n");
+
+  console.log("\n\nPART 2: RENTAL INCOME DISTRIBUTION");
+  console.log("=" .repeat(70) + "\n");
+
+  // Step 1: Tokenize rental property
+  console.log("📋 STEP 1: Tokenize Rental Property");
+  await assetToken.tokenizeAsset(
+    deployer.address,
+    0, // RealEstate
+    ethers.parseEther("2000000"), // $2M
+    "Luxury Apartments, Downtown Dubai",
+    "ipfs://QmRentalProperty456"
+  );
+  const rentalTokenId = await assetToken.totalSupply();
+  await assetToken.verifyAsset(rentalTokenId);
+  console.log("✅ Rental Property Tokenized! Token ID:", rentalTokenId.toString());
+  console.log("   Valuation: $2,000,000\n");
+
+  // Step 2: Fractionalize
+  console.log("📋 STEP 2: Fractionalize Property");
+  await assetToken.fractionalizeAsset(rentalTokenId, 10000); // 10,000 shares
+  console.log("✅ Property Fractionalized!");
+  console.log("   Total Shares: 10,000\n");
+
+  // Step 3: Distribute shares to investors
+  console.log("📋 STEP 3: Distribute Shares to Investors");
+  await assetToken.transferFractional(rentalTokenId, investor1.address, 3000);
+  await assetToken.transferFractional(rentalTokenId, investor2.address, 2500);
+  await assetToken.transferFractional(rentalTokenId, investor3.address, 1500);
+  console.log("✅ Shares Distributed!");
+  console.log("   Investor 1: 3,000 shares (30%)");
+  console.log("   Investor 2: 2,500 shares (25%)");
+  console.log("   Investor 3: 1,500 shares (15%)");
+  console.log("   Owner: 3,000 shares (30%)\n");
+
+  // Step 4: Receive rental income
+  console.log("📋 STEP 4: Receive Monthly Rental Income");
+  const monthlyRent = ethers.parseEther("50"); // 50 ETH/month
+  const startDate = Math.floor(Date.now() / 1000);
+  const endDate = startDate + (30 * 24 * 60 * 60); // 30 days
+
+  await rentalIncome.receiveRentalIncome(rentalTokenId, startDate, endDate, { value: monthlyRent });
+  console.log("✅ Rental Income Received!");
+  console.log("   Amount: 50 ETH");
+  console.log("   Period: Month 1\n");
+
+  // Step 5: Distribute income
+  console.log("📋 STEP 5: Distribute Income to Shareholders");
+  const recipients = [deployer.address, investor1.address, investor2.address, investor3.address];
+  await rentalIncome.distributeIncome(rentalTokenId, 1, recipients);
+  console.log("✅ Income Distributed!");
+
+  const inv1Share = await rentalIncome.getUserDistribution(rentalTokenId, 1, investor1.address);
+  const inv2Share = await rentalIncome.getUserDistribution(rentalTokenId, 1, investor2.address);
+  const inv3Share = await rentalIncome.getUserDistribution(rentalTokenId, 1, investor3.address);
+  const ownerShare = await rentalIncome.getUserDistribution(rentalTokenId, 1, deployer.address);
+
+  console.log("\n💰 Distribution Breakdown:");
+  console.log("   Investor 1 (30%):", ethers.formatEther(inv1Share[0]), "ETH");
+  console.log("   Investor 2 (25%):", ethers.formatEther(inv2Share[0]), "ETH");
+  console.log("   Investor 3 (15%):", ethers.formatEther(inv3Share[0]), "ETH");
+  console.log("   Owner (30%):", ethers.formatEther(ownerShare[0]), "ETH\n");
+
+  // Step 6: Investors claim income
+  console.log("📋 STEP 6: Investors Claim Their Income");
+
+  const inv1BalBefore = await ethers.provider.getBalance(investor1.address);
+  await rentalIncome.connect(investor1).claimIncome(rentalTokenId, 1);
+  const inv1BalAfter = await ethers.provider.getBalance(investor1.address);
+  console.log("✅ Investor 1 claimed:", ethers.formatEther(inv1BalAfter - inv1BalBefore).substring(0, 6), "ETH");
+
+  const inv2BalBefore = await ethers.provider.getBalance(investor2.address);
+  await rentalIncome.connect(investor2).claimIncome(rentalTokenId, 1);
+  const inv2BalAfter = await ethers.provider.getBalance(investor2.address);
+  console.log("✅ Investor 2 claimed:", ethers.formatEther(inv2BalAfter - inv2BalBefore).substring(0, 6), "ETH");
+
+  const inv3BalBefore = await ethers.provider.getBalance(investor3.address);
+  await rentalIncome.connect(investor3).claimIncome(rentalTokenId, 1);
+  const inv3BalAfter = await ethers.provider.getBalance(investor3.address);
+  console.log("✅ Investor 3 claimed:", ethers.formatEther(inv3BalAfter - inv3BalBefore).substring(0, 5), "ETH\n");
+
+  // Multiple periods
+  console.log("📋 STEP 7: Second Month Rental Income");
+  await rentalIncome.receiveRentalIncome(
+    rentalTokenId,
+    endDate,
+    endDate + (30 * 24 * 60 * 60),
+    { value: ethers.parseEther("55") } // $5 increase
+  );
+  console.log("✅ Month 2 Income: 55 ETH received\n");
+
+  await rentalIncome.distributeIncome(rentalTokenId, 2, recipients);
+  console.log("✅ Month 2 Income Distributed!");
+
+  // Check property stats
+  const stats = await rentalIncome.propertyStats(rentalTokenId);
+  console.log("\n📊 Property Statistics:");
+  console.log("   Total Rental Income:", ethers.formatEther(stats.totalRentalIncome), "ETH");
+  console.log("   Total Distributed:", ethers.formatEther(stats.totalDistributed), "ETH");
+  console.log("   Number of Periods:", stats.periodsCount.toString());
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("✅ ENHANCED FEATURES DEMO COMPLETE!");
+  console.log("=" .repeat(70));
+
+  console.log("\n🎯 Features Demonstrated:");
+  console.log("  ✅ Complete bailout approval workflow");
+  console.log("  ✅ Automated fund disbursement");
+  console.log("  ✅ Repayment schedule with interest");
+  console.log("  ✅ Rental income collection");
+  console.log("  ✅ Proportional income distribution");
+  console.log("  ✅ Multi-period rental tracking");
+  console.log("  ✅ Individual income claiming");
+
+  console.log("\n💡 System Status:");
+  console.log("  Bailout Requests: 1");
+  console.log("  Repayments Made: 3");
+  console.log("  Rental Properties: 1");
+  console.log("  Rental Periods: 2");
+  console.log("  Total Rental Income:", ethers.formatEther(stats.totalRentalIncome), "ETH");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

@@ -1,0 +1,526 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+// Minimal local implementations to replace OpenZeppelin upgradeable imports when not available.
+// These are simplified and intended for local compilation and testing; review and replace with
+// audited OpenZeppelin implementations for production use.
+
+library CountersUpgradeable {
+    struct Counter {
+        uint256 _value;
+    }
+    function current(Counter storage counter) internal view returns (uint256) {
+        return counter._value;
+    }
+contract BancafiBailout is
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable
+{
+
+abstract contract AccessControlUpgradeable {
+    mapping(bytes32 => mapping(address => bool)) private _roles;
+
+    function __AccessControl_init() internal {}
+
+    modifier onlyRole(bytes32 role) {
+        require(hasRole(role, msg.sender), "AccessControl: account missing role");
+        _;
+    }
+
+    function hasRole(bytes32 role, address account) public view returns (bool) {
+        return _roles[role][account];
+    }
+
+    function _grantRole(bytes32 role, address account) internal {
+        _roles[role][account] = true;
+    }
+}
+
+abstract contract PausableUpgradeable {
+    bool private _paused;
+
+    function __Pausable_init() internal { _paused = false; }
+
+    modifier whenNotPaused() {
+        require(!_paused, "Pausable: paused");
+        _;
+    }
+
+    function _pause() internal { _paused = true; }
+
+    function _unpause() internal { _paused = false; }
+}
+
+abstract contract ReentrancyGuardUpgradeable {
+    uint256 private _status;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    function __ReentrancyGuard_init() internal { _status = _NOT_ENTERED; }
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+}
+
+/**
+ * @title BancafiBailout
+ * @notice DAO-governed bailout mechanism for tokenized entities
+ * @dev Manages emergency funding with strict governance and repayment terms
+ */
+contract BancafiBailout is
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    using CountersUpgradeable for CountersUpgradeable.Counter;
+
+    // Roles
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant TREASURY_MANAGER_ROLE = keccak256("TREASURY_MANAGER_ROLE");
+    bytes32 public constant BAILOUT_APPROVER_ROLE = keccak256("BAILOUT_APPROVER_ROLE");
+
+    // Bailout status
+    enum BailoutStatus {
+        Pending,
+        Approved,
+        Disbursed,
+        Repaying,
+        Completed,
+        Defaulted,
+        Rejected
+    }
+
+    struct BailoutRequest {
+        uint256 requestId;
+        address requester;
+        uint256 amount;
+        uint256 requestedAt;
+        uint256 approvedAt;
+        uint256 disbursedAt;
+        uint256 dueDate;
+        uint256 interestRate; // basis points (e.g., 500 = 5%)
+        BailoutStatus status;
+        string reason;
+        string solvencyProof; // IPFS hash
+        uint256 collateralTokenId; // Asset token ID as collateral
+        uint256 repaidAmount;
+        address approver;
+    }
+
+    struct RepaymentSchedule {
+        uint256 bailoutId;
+        uint256 totalAmount;
+        uint256 amountPaid;
+        uint256 installmentAmount;
+        uint256 installmentCount;
+        uint256 nextPaymentDue;
+        uint256 paymentInterval; // in seconds
+        bool isActive;
+    }
+
+    // State variables
+    CountersUpgradeable.Counter private _bailoutIds;
+    mapping(uint256 => BailoutRequest) public bailoutRequests;
+    mapping(uint256 => RepaymentSchedule) public repaymentSchedules;
+    mapping(address => uint256[]) public userBailouts;
+    mapping(address => uint256) public userActiveBailouts;
+
+    uint256 public treasuryBalance;
+    uint256 public totalDisbursed;
+    uint256 public totalRepaid;
+    uint256 public maxBailoutAmount;
+    uint256 public minCollateralRatio; // basis points (e.g., 15000 = 150%)
+
+    // Events
+    event BailoutRequested(
+        uint256 indexed requestId,
+        address indexed requester,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event BailoutApproved(
+        uint256 indexed requestId,
+        address indexed approver,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+        constructor() {}
+        uint256 timestamp
+    );
+
+    event BailoutRepayment(
+        uint256 indexed requestId,
+        address indexed payer,
+        uint256 amount,
+        uint256 remainingBalance,
+        uint256 timestamp
+    );
+
+    event BailoutCompleted(
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+
+    event BailoutDefaulted(
+        uint256 indexed requestId,
+        uint256 outstandingAmount,
+        uint256 timestamp
+    );
+
+    event BailoutRejected(
+        uint256 indexed requestId,
+        address indexed rejector,
+        string reason,
+        uint256 timestamp
+    );
+
+    event TreasuryDeposit(
+        address indexed depositor,
+        uint256 amount,
+        uint256 newBalance,
+        uint256 timestamp
+    );
+
+    event TreasuryWithdrawal(
+        address indexed recipient,
+        uint256 amount,
+        uint256 newBalance,
+        uint256 timestamp
+    );
+
+    event MaxBailoutAmountUpdated(
+        uint256 oldAmount,
+        uint256 newAmount,
+        uint256 timestamp
+    );
+
+    event CollateralSeized(
+        uint256 indexed requestId,
+        uint256 indexed tokenId,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the bailout contract
+     * @param maxBailoutAmount_ Maximum bailout amount
+     * @param minCollateralRatio_ Minimum collateral ratio in basis points
+     */
+    function initialize(
+        uint256 maxBailoutAmount_,
+        uint256 minCollateralRatio_
+    ) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(TREASURY_MANAGER_ROLE, msg.sender);
+        _grantRole(BAILOUT_APPROVER_ROLE, msg.sender);
+
+        maxBailoutAmount = maxBailoutAmount_;
+        minCollateralRatio = minCollateralRatio_;
+    }
+
+    /**
+     * @notice Request a bailout
+     * @param amount_ Requested amount
+     * @param reason_ Reason for bailout
+     * @param solvencyProof_ IPFS hash of solvency proof
+     * @param collateralTokenId_ Asset token ID for collateral
+     * @param repaymentMonths_ Number of months for repayment
+     */
+    function requestBailout(
+        uint256 amount_,
+        string memory reason_,
+        string memory solvencyProof_,
+        uint256 collateralTokenId_,
+        uint256 repaymentMonths_
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        require(amount_ > 0, "Amount must be > 0");
+        require(amount_ <= maxBailoutAmount, "Exceeds max bailout");
+        require(bytes(reason_).length > 0, "Reason required");
+        require(bytes(solvencyProof_).length > 0, "Solvency proof required");
+        require(userActiveBailouts[msg.sender] == 0, "Active bailout exists");
+        require(repaymentMonths_ > 0 && repaymentMonths_ <= 60, "Invalid repayment period");
+
+        _bailoutIds.increment();
+        uint256 requestId = _bailoutIds.current();
+
+        uint256 dueDate = block.timestamp + (repaymentMonths_ * 30 days);
+
+        bailoutRequests[requestId] = BailoutRequest({
+            requestId: requestId,
+            requester: msg.sender,
+            amount: amount_,
+            requestedAt: block.timestamp,
+            approvedAt: 0,
+            disbursedAt: 0,
+            dueDate: dueDate,
+            interestRate: 500, // 5% default
+            status: BailoutStatus.Pending,
+            reason: reason_,
+            solvencyProof: solvencyProof_,
+            collateralTokenId: collateralTokenId_,
+            repaidAmount: 0,
+            approver: address(0)
+        });
+
+        userBailouts[msg.sender].push(requestId);
+        userActiveBailouts[msg.sender] = requestId;
+
+        emit BailoutRequested(requestId, msg.sender, amount_, block.timestamp);
+
+        return requestId;
+    }
+
+    /**
+     * @notice Approve a bailout request
+     * @param requestId_ Request ID to approve
+     * @param interestRate_ Interest rate in basis points
+     */
+    function approveBailout(
+        uint256 requestId_,
+        uint256 interestRate_
+    ) external whenNotPaused onlyRole(BAILOUT_APPROVER_ROLE) {
+        BailoutRequest storage request = bailoutRequests[requestId_];
+        require(request.status == BailoutStatus.Pending, "Not pending");
+        require(treasuryBalance >= request.amount, "Insufficient treasury");
+
+        request.status = BailoutStatus.Approved;
+        request.approvedAt = block.timestamp;
+        request.approver = msg.sender;
+        request.interestRate = interestRate_;
+
+        emit BailoutApproved(requestId_, msg.sender, request.amount, block.timestamp);
+    }
+
+    /**
+     * @notice Disburse approved bailout funds
+     * @param requestId_ Request ID to disburse
+     * @param installmentCount_ Number of repayment installments
+     */
+    function disburseBailout(
+        uint256 requestId_,
+        uint256 installmentCount_
+    ) external whenNotPaused nonReentrant onlyRole(TREASURY_MANAGER_ROLE) {
+        BailoutRequest storage request = bailoutRequests[requestId_];
+        require(request.status == BailoutStatus.Approved, "Not approved");
+        require(treasuryBalance >= request.amount, "Insufficient treasury");
+        require(installmentCount_ > 0, "Invalid installment count");
+
+        uint256 totalWithInterest = request.amount + (request.amount * request.interestRate / 10000);
+        uint256 installmentAmount = totalWithInterest / installmentCount_;
+        uint256 paymentInterval = (request.dueDate - block.timestamp) / installmentCount_;
+
+        treasuryBalance -= request.amount;
+        totalDisbursed += request.amount;
+
+        request.status = BailoutStatus.Disbursed;
+        request.disbursedAt = block.timestamp;
+
+        // Setup repayment schedule
+        repaymentSchedules[requestId_] = RepaymentSchedule({
+            bailoutId: requestId_,
+            totalAmount: totalWithInterest,
+            amountPaid: 0,
+            installmentAmount: installmentAmount,
+            installmentCount: installmentCount_,
+            nextPaymentDue: block.timestamp + paymentInterval,
+            paymentInterval: paymentInterval,
+            isActive: true
+        });
+
+        // Transfer funds
+        (bool success, ) = request.requester.call{value: request.amount}("");
+        require(success, "Transfer failed");
+
+        emit BailoutDisbursed(requestId_, request.requester, request.amount, block.timestamp);
+    }
+
+    /**
+     * @notice Make repayment on bailout
+     * @param requestId_ Request ID to repay
+     */
+    function repayBailout(uint256 requestId_) external payable whenNotPaused nonReentrant {
+        BailoutRequest storage request = bailoutRequests[requestId_];
+        RepaymentSchedule storage schedule = repaymentSchedules[requestId_];
+
+        require(request.requester == msg.sender, "Not requester");
+        require(request.status == BailoutStatus.Disbursed || request.status == BailoutStatus.Repaying, "Cannot repay");
+        require(schedule.isActive, "Schedule not active");
+        require(msg.value > 0, "Payment required");
+
+        uint256 remainingBalance = schedule.totalAmount - schedule.amountPaid;
+        require(msg.value <= remainingBalance, "Overpayment");
+
+        schedule.amountPaid += msg.value;
+        request.repaidAmount += msg.value;
+        treasuryBalance += msg.value;
+        totalRepaid += msg.value;
+
+        if (request.status == BailoutStatus.Disbursed) {
+            request.status = BailoutStatus.Repaying;
+        }
+
+        emit BailoutRepayment(requestId_, msg.sender, msg.value, remainingBalance - msg.value, block.timestamp);
+
+        // Check if fully repaid
+        if (schedule.amountPaid >= schedule.totalAmount) {
+            request.status = BailoutStatus.Completed;
+            schedule.isActive = false;
+            userActiveBailouts[msg.sender] = 0;
+
+            emit BailoutCompleted(requestId_, schedule.amountPaid, block.timestamp);
+        } else {
+            // Update next payment due
+            schedule.nextPaymentDue = block.timestamp + schedule.paymentInterval;
+        }
+    }
+
+    /**
+     * @notice Mark bailout as defaulted
+     * @param requestId_ Request ID to default
+     */
+    function markAsDefaulted(uint256 requestId_) external onlyRole(BAILOUT_APPROVER_ROLE) {
+        BailoutRequest storage request = bailoutRequests[requestId_];
+        RepaymentSchedule storage schedule = repaymentSchedules[requestId_];
+
+        require(request.status == BailoutStatus.Disbursed || request.status == BailoutStatus.Repaying, "Invalid status");
+        require(block.timestamp > request.dueDate, "Not overdue");
+
+        uint256 outstandingAmount = schedule.totalAmount - schedule.amountPaid;
+
+        request.status = BailoutStatus.Defaulted;
+        schedule.isActive = false;
+        userActiveBailouts[request.requester] = 0;
+
+        emit BailoutDefaulted(requestId_, outstandingAmount, block.timestamp);
+        emit CollateralSeized(requestId_, request.collateralTokenId, block.timestamp);
+    }
+
+    /**
+     * @notice Reject a bailout request
+     * @param requestId_ Request ID to reject
+     * @param rejectionReason_ Reason for rejection
+     */
+    function rejectBailout(
+        uint256 requestId_,
+        string memory rejectionReason_
+    ) external onlyRole(BAILOUT_APPROVER_ROLE) {
+        BailoutRequest storage request = bailoutRequests[requestId_];
+        require(request.status == BailoutStatus.Pending, "Not pending");
+
+        request.status = BailoutStatus.Rejected;
+        userActiveBailouts[request.requester] = 0;
+
+        emit BailoutRejected(requestId_, msg.sender, rejectionReason_, block.timestamp);
+    }
+
+    /**
+     * @notice Deposit funds to treasury
+     */
+    function depositToTreasury() external payable whenNotPaused nonReentrant {
+        require(msg.value > 0, "Amount must be > 0");
+
+        treasuryBalance += msg.value;
+
+        emit TreasuryDeposit(msg.sender, msg.value, treasuryBalance, block.timestamp);
+    }
+
+    /**
+     * @notice Withdraw from treasury (governance only)
+     * @param amount_ Amount to withdraw
+     * @param recipient_ Recipient address
+     */
+    function withdrawFromTreasury(
+        uint256 amount_,
+        address payable recipient_
+    ) external whenNotPaused nonReentrant onlyRole(TREASURY_MANAGER_ROLE) {
+    /**
+     * @notice Authorize upgrade
+     */
+    // UUPS upgrade authorization removed for local compilation (no UUPS support in this build).
+
+        emit TreasuryWithdrawal(recipient_, amount_, treasuryBalance, block.timestamp);
+    }
+
+    /**
+     * @notice Update max bailout amount
+     * @param newMaxAmount_ New maximum amount
+     */
+    function updateMaxBailoutAmount(uint256 newMaxAmount_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 oldAmount = maxBailoutAmount;
+        maxBailoutAmount = newMaxAmount_;
+
+        emit MaxBailoutAmountUpdated(oldAmount, newMaxAmount_, block.timestamp);
+    }
+
+    /**
+     * @notice Get user's bailout history
+     * @param user_ User address
+     */
+    function getUserBailouts(address user_) external view returns (uint256[] memory) {
+        return userBailouts[user_];
+    }
+
+    /**
+     * @notice Get bailout details
+     * @param requestId_ Request ID
+     */
+    function getBailoutDetails(uint256 requestId_)
+        external
+        view
+        returns (BailoutRequest memory, RepaymentSchedule memory)
+    {
+        return (bailoutRequests[requestId_], repaymentSchedules[requestId_]);
+    }
+
+    /**
+     * @notice Pause contract
+     */
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause contract
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Authorize upgrade
+     */
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    /**
+     * @notice Receive ETH
+     */
+    receive() external payable {
+        treasuryBalance += msg.value;
+        emit TreasuryDeposit(msg.sender, msg.value, treasuryBalance, block.timestamp);
+    }
+}

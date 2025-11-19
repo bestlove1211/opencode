@@ -1,0 +1,121 @@
+const express = require('express');
+const router = express.Router();
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+// GET /api/staking/pool
+router.get('/pool', async (req, res) => {
+  try {
+    const pool = await blockchain.contracts.staking.pool();
+
+    res.json({
+      totalStaked: ethers.formatEther(pool.totalStaked),
+      totalVotingPower: ethers.formatEther(pool.totalVotingPower),
+      rewardsPerSecond: ethers.formatEther(pool.rewardsPerSecond),
+      accRewardPerShare: pool.accRewardPerShare.toString(),
+      lastRewardTime: Number(pool.lastRewardTime),
+      totalRewardsDistributed: ethers.formatEther(pool.totalRewardsDistributed)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/staking/user/:address
+router.get('/user/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    const totalStaked = await blockchain.contracts.staking.userTotalStaked(address);
+    const stakingPower = await blockchain.contracts.staking.userStakingPower(address);
+
+    res.json({
+      address,
+      totalStaked: ethers.formatEther(totalStaked),
+      stakingPower: ethers.formatEther(stakingPower)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/staking/stake
+router.post('/stake', async (req, res) => {
+  try {
+    const { amount, lockPeriod, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('staking', privateKey);
+
+    const tx = await contract.stake(
+      ethers.parseEther(amount),
+      lockPeriod
+    );
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/staking/:stakeId/unstake
+router.post('/:stakeId/unstake', async (req, res) => {
+  try {
+    const { stakeId } = req.params;
+    const { privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('staking', privateKey);
+
+    const tx = await contract.unstake(stakeId);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/staking/claim-rewards
+router.post('/claim-rewards', async (req, res) => {
+  try {
+    const { stakeId, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('staking', privateKey);
+
+    const tx = stakeId
+      ? await contract.claimRewards(stakeId)
+      : await contract.claimAllRewards();
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+module.exports = router;

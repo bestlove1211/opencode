@@ -1,0 +1,191 @@
+const { ethers, upgrades } = require("hardhat");
+const fs = require("fs");
+
+async function main() {
+  console.log("🚀 BANCAFI ENHANCEMENT CONTRACTS DEPLOYMENT\n");
+  console.log("=".repeat(80));
+
+  const [deployer] = await ethers.getSigners();
+  console.log("Deployer:", deployer.address);
+  console.log("Balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH\n");
+
+  // Load core contract addresses
+  const deployment = JSON.parse(fs.readFileSync("deployment-complete.json"));
+  const addresses = deployment.contracts;
+
+  const enhancements = {};
+
+  // ========== DEPLOY ENHANCEMENTS ==========
+  console.log("\n📦 DEPLOYING ENHANCEMENT CONTRACTS");
+  console.log("=".repeat(80));
+
+  // 1. Chainlink Automation
+  console.log("\n1️⃣ Deploying Chainlink Automation...");
+  const Automation = await ethers.getContractFactory("BancafiAutomation");
+  const automation = await upgrades.deployProxy(
+    Automation,
+    [addresses.oracle, 3600], // 1 hour update interval
+    { initializer: "initialize", kind: "uups" }
+  );
+  await automation.waitForDeployment();
+  enhancements.automation = await automation.getAddress();
+  console.log("✅ Automation:", enhancements.automation);
+
+  // 2. Emergency Coordinator
+  console.log("\n2️⃣ Deploying Emergency Coordinator...");
+  const EmergencyCoordinator = await ethers.getContractFactory("BancafiEmergencyCoordinator");
+  const coordinator = await upgrades.deployProxy(
+    EmergencyCoordinator,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await coordinator.waitForDeployment();
+  enhancements.emergencyCoordinator = await coordinator.getAddress();
+  console.log("✅ Emergency Coordinator:", enhancements.emergencyCoordinator);
+
+  // 3. Analytics
+  console.log("\n3️⃣ Deploying Analytics...");
+  const Analytics = await ethers.getContractFactory("BancafiAnalytics");
+  const analytics = await upgrades.deployProxy(
+    Analytics,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await analytics.waitForDeployment();
+  enhancements.analytics = await analytics.getAddress();
+  console.log("✅ Analytics:", enhancements.analytics);
+
+  // ========== CONFIGURE ENHANCEMENTS ==========
+  console.log("\n\n🔧 CONFIGURING ENHANCEMENT CONTRACTS");
+  console.log("=".repeat(80));
+
+  // Configure Analytics
+  console.log("\n1️⃣ Configuring Analytics with contract addresses...");
+  await analytics.setContractAddresses(
+    addresses.assetToken,
+    addresses.bailout,
+    addresses.staking,
+    addresses.marketplace,
+    addresses.liquidityPool,
+    addresses.insurance,
+    addresses.treasury,
+    addresses.oracle
+  );
+  console.log("✅ Analytics configured");
+
+  // Register contracts with Emergency Coordinator
+  console.log("\n2️⃣ Registering contracts with Emergency Coordinator...");
+
+  const contractsToRegister = [
+    { addr: addresses.assetToken, type: 0, name: "Asset Token" },
+    { addr: addresses.bailout, type: 1, name: "Bailout" },
+    { addr: addresses.rentalIncome, type: 2, name: "Rental Income" },
+    { addr: addresses.institutional, type: 3, name: "Institutional" },
+    { addr: addresses.kyc, type: 4, name: "KYC" },
+    { addr: addresses.marketplace, type: 5, name: "Marketplace" },
+    { addr: addresses.liquidityPool, type: 6, name: "Liquidity Pool" },
+    { addr: addresses.oracle, type: 7, name: "Oracle" },
+    { addr: addresses.staking, type: 8, name: "Staking" },
+    { addr: addresses.insurance, type: 9, name: "Insurance" },
+    { addr: addresses.vesting, type: 10, name: "Vesting" },
+    { addr: addresses.treasury, type: 11, name: "Treasury" }
+  ];
+
+  const contractAddrs = contractsToRegister.map(c => c.addr);
+  const contractTypes = contractsToRegister.map(c => c.type);
+  const contractNames = contractsToRegister.map(c => c.name);
+
+  await coordinator.addContractsBatch(contractAddrs, contractTypes, contractNames);
+  console.log("✅ Registered 12 contracts with Emergency Coordinator");
+
+  // Grant PAUSER_ROLE to Emergency Coordinator on all contracts
+  console.log("\n3️⃣ Granting PAUSER_ROLE to Emergency Coordinator...");
+
+  const contracts = [
+    { name: "AssetToken", addr: addresses.assetToken },
+    { name: "Bailout", addr: addresses.bailout },
+    { name: "RentalIncome", addr: addresses.rentalIncome },
+    { name: "Institutional", addr: addresses.institutional },
+    { name: "KYC", addr: addresses.kyc },
+    { name: "Marketplace", addr: addresses.marketplace },
+    { name: "LiquidityPool", addr: addresses.liquidityPool },
+    { name: "Oracle", addr: addresses.oracle },
+    { name: "Staking", addr: addresses.staking },
+    { name: "Insurance", addr: addresses.insurance },
+    { name: "Vesting", addr: addresses.vesting },
+    { name: "Treasury", addr: addresses.treasury }
+  ];
+
+  for (const contract of contracts) {
+    try {
+      const instance = await ethers.getContractAt("BancafiAssetToken", contract.addr);
+      const PAUSER_ROLE = await instance.PAUSER_ROLE();
+
+      // Check if coordinator already has the role
+      const hasRole = await instance.hasRole(PAUSER_ROLE, enhancements.emergencyCoordinator);
+
+      if (!hasRole) {
+        await instance.grantRole(PAUSER_ROLE, enhancements.emergencyCoordinator);
+        console.log(`   ✅ ${contract.name} - PAUSER_ROLE granted`);
+      } else {
+        console.log(`   ✓ ${contract.name} - already has PAUSER_ROLE`);
+      }
+    } catch (e) {
+      console.log(`   ⚠️  ${contract.name} - Could not grant role: ${e.message}`);
+    }
+  }
+
+  console.log("✅ Emergency pause system configured");
+
+  // ========== SUMMARY ==========
+  console.log("\n\n" + "=".repeat(80));
+  console.log("🎉 ENHANCEMENT CONTRACTS DEPLOYED!");
+  console.log("=".repeat(80));
+
+  console.log("\n📋 ENHANCEMENT ADDRESSES:\n");
+  console.log("  1. Automation:            ", enhancements.automation);
+  console.log("  2. Emergency Coordinator: ", enhancements.emergencyCoordinator);
+  console.log("  3. Analytics:             ", enhancements.analytics);
+
+  console.log("\n✅ FEATURES ENABLED:");
+  console.log("  • Chainlink Automation - Automatic oracle price updates");
+  console.log("  • Emergency Coordinator - One-click pause all contracts");
+  console.log("  • Analytics - On-chain metrics and health scoring");
+
+  console.log("\n📊 SYSTEM STATUS:");
+  const status = await coordinator.getSystemStatus();
+  console.log(`  Total Managed Contracts: ${status[0]}`);
+  console.log(`  Currently Paused: ${status[1]}`);
+  console.log(`  Emergency Mode: ${status[2] ? "ACTIVE" : "Normal"}`);
+
+  console.log("\n" + "=".repeat(80));
+
+  // Save deployment
+  const enhancementDeployment = {
+    network: "localhost",
+    chainId: 1337,
+    deployer: deployer.address,
+    timestamp: new Date().toISOString(),
+    enhancements: enhancements,
+    coreContracts: addresses,
+    configured: {
+      analyticsContractsSet: true,
+      emergencyCoordinatorRegistered: true,
+      pauserRolesGranted: true
+    }
+  };
+
+  fs.writeFileSync(
+    "deployment-enhancements.json",
+    JSON.stringify(enhancementDeployment, null, 2)
+  );
+
+  console.log("\n✅ Deployment info saved to: deployment-enhancements.json\n");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

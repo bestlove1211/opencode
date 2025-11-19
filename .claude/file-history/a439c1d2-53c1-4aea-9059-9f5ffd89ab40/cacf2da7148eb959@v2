@@ -1,0 +1,328 @@
+const { ethers, upgrades } = require("hardhat");
+
+/**
+ * Bancafi Credit Platform Deployment Script
+ *
+ * Deploys all core contracts in the correct order:
+ * 1. Price Oracle
+ * 2. Compliance System
+ * 3. Credit Score System
+ * 4. Collateral Managers (Single + Multi-Asset)
+ * 5. Lending Protocol
+ * 6. Debt Collection
+ * 7. Block Market (BBM)
+ * 8. Private Credit Lines
+ * 9. Insurance Pool
+ * 10. Institutional Onboarding
+ * 11. Portfolio Manager
+ * 12. Wallet Integration
+ */
+
+async function main() {
+  console.log("Starting Bancafi Credit Platform Deployment...\n");
+
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying contracts with account:", deployer.address);
+  console.log("Account balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH\n");
+
+  const deployedContracts = {};
+
+  try {
+    // ===========================================
+    // 1. Deploy Price Oracle (Chainlink)
+    // ===========================================
+    console.log("1. Deploying BancafiPriceOracle...");
+    const BancafiPriceOracle = await ethers.getContractFactory("BancafiPriceOracle");
+    const priceOracle = await upgrades.deployProxy(
+      BancafiPriceOracle,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await priceOracle.waitForDeployment();
+    deployedContracts.priceOracle = await priceOracle.getAddress();
+    console.log("✓ BancafiPriceOracle deployed to:", deployedContracts.priceOracle);
+    console.log();
+
+    // ===========================================
+    // 2. Deploy Compliance System
+    // ===========================================
+    console.log("2. Deploying BancafiCompliance...");
+    const BancafiCompliance = await ethers.getContractFactory("BancafiCompliance");
+    const compliance = await upgrades.deployProxy(
+      BancafiCompliance,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await compliance.waitForDeployment();
+    deployedContracts.compliance = await compliance.getAddress();
+    console.log("✓ BancafiCompliance deployed to:", deployedContracts.compliance);
+    console.log();
+
+    // ===========================================
+    // 3. Deploy Credit Score System
+    // ===========================================
+    console.log("3. Deploying CreditScore...");
+    const CreditScore = await ethers.getContractFactory("CreditScore");
+    const creditScore = await upgrades.deployProxy(
+      CreditScore,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await creditScore.waitForDeployment();
+    deployedContracts.creditScore = await creditScore.getAddress();
+    console.log("✓ CreditScore deployed to:", deployedContracts.creditScore);
+    console.log();
+
+    // ===========================================
+    // 4. Deploy Collateral Manager (Standard)
+    // ===========================================
+    console.log("4. Deploying CollateralManager...");
+    const CollateralManager = await ethers.getContractFactory("CollateralManager");
+    const collateralManager = await upgrades.deployProxy(
+      CollateralManager,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await collateralManager.waitForDeployment();
+    deployedContracts.collateralManager = await collateralManager.getAddress();
+    console.log("✓ CollateralManager deployed to:", deployedContracts.collateralManager);
+    console.log();
+
+    // ===========================================
+    // 5. Deploy Multi-Asset Collateral Manager
+    // ===========================================
+    console.log("5. Deploying MultiAssetCollateralManager...");
+    const MultiAssetCollateralManager = await ethers.getContractFactory("MultiAssetCollateralManager");
+    const multiAssetCollateralManager = await upgrades.deployProxy(
+      MultiAssetCollateralManager,
+      [deployedContracts.priceOracle],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await multiAssetCollateralManager.waitForDeployment();
+    deployedContracts.multiAssetCollateralManager = await multiAssetCollateralManager.getAddress();
+    console.log("✓ MultiAssetCollateralManager deployed to:", deployedContracts.multiAssetCollateralManager);
+    console.log();
+
+    // ===========================================
+    // 6. Deploy Lending Protocol
+    // ===========================================
+    console.log("6. Deploying BancafiLending...");
+    const BancafiLending = await ethers.getContractFactory("BancafiLending");
+    const lending = await upgrades.deployProxy(
+      BancafiLending,
+      [
+        deployedContracts.collateralManager,
+        deployedContracts.creditScore,
+        deployedContracts.priceOracle
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await lending.waitForDeployment();
+    deployedContracts.lending = await lending.getAddress();
+    console.log("✓ BancafiLending deployed to:", deployedContracts.lending);
+    console.log();
+
+    // ===========================================
+    // 7. Deploy Debt Collection
+    // ===========================================
+    console.log("7. Deploying DebtCollection...");
+    const DebtCollection = await ethers.getContractFactory("DebtCollection");
+    const debtCollection = await upgrades.deployProxy(
+      DebtCollection,
+      [
+        deployedContracts.lending,
+        deployedContracts.collateralManager,
+        deployedContracts.creditScore
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await debtCollection.waitForDeployment();
+    deployedContracts.debtCollection = await debtCollection.getAddress();
+    console.log("✓ DebtCollection deployed to:", deployedContracts.debtCollection);
+    console.log();
+
+    // ===========================================
+    // 8. Deploy Block Market (BBM)
+    // ===========================================
+    console.log("8. Deploying BancafiBlockMarket...");
+    const BancafiBlockMarket = await ethers.getContractFactory("BancafiBlockMarket");
+    const blockMarket = await upgrades.deployProxy(
+      BancafiBlockMarket,
+      [deployedContracts.debtCollection],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await blockMarket.waitForDeployment();
+    deployedContracts.blockMarket = await blockMarket.getAddress();
+    console.log("✓ BancafiBlockMarket deployed to:", deployedContracts.blockMarket);
+    console.log();
+
+    // ===========================================
+    // 9. Deploy Private Credit Line
+    // ===========================================
+    console.log("9. Deploying BancafiPrivateCreditLine...");
+    const BancafiPrivateCreditLine = await ethers.getContractFactory("BancafiPrivateCreditLine");
+    const privateCreditLine = await upgrades.deployProxy(
+      BancafiPrivateCreditLine,
+      [
+        deployedContracts.creditScore,
+        deployedContracts.priceOracle,
+        deployedContracts.compliance
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await privateCreditLine.waitForDeployment();
+    deployedContracts.privateCreditLine = await privateCreditLine.getAddress();
+    console.log("✓ BancafiPrivateCreditLine deployed to:", deployedContracts.privateCreditLine);
+    console.log();
+
+    // ===========================================
+    // 10. Deploy Insurance Pool
+    // ===========================================
+    console.log("10. Deploying BancafiInsurance...");
+    const BancafiInsurance = await ethers.getContractFactory("BancafiInsurance");
+    const insurance = await upgrades.deployProxy(
+      BancafiInsurance,
+      [
+        deployedContracts.lending,
+        deployedContracts.priceOracle
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await insurance.waitForDeployment();
+    deployedContracts.insurance = await insurance.getAddress();
+    console.log("✓ BancafiInsurance deployed to:", deployedContracts.insurance);
+    console.log();
+
+    // ===========================================
+    // 11. Deploy Institutional Onboarding
+    // ===========================================
+    console.log("11. Deploying InstitutionalOnboarding...");
+    const InstitutionalOnboarding = await ethers.getContractFactory("InstitutionalOnboarding");
+    const institutionalOnboarding = await upgrades.deployProxy(
+      InstitutionalOnboarding,
+      [deployedContracts.compliance],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await institutionalOnboarding.waitForDeployment();
+    deployedContracts.institutionalOnboarding = await institutionalOnboarding.getAddress();
+    console.log("✓ InstitutionalOnboarding deployed to:", deployedContracts.institutionalOnboarding);
+    console.log();
+
+    // ===========================================
+    // 12. Deploy Portfolio Manager
+    // ===========================================
+    console.log("12. Deploying BancafiPortfolioManager...");
+    const BancafiPortfolioManager = await ethers.getContractFactory("BancafiPortfolioManager");
+    const portfolioManager = await upgrades.deployProxy(
+      BancafiPortfolioManager,
+      [deployedContracts.debtCollection],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await portfolioManager.waitForDeployment();
+    deployedContracts.portfolioManager = await portfolioManager.getAddress();
+    console.log("✓ BancafiPortfolioManager deployed to:", deployedContracts.portfolioManager);
+    console.log();
+
+    // ===========================================
+    // 13. Deploy Wallet Integration
+    // ===========================================
+    console.log("13. Deploying BancafiWalletIntegration...");
+    const BancafiWalletIntegration = await ethers.getContractFactory("BancafiWalletIntegration");
+    const walletIntegration = await upgrades.deployProxy(
+      BancafiWalletIntegration,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await walletIntegration.waitForDeployment();
+    deployedContracts.walletIntegration = await walletIntegration.getAddress();
+    console.log("✓ BancafiWalletIntegration deployed to:", deployedContracts.walletIntegration);
+    console.log();
+
+    // ===========================================
+    // Configure Contract Permissions
+    // ===========================================
+    console.log("Configuring contract permissions...\n");
+
+    // Authorize BancafiLending to manage collateral
+    console.log("- Authorizing BancafiLending in CollateralManager...");
+    await collateralManager.setAuthorizedCaller(deployedContracts.lending, true);
+
+    // Authorize DebtCollection to manage collateral
+    console.log("- Authorizing DebtCollection in CollateralManager...");
+    await collateralManager.setAuthorizedCaller(deployedContracts.debtCollection, true);
+
+    // Authorize BancafiLending to update credit scores
+    console.log("- Authorizing BancafiLending in CreditScore...");
+    await creditScore.setAuthorizedCaller(deployedContracts.lending, true);
+
+    // Authorize DebtCollection to update credit scores
+    console.log("- Authorizing DebtCollection in CreditScore...");
+    await creditScore.setAuthorizedCaller(deployedContracts.debtCollection, true);
+
+    // Authorize PrivateCreditLine to update credit scores
+    console.log("- Authorizing PrivateCreditLine in CreditScore...");
+    await creditScore.setAuthorizedCaller(deployedContracts.privateCreditLine, true);
+
+    // Authorize BancafiLending in MultiAssetCollateralManager
+    console.log("- Authorizing BancafiLending in MultiAssetCollateralManager...");
+    const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
+    await multiAssetCollateralManager.grantRole(MANAGER_ROLE, deployedContracts.lending);
+
+    // Authorize DebtCollection in MultiAssetCollateralManager
+    console.log("- Authorizing DebtCollection in MultiAssetCollateralManager...");
+    const LIQUIDATOR_ROLE = ethers.keccak256(ethers.toUtf8Bytes("LIQUIDATOR_ROLE"));
+    await multiAssetCollateralManager.grantRole(LIQUIDATOR_ROLE, deployedContracts.debtCollection);
+
+    console.log("\n✓ All permissions configured successfully!\n");
+
+    // ===========================================
+    // Deployment Summary
+    // ===========================================
+    console.log("=".repeat(60));
+    console.log("DEPLOYMENT SUMMARY");
+    console.log("=".repeat(60));
+    console.log("Network:", (await ethers.provider.getNetwork()).name);
+    console.log("Deployer:", deployer.address);
+    console.log("Timestamp:", new Date().toISOString());
+    console.log();
+    console.log("Deployed Contracts:");
+    console.log("-".repeat(60));
+
+    for (const [name, address] of Object.entries(deployedContracts)) {
+      console.log(`${name.padEnd(30)} ${address}`);
+    }
+
+    console.log("=".repeat(60));
+    console.log();
+
+    // Save deployment addresses to file
+    const fs = require("fs");
+    const deploymentInfo = {
+      network: (await ethers.provider.getNetwork()).name,
+      chainId: (await ethers.provider.getNetwork()).chainId,
+      deployer: deployer.address,
+      timestamp: new Date().toISOString(),
+      contracts: deployedContracts
+    };
+
+    fs.writeFileSync(
+      "./deployment-addresses.json",
+      JSON.stringify(deploymentInfo, null, 2)
+    );
+
+    console.log("✓ Deployment addresses saved to deployment-addresses.json");
+    console.log("\n✅ Deployment completed successfully!");
+
+  } catch (error) {
+    console.error("\n❌ Deployment failed!");
+    console.error("Error:", error.message);
+    throw error;
+  }
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

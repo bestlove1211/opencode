@@ -1,0 +1,250 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("🏢 BANCAFI REAL ESTATE TOKENIZATION DEMO\n");
+  console.log("=" .repeat(70));
+
+  // Contract address
+  const assetTokenAddress = "0x9d4454B023096f34B160D6B654540c56A1F81688";
+  const assetToken = await ethers.getContractAt("BancafiAssetToken", assetTokenAddress);
+
+  const [deployer, developer, investor1, investor2, investor3] = await ethers.getSigners();
+
+  console.log("👥 PARTICIPANTS:");
+  console.log("  Property Developer:", developer.address);
+  console.log("  Investor 1:", investor1.address);
+  console.log("  Investor 2:", investor2.address);
+  console.log("  Investor 3:", investor3.address);
+  console.log("=" .repeat(70) + "\n");
+
+  // Real Estate Properties to Tokenize
+  const properties = [
+    {
+      name: "Dubai Marina Luxury Apartment",
+      owner: developer.address,
+      type: 0, // RealEstate
+      valuation: ethers.parseEther("2500000"), // $2.5M
+      location: "Dubai Marina, Tower 23, Floor 45, Unit 4502",
+      details: {
+        size: "2,500 sq ft",
+        bedrooms: 3,
+        bathrooms: 3,
+        amenities: "Pool, Gym, 24/7 Security",
+        yearBuilt: 2023
+      },
+      documents: "ipfs://QmDubaiMarinaLegalDocs_Certificate_TitleDeed_abc123"
+    },
+    {
+      name: "Manhattan Commercial Building",
+      owner: developer.address,
+      type: 0, // RealEstate
+      valuation: ethers.parseEther("15000000"), // $15M
+      location: "Manhattan, New York, 5th Avenue, Building 250",
+      details: {
+        size: "50,000 sq ft",
+        floors: 12,
+        type: "Commercial Office Space",
+        occupancyRate: "95%",
+        yearBuilt: 2020
+      },
+      documents: "ipfs://QmManhattanCommercial_TitleDeed_Lease_Contracts_def456"
+    },
+    {
+      name: "London Prime Residential",
+      owner: investor1.address,
+      type: 0, // RealEstate
+      valuation: ethers.parseEther("5000000"), // $5M
+      location: "Kensington, London, SW7 3AR, Hyde Park Gardens",
+      details: {
+        size: "4,000 sq ft",
+        bedrooms: 5,
+        bathrooms: 4,
+        features: "Period Property, Garden, Parking",
+        yearBuilt: 1890
+      },
+      documents: "ipfs://QmLondonPrime_LandRegistry_Deeds_ghi789"
+    }
+  ];
+
+  console.log("📋 STEP 1: TOKENIZING REAL ESTATE PROPERTIES\n");
+
+  let tokenId = 0;
+  const tokenizedProperties = [];
+
+  for (const property of properties) {
+    tokenId++;
+    console.log(`\n🏠 Property ${tokenId}: ${property.name}`);
+    console.log("─".repeat(70));
+    console.log(`📍 Location: ${property.location}`);
+    console.log(`💰 Valuation: ${ethers.formatEther(property.valuation)} ETH`);
+    console.log(`📏 Size: ${property.details.size}`);
+    console.log(`📄 Documents: ${property.documents}`);
+
+    console.log(`\n⏳ Tokenizing property...`);
+    const tx = await assetToken.tokenizeAsset(
+      property.owner,
+      property.type,
+      property.valuation,
+      property.location,
+      property.documents
+    );
+    await tx.wait();
+
+    console.log(`✅ Property Tokenized! Token ID: ${tokenId}`);
+    console.log(`   Owner: ${property.owner}`);
+    console.log(`   Status: Pending Verification`);
+
+    tokenizedProperties.push({
+      ...property,
+      tokenId: tokenId
+    });
+  }
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("📋 STEP 2: VERIFYING REAL ESTATE ASSETS\n");
+
+  for (const property of tokenizedProperties) {
+    console.log(`\n✔️  Verifying: ${property.name} (Token ID: ${property.tokenId})`);
+    await assetToken.verifyAsset(property.tokenId);
+
+    const metadata = await assetToken.assetMetadata(property.tokenId);
+    console.log(`✅ Verified by: ${deployer.address}`);
+    console.log(`   Status: ${metadata.status === 1n ? "✅ VERIFIED" : "⏳ PENDING"}`);
+    console.log(`   Timestamp: ${new Date(Number(metadata.lastUpdatedAt) * 1000).toLocaleString()}`);
+  }
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("📋 STEP 3: FRACTIONALIZING PROPERTIES FOR INVESTMENT\n");
+
+  // Fractionalize Dubai Marina Apartment
+  console.log("\n🔀 Fractionalizing: Dubai Marina Luxury Apartment (Token ID: 1)");
+  console.log("   Total Fractions: 10,000 (Each fraction = $250 investment)");
+
+  await assetToken.connect(developer).fractionalizeAsset(1, 10000);
+
+  const prop1Meta = await assetToken.assetMetadata(1);
+  console.log(`✅ Fractionalization Complete!`);
+  console.log(`   Owner: ${developer.address}`);
+  console.log(`   Total Fractions: ${prop1Meta.totalFractions.toString()}`);
+  console.log(`   Value per Fraction: $250`);
+
+  // Fractionalize Manhattan Building
+  console.log("\n\n🔀 Fractionalizing: Manhattan Commercial Building (Token ID: 2)");
+  console.log("   Total Fractions: 30,000 (Each fraction = $500 investment)");
+
+  await assetToken.connect(developer).fractionalizeAsset(2, 30000);
+
+  const prop2Meta = await assetToken.assetMetadata(2);
+  console.log(`✅ Fractionalization Complete!`);
+  console.log(`   Owner: ${developer.address}`);
+  console.log(`   Total Fractions: ${prop2Meta.totalFractions.toString()}`);
+  console.log(`   Value per Fraction: $500`);
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("📋 STEP 4: INVESTORS ACQUIRING FRACTIONAL OWNERSHIP\n");
+
+  // Investor 1 buys Dubai Marina fractions
+  console.log("\n💼 Investor 1 purchasing Dubai Marina fractions...");
+  console.log("   Acquiring 2,000 fractions (20% ownership = $500,000)");
+  await assetToken.connect(developer).transferFractional(1, investor1.address, 2000);
+
+  let inv1Fractions = await assetToken.fractionalOwnership(1, investor1.address);
+  console.log(`✅ Transfer Complete!`);
+  console.log(`   Investor 1 now owns: ${inv1Fractions.toString()} fractions (${inv1Fractions * 100n / 10000n}%)`);
+
+  // Investor 2 buys Dubai Marina fractions
+  console.log("\n💼 Investor 2 purchasing Dubai Marina fractions...");
+  console.log("   Acquiring 3,000 fractions (30% ownership = $750,000)");
+  await assetToken.connect(developer).transferFractional(1, investor2.address, 3000);
+
+  let inv2Fractions = await assetToken.fractionalOwnership(1, investor2.address);
+  console.log(`✅ Transfer Complete!`);
+  console.log(`   Investor 2 now owns: ${inv2Fractions.toString()} fractions (${inv2Fractions * 100n / 10000n}%)`);
+
+  // Investor 3 buys Manhattan fractions
+  console.log("\n💼 Investor 3 purchasing Manhattan Commercial fractions...");
+  console.log("   Acquiring 6,000 fractions (20% ownership = $3,000,000)");
+  await assetToken.connect(developer).transferFractional(2, investor3.address, 6000);
+
+  let inv3Fractions = await assetToken.fractionalOwnership(2, investor3.address);
+  console.log(`✅ Transfer Complete!`);
+  console.log(`   Investor 3 now owns: ${inv3Fractions.toString()} fractions (${inv3Fractions * 100n / 30000n}%)`);
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("📋 STEP 5: SECONDARY MARKET TRADING\n");
+
+  // Investor 1 sells some fractions to Investor 2
+  console.log("\n🔄 Secondary Market: Investor 1 → Investor 2");
+  console.log("   Transferring 500 Dubai Marina fractions");
+  await assetToken.connect(investor1).transferFractional(1, investor2.address, 500);
+
+  inv1Fractions = await assetToken.fractionalOwnership(1, investor1.address);
+  inv2Fractions = await assetToken.fractionalOwnership(1, investor2.address);
+
+  console.log(`✅ Secondary Transfer Complete!`);
+  console.log(`   Investor 1 now owns: ${inv1Fractions.toString()} fractions (${inv1Fractions * 100n / 10000n}%)`);
+  console.log(`   Investor 2 now owns: ${inv2Fractions.toString()} fractions (${inv2Fractions * 100n / 10000n}%)`);
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("📋 STEP 6: UPDATING PROPERTY VALUATIONS\n");
+
+  // Market appreciation for Dubai Marina
+  console.log("\n📈 Dubai Marina property appreciated by 20%");
+  const newDubaiValuation = ethers.parseEther("3000000"); // $3M
+  await assetToken.updateValuation(1, newDubaiValuation);
+
+  const updatedMeta1 = await assetToken.assetMetadata(1);
+  console.log(`✅ Valuation Updated!`);
+  console.log(`   Old Value: $2,500,000`);
+  console.log(`   New Value: ${ethers.formatEther(updatedMeta1.valuation)} ETH ($3,000,000)`);
+  console.log(`   Investor 2 portfolio gain: ${(3000000 - 2500000) * Number(inv2Fractions) / 10000} USD`);
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("📊 FINAL PORTFOLIO SUMMARY\n");
+
+  // Get all ownership data
+  const dev1Fractions = await assetToken.fractionalOwnership(1, developer.address);
+  const dev2Fractions = await assetToken.fractionalOwnership(2, developer.address);
+  const inv1Dubai = await assetToken.fractionalOwnership(1, investor1.address);
+  const inv2Dubai = await assetToken.fractionalOwnership(1, investor2.address);
+  const inv3Manhattan = await assetToken.fractionalOwnership(2, investor3.address);
+
+  console.log("\n🏢 DUBAI MARINA LUXURY APARTMENT (Token ID: 1)");
+  console.log("   Current Valuation: $3,000,000");
+  console.log("   Total Fractions: 10,000");
+  console.log("─".repeat(70));
+  console.log(`   Developer:  ${dev1Fractions.toString()} fractions (${dev1Fractions * 100n / 10000n}%) = $${Number(dev1Fractions) * 300}`);
+  console.log(`   Investor 1: ${inv1Dubai.toString()} fractions (${inv1Dubai * 100n / 10000n}%) = $${Number(inv1Dubai) * 300}`);
+  console.log(`   Investor 2: ${inv2Dubai.toString()} fractions (${inv2Dubai * 100n / 10000n}%) = $${Number(inv2Dubai) * 300}`);
+
+  console.log("\n\n🏢 MANHATTAN COMMERCIAL BUILDING (Token ID: 2)");
+  console.log("   Current Valuation: $15,000,000");
+  console.log("   Total Fractions: 30,000");
+  console.log("─".repeat(70));
+  console.log(`   Developer:  ${dev2Fractions.toString()} fractions (${dev2Fractions * 100n / 30000n}%) = $${Number(dev2Fractions) * 500}`);
+  console.log(`   Investor 3: ${inv3Manhattan.toString()} fractions (${inv3Manhattan * 100n / 30000n}%) = $${Number(inv3Manhattan) * 500}`);
+
+  console.log("\n\n🏠 LONDON PRIME RESIDENTIAL (Token ID: 3)");
+  console.log("   Current Valuation: $5,000,000");
+  console.log("   Status: Not Fractionalized (100% ownership)");
+  console.log("─".repeat(70));
+  console.log(`   Investor 1: 100% = $5,000,000`);
+
+  const totalAssets = await assetToken.totalSupply();
+  console.log("\n\n" + "=".repeat(70));
+  console.log("✅ DEMO COMPLETE!");
+  console.log("=" .repeat(70));
+  console.log(`📊 Total Real Estate Assets Tokenized: ${totalAssets.toString()}`);
+  console.log(`💰 Total Portfolio Value: $23,000,000`);
+  console.log(`👥 Total Investors: 4 (1 Developer + 3 Investors)`);
+  console.log(`🔀 Fractionalized Properties: 2/3`);
+  console.log(`📈 Total Fractional Transfers: 4`);
+  console.log("\n🎉 All real estate tokenization features working perfectly!");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

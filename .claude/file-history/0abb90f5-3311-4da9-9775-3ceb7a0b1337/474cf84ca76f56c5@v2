@@ -1,0 +1,139 @@
+# Bancafi Quick Start Guide
+
+## 🚀 Get Started in 5 Minutes
+
+### 1. Install Dependencies
+```bash
+cd bancafi-contracts
+npm install
+```
+
+### 2. Compile Contracts
+```bash
+npx hardhat compile
+```
+
+### 3. Run Local Node
+```bash
+npx hardhat node
+```
+
+### 4. Deploy (in new terminal)
+```bash
+npx hardhat run scripts/deploy.js --network localhost
+```
+
+## 📝 What Gets Deployed
+
+1. **Governance Token (BGT)** - 100M initial supply
+2. **Timelock Controller** - 2-day delay
+3. **DAO Governor** - Full governance system
+4. **Asset Token (BRWA)** - NFTs for real-world assets
+5. **Bailout System** - Emergency funding mechanism
+
+## 💡 Quick Examples
+
+### Tokenize an Asset
+```javascript
+const BancafiAssetToken = await ethers.getContractAt("BancafiAssetToken", ASSET_TOKEN_ADDRESS);
+
+const tx = await BancafiAssetToken.tokenizeAsset(
+    ownerAddress,
+    0, // RealEstate
+    ethers.parseEther("500000"),
+    "Dubai Marina Tower 3",
+    "ipfs://Qm123abc..."
+);
+
+const receipt = await tx.wait();
+console.log("Asset tokenized! Token ID:", receipt.events[0].args.tokenId);
+```
+
+### Request a Bailout
+```javascript
+const BancafiBailout = await ethers.getContractAt("BancafiBailout", BAILOUT_ADDRESS);
+
+const tx = await BancafiBailout.requestBailout(
+    ethers.parseEther("10000"), // 10K ETH
+    "Project funding shortfall",
+    "ipfs://Qmsolvency123...",
+    assetTokenId, // Collateral
+    24 // 24 months
+);
+
+const receipt = await tx.wait();
+console.log("Bailout requested! Request ID:", receipt.events[0].args.requestId);
+```
+
+### Create a Proposal
+```javascript
+const BancafiDAO = await ethers.getContractAt("BancafiDAO", DAO_ADDRESS);
+
+// Encode function call
+const bailoutInterface = new ethers.Interface(BancafiBailout.abi);
+const calldata = bailoutInterface.encodeFunctionData("approveBailout", [requestId, 500]);
+
+const tx = await BancafiDAO.proposeWithMetadata(
+    [BAILOUT_ADDRESS],
+    [0],
+    [calldata],
+    "Approve emergency bailout for Project X",
+    "Bailout Proposal #1",
+    true
+);
+
+const receipt = await tx.wait();
+console.log("Proposal created! ID:", receipt.events[0].args.proposalId);
+```
+
+### Vote on Proposal
+```javascript
+// 0 = Against, 1 = For, 2 = Abstain
+await BancafiDAO.castVoteWithTimestamp(proposalId, 1);
+console.log("Vote cast!");
+```
+
+## 🔐 Security Checklist
+
+Before using in production:
+
+- [ ] Run full test suite
+- [ ] Professional security audit
+- [ ] Deploy to testnet (Sepolia/Goerli)
+- [ ] Test all workflows end-to-end
+- [ ] Setup multisig for admin roles
+- [ ] Configure proper timelock delays
+- [ ] Verify contracts on Etherscan
+- [ ] Setup monitoring and alerts
+
+## 📚 Next Steps
+
+1. Read the full [README.md](./README.md)
+2. Review contract source code in `contracts/core/`
+3. Study deployment script in `scripts/deploy.js`
+4. Write tests in `test/`
+5. Configure networks in `hardhat.config.js`
+
+## 🆘 Common Issues
+
+### "Insufficient funds"
+Make sure your account has enough ETH for gas fees.
+
+### "Insufficient voting power"
+You need to delegate tokens to yourself: `await token.delegate(yourAddress)`
+
+### "Not paused" errors
+The contract might be paused. Check with admin.
+
+### Upgrade failed
+Ensure you have `UPGRADER_ROLE` on the contract.
+
+## 📞 Support
+
+- GitHub Issues: [Report bugs](https://github.com/your-repo/issues)
+- Documentation: See README.md
+- Community: [Discord/Telegram link]
+
+---
+
+**Ready to build the future of decentralized finance!** 🚀

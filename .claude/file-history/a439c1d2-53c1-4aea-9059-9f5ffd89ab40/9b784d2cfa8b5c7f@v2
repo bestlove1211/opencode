@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title IPriceOracle
+ * @notice Interface for price oracle integration (Chainlink compatible)
+ */
+interface IPriceOracle {
+    /**
+     * @notice Get latest price for an asset
+     * @param asset Asset address
+     * @return price Price in USD (18 decimals)
+     */
+    function getLatestPrice(address asset) external view returns (uint256 price);
+
+    /**
+     * @notice Get price with timestamp
+     * @param asset Asset address
+     * @return price Price in USD (18 decimals)
+     * @return timestamp Last update timestamp
+     */
+    function getPriceWithTimestamp(address asset) external view returns (uint256 price, uint256 timestamp);
+
+    /**
+     * @notice Check if price is stale
+     * @param asset Asset address
+     * @return Whether price data is stale
+     */
+    function isPriceStale(address asset) external view returns (bool);
+
+    /**
+     * @notice Get asset decimals
+     * @param asset Asset address
+     * @return Number of decimals for the asset price
+     */
+    function getAssetDecimals(address asset) external view returns (uint8);
+}

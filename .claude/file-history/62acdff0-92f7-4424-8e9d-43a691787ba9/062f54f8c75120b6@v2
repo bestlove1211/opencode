@@ -1,0 +1,380 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("🎯 BANCAFI COMPREHENSIVE ECOSYSTEM INTEGRATION DEMO\n");
+  console.log("=" .repeat(80));
+  console.log("Demonstrating complete workflow across all 15 contracts\n");
+
+  // Load deployment
+  const fs = require("fs");
+  const deployment = JSON.parse(fs.readFileSync("deployment-complete.json"));
+  const addresses = deployment.contracts;
+
+  const [deployer, user1, user2, institution, teamMember] = await ethers.getSigners();
+
+  console.log("📋 PARTICIPANTS:");
+  console.log(`  Deployer:     ${deployer.address}`);
+  console.log(`  User1:        ${user1.address}`);
+  console.log(`  User2:        ${user2.address}`);
+  console.log(`  Institution:  ${institution.address}`);
+  console.log(`  Team Member:  ${teamMember.address}\n`);
+
+  // Get contract instances
+  const governanceToken = await ethers.getContractAt("BancafiGovernanceToken", addresses.governanceToken);
+  const dao = await ethers.getContractAt("BancafiDAO", addresses.dao);
+  const assetToken = await ethers.getContractAt("BancafiAssetToken", addresses.assetToken);
+  const bailout = await ethers.getContractAt("BancafiBailout", addresses.bailout);
+  const rentalIncome = await ethers.getContractAt("BancafiRentalIncome", addresses.rentalIncome);
+  const kyc = await ethers.getContractAt("BancafiKYC", addresses.kyc);
+  const marketplace = await ethers.getContractAt("BancafiMarketplace", addresses.marketplace);
+  const liquidityPool = await ethers.getContractAt("BancafiLiquidityPool", addresses.liquidityPool);
+  const oracle = await ethers.getContractAt("BancafiOracle", addresses.oracle);
+  const staking = await ethers.getContractAt("BancafiStaking", addresses.staking);
+  const insurance = await ethers.getContractAt("BancafiInsurance", addresses.insurance);
+  const vesting = await ethers.getContractAt("BancafiVesting", addresses.vesting);
+  const treasury = await ethers.getContractAt("BancafiTreasury", addresses.treasury);
+
+  // ========== PHASE 1: ONBOARDING & SETUP ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("📝 PHASE 1: USER ONBOARDING & TOKEN DISTRIBUTION");
+  console.log("=".repeat(80));
+
+  // KYC for User1
+  console.log("\n1️⃣ KYC Verification for User1...");
+  await kyc.connect(user1).registerUser();
+  await kyc.uploadDocument(user1.address, "QmKYCDocument1");
+  await kyc.verifyDocument(user1.address, 0);
+  await kyc.verifyUser(user1.address, 2); // Premium tier
+  console.log("✅ User1 verified with Premium tier");
+
+  // KYC for User2
+  console.log("\n2️⃣ KYC Verification for User2...");
+  await kyc.connect(user2).registerUser();
+  await kyc.uploadDocument(user2.address, "QmKYCDocument2");
+  await kyc.verifyDocument(user2.address, 0);
+  await kyc.verifyUser(user2.address, 1); // Standard tier
+  console.log("✅ User2 verified with Standard tier");
+
+  // Create vesting schedule for team member
+  console.log("\n3️⃣ Creating Team Vesting Schedule...");
+  const teamTokens = ethers.parseEther("100000"); // 100K BGT
+  await governanceToken.transfer(addresses.vesting, teamTokens);
+  await vesting.createVestingSchedule(
+    teamMember.address,
+    teamTokens,
+    0 // Team category (4 years, 1 year cliff)
+  );
+  console.log(`✅ Created vesting: ${ethers.formatEther(teamTokens)} BGT for team member`);
+  console.log("   Schedule: 4 years, 1 year cliff, monthly releases");
+
+  // Distribute governance tokens for staking
+  console.log("\n4️⃣ Distributing BGT Tokens for Staking...");
+  await governanceToken.transfer(user1.address, ethers.parseEther("10000"));
+  await governanceToken.transfer(user2.address, ethers.parseEther("5000"));
+  console.log("✅ Distributed 10,000 BGT to User1");
+  console.log("✅ Distributed 5,000 BGT to User2");
+
+  // ========== PHASE 2: ASSET TOKENIZATION & ORACLE ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🏠 PHASE 2: ASSET TOKENIZATION WITH ORACLE PRICING");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ Tokenizing Real Estate Asset...");
+  const tx1 = await assetToken.tokenizeAsset(
+    0, // RealEstate
+    "Downtown Commercial Property",
+    "ipfs://QmRealEstateDetails",
+    ethers.parseEther("1000000") // $1M valuation
+  );
+  const receipt1 = await tx1.wait();
+  const tokenId = 1; // First token
+  console.log(`✅ Real Estate tokenized: Token ID #${tokenId}`);
+  console.log(`   Valuation: $${ethers.formatEther(ethers.parseEther("1000000"))}`);
+
+  console.log("\n2️⃣ Verifying Asset...");
+  await assetToken.verifyAsset(tokenId);
+  console.log("✅ Asset verified by VERIFIER_ROLE");
+
+  console.log("\n3️⃣ Initializing Oracle Price Feed (Manual)...");
+  await oracle.initializeAssetManual(
+    tokenId,
+    0, // RealEstate
+    ethers.parseEther("1000000"), // Initial price
+    0 // Use default staleness (30 days for real estate)
+  );
+  console.log("✅ Oracle initialized with manual pricing");
+  const priceData = await oracle.getPriceWithStatus(tokenId);
+  console.log(`   Current Price: $${ethers.formatEther(priceData[0])}`);
+  console.log(`   Is Stale: ${priceData[1]}`);
+  console.log(`   Source: Manual`);
+
+  console.log("\n4️⃣ Fractionalizing Asset (1000 fractions)...");
+  await assetToken.fractionalizeAsset(tokenId, 1000);
+  console.log("✅ Asset fractionalized into 1000 shares");
+
+  // ========== PHASE 3: INSURANCE & PROTECTION ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🛡️ PHASE 3: INSURANCE POLICY CREATION");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ User1 Creating Insurance Policy...");
+  const coverageAmount = ethers.parseEther("500000"); // $500K coverage
+  const duration = 365 * 24 * 60 * 60; // 1 year
+  const annualPremium = (coverageAmount * BigInt(500)) / BigInt(10000); // 5%
+  const premium = (annualPremium * BigInt(duration)) / BigInt(365 * 24 * 60 * 60);
+
+  await insurance.connect(user1).createPolicy(
+    tokenId,
+    coverageAmount,
+    duration,
+    { value: premium }
+  );
+  console.log(`✅ Insurance policy created`);
+  console.log(`   Coverage: $${ethers.formatEther(coverageAmount)}`);
+  console.log(`   Premium: ${ethers.formatEther(premium)} ETH`);
+  console.log(`   Duration: 1 year`);
+
+  // ========== PHASE 4: STAKING & VOTING POWER ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🔒 PHASE 4: GOVERNANCE TOKEN STAKING");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ User1 Staking with 1-Year Lock...");
+  const stakeAmount1 = ethers.parseEther("5000");
+  await governanceToken.connect(user1).approve(addresses.staking, stakeAmount1);
+  await staking.connect(user1).stake(stakeAmount1, 3); // OneYear lock
+  const votingPower1 = (stakeAmount1 * BigInt(30000)) / BigInt(10000); // 3x multiplier
+  console.log(`✅ Staked: ${ethers.formatEther(stakeAmount1)} BGT`);
+  console.log(`   Lock Period: 1 Year`);
+  console.log(`   Voting Power: ${ethers.formatEther(votingPower1)} (3x multiplier)`);
+
+  console.log("\n2️⃣ User2 Staking with 6-Month Lock...");
+  const stakeAmount2 = ethers.parseEther("3000");
+  await governanceToken.connect(user2).approve(addresses.staking, stakeAmount2);
+  await staking.connect(user2).stake(stakeAmount2, 2); // SixMonths lock
+  const votingPower2 = (stakeAmount2 * BigInt(20000)) / BigInt(10000); // 2x multiplier
+  console.log(`✅ Staked: ${ethers.formatEther(stakeAmount2)} BGT`);
+  console.log(`   Lock Period: 6 Months`);
+  console.log(`   Voting Power: ${ethers.formatEther(votingPower2)} (2x multiplier)`);
+
+  // ========== PHASE 5: FRACTIONAL DISTRIBUTION & MARKETPLACE ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🏪 PHASE 5: FRACTIONAL TRADING & MARKETPLACE");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ Distributing Fractional Ownership...");
+  await assetToken.transferFractional(tokenId, user1.address, 400); // 40%
+  await assetToken.transferFractional(tokenId, user2.address, 300); // 30%
+  console.log("✅ Distributed 400 fractions (40%) to User1");
+  console.log("✅ Distributed 300 fractions (30%) to User2");
+
+  console.log("\n2️⃣ User1 Creating Marketplace Listing...");
+  await assetToken.connect(user1).setApprovalForAll(addresses.marketplace, true);
+  const listingPrice = ethers.parseEther("1200"); // $1200 per fraction
+  await marketplace.connect(user1).createListing(
+    tokenId,
+    100, // Selling 100 fractions
+    listingPrice,
+    7 * 24 * 60 * 60, // 7 days duration
+    0 // Sale type
+  );
+  console.log(`✅ Listed 100 fractions at ${ethers.formatEther(listingPrice)} ETH each`);
+  console.log(`   Total Value: ${ethers.formatEther(listingPrice * BigInt(100))} ETH`);
+
+  console.log("\n3️⃣ Creating Liquidity Pool...");
+  await assetToken.connect(user2).setApprovalForAll(addresses.liquidityPool, true);
+  const poolFractions = 200;
+  const poolETH = ethers.parseEther("240000"); // 200 fractions * $1200
+  await liquidityPool.connect(user2).createPool(
+    tokenId,
+    poolFractions,
+    { value: poolETH }
+  );
+  console.log(`✅ Liquidity pool created`);
+  console.log(`   Fractions: ${poolFractions}`);
+  console.log(`   ETH: ${ethers.formatEther(poolETH)}`);
+  console.log(`   Initial Price: ${ethers.formatEther(poolETH / BigInt(poolFractions))} ETH per fraction`);
+
+  // ========== PHASE 6: RENTAL INCOME DISTRIBUTION ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("💰 PHASE 6: RENTAL INCOME DISTRIBUTION");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ Creating Rental Period...");
+  const startDate = Math.floor(Date.now() / 1000);
+  const endDate = startDate + (30 * 24 * 60 * 60); // 30 days
+  await rentalIncome.createRentalPeriod(tokenId, startDate, endDate);
+  console.log("✅ Rental period created: 30 days");
+
+  console.log("\n2️⃣ Receiving Rental Income...");
+  const rentalAmount = ethers.parseEther("10000"); // $10K monthly rent
+  await rentalIncome.receiveRentalIncome(tokenId, 1, { value: rentalAmount });
+  console.log(`✅ Received ${ethers.formatEther(rentalAmount)} ETH rental income`);
+
+  console.log("\n3️⃣ Distributing Income to Shareholders...");
+  await rentalIncome.distributeIncome(tokenId, 1);
+  console.log("✅ Income distributed proportionally");
+
+  const user1Income = await rentalIncome.getUserIncome(tokenId, 1, user1.address);
+  const user2Income = await rentalIncome.getUserIncome(tokenId, 1, user2.address);
+  console.log(`   User1 (40%): ${ethers.formatEther(user1Income)} ETH`);
+  console.log(`   User2 (30%): ${ethers.formatEther(user2Income)} ETH`);
+
+  // ========== PHASE 7: TREASURY & BUDGET MANAGEMENT ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🏦 PHASE 7: TREASURY BUDGET & SPENDING");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ Depositing Funds to Treasury...");
+  await deployer.sendTransaction({
+    to: addresses.treasury,
+    value: ethers.parseEther("100000")
+  });
+  console.log("✅ Deposited 100,000 ETH to treasury");
+
+  console.log("\n2️⃣ Allocating Development Budget...");
+  await treasury.allocateBudget(0, ethers.parseEther("50000")); // Development
+  console.log("✅ Allocated 50,000 ETH to Development budget");
+
+  console.log("\n3️⃣ Creating Spending Proposal...");
+  const proposalAmount = ethers.parseEther("10000");
+  await treasury.createProposal(
+    user1.address,
+    proposalAmount,
+    ethers.ZeroAddress, // ETH
+    0, // Development category
+    "Smart contract audit payment"
+  );
+  console.log(`✅ Created proposal: ${ethers.formatEther(proposalAmount)} ETH for audit`);
+
+  console.log("\n4️⃣ Multi-Sig Approval (Requires 2 approvals)...");
+  await treasury.approveProposal(1);
+  console.log("✅ Approval 1/2 from deployer");
+
+  // Grant TREASURER_ROLE to user2 for second approval
+  const TREASURER_ROLE = await treasury.TREASURER_ROLE();
+  await treasury.grantRole(TREASURER_ROLE, user2.address);
+  await treasury.connect(user2).approveProposal(1);
+  console.log("✅ Approval 2/2 from user2");
+  console.log("✅ Proposal auto-executed! Funds transferred.");
+
+  // ========== PHASE 8: BAILOUT REQUEST ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🆘 PHASE 8: EMERGENCY BAILOUT WITH INSURANCE");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ User1 Requesting Emergency Bailout...");
+  await assetToken.connect(user1).approve(addresses.bailout, tokenId);
+
+  const bailoutAmount = ethers.parseEther("500000");
+  await bailout.connect(user1).requestBailout(
+    bailoutAmount,
+    "Market downturn - need liquidity",
+    "ipfs://QmFinancialProof",
+    tokenId,
+    12 // 12 months
+  );
+  console.log(`✅ Bailout requested: ${ethers.formatEther(bailoutAmount)} ETH`);
+  console.log("   Collateral: Token #1 (locked)");
+
+  console.log("\n2️⃣ DAO Approving Bailout (5% interest)...");
+  const BAILOUT_APPROVER = await bailout.BAILOUT_APPROVER_ROLE();
+  await bailout.approveBailout(1, 500); // 5% interest
+  console.log("✅ Bailout approved with 5% annual interest");
+
+  const totalWithInterest = (bailoutAmount * BigInt(10500)) / BigInt(10000);
+  console.log(`   Total to repay: ${ethers.formatEther(totalWithInterest)} ETH`);
+  console.log(`   Interest: ${ethers.formatEther(totalWithInterest - bailoutAmount)} ETH`);
+
+  // ========== PHASE 9: DAO GOVERNANCE ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("🗳️ PHASE 9: DAO GOVERNANCE PROPOSAL");
+  console.log("=".repeat(80));
+
+  console.log("\n1️⃣ Preparing Governance Participation...");
+  // Users need to delegate to participate
+  await governanceToken.connect(user1).delegate(user1.address);
+  await governanceToken.connect(user2).delegate(user2.address);
+  console.log("✅ Users delegated their voting power");
+
+  // Mine blocks to establish voting power snapshot
+  await ethers.provider.send("evm_mine", []);
+  await ethers.provider.send("evm_mine", []);
+
+  console.log("\n2️⃣ Creating DAO Proposal to Update Oracle Price...");
+  const target = addresses.oracle;
+  const value = 0;
+  const calldata = oracle.interface.encodeFunctionData("updatePriceManual", [
+    tokenId,
+    ethers.parseEther("1100000") // Update to $1.1M
+  ]);
+
+  const description = "Update real estate valuation to $1.1M based on new appraisal";
+
+  const proposalTx = await dao.connect(user1).proposeWithMetadata(
+    [target],
+    [value],
+    [calldata],
+    description,
+    "Real Estate Price Update",
+    false // Not a bailout proposal
+  );
+
+  const proposalReceipt = await proposalTx.wait();
+  console.log("✅ DAO proposal created!");
+  console.log("   Title: Real Estate Price Update");
+  console.log("   Target: Oracle contract");
+  console.log("   Action: Update asset price to $1.1M");
+
+  // ========== SUMMARY ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("📊 ECOSYSTEM INTEGRATION SUMMARY");
+  console.log("=".repeat(80));
+
+  console.log("\n✅ COMPLETED WORKFLOWS:");
+  console.log("   1. KYC verification for 2 users (Individual onboarding)");
+  console.log("   2. Team vesting schedule created (4-year with 1-year cliff)");
+  console.log("   3. Real estate asset tokenized with oracle pricing");
+  console.log("   4. Insurance policy created for asset protection");
+  console.log("   5. Governance tokens staked with voting power multipliers");
+  console.log("   6. Fractional ownership distributed and listed on marketplace");
+  console.log("   7. AMM liquidity pool created for fractional trading");
+  console.log("   8. Rental income distributed to fractional owners");
+  console.log("   9. Treasury budget allocated and spending proposal executed");
+  console.log("  10. Emergency bailout requested and approved with collateral");
+  console.log("  11. DAO governance proposal created for price update");
+
+  console.log("\n📈 KEY METRICS:");
+  const poolInfo = await staking.pool();
+  const treasuryStats = await treasury.getTreasuryStats();
+  const poolStats = await insurance.poolStats();
+
+  console.log(`   Total BGT Staked: ${ethers.formatEther(poolInfo.totalStaked)}`);
+  console.log(`   Total Voting Power: ${ethers.formatEther(poolInfo.totalVotingPower)}`);
+  console.log(`   Treasury Balance: ${ethers.formatEther(treasuryStats.currentETHBalance)} ETH`);
+  console.log(`   Insurance Pool: ${ethers.formatEther(poolStats.activeBalance)} ETH`);
+  console.log(`   Active Policies: ${poolStats.activePolicies}`);
+
+  console.log("\n🔗 CONTRACT INTERACTIONS:");
+  console.log("   ✓ AssetToken ↔ Oracle (Price feeds)");
+  console.log("   ✓ AssetToken ↔ Marketplace (Fractional trading)");
+  console.log("   ✓ AssetToken ↔ LiquidityPool (AMM trading)");
+  console.log("   ✓ AssetToken ↔ RentalIncome (Income distribution)");
+  console.log("   ✓ AssetToken ↔ Bailout (Collateral locking)");
+  console.log("   ✓ GovernanceToken ↔ Staking (Voting power)");
+  console.log("   ✓ GovernanceToken ↔ Vesting (Token distribution)");
+  console.log("   ✓ GovernanceToken ↔ DAO (Governance)");
+  console.log("   ✓ KYC ↔ Users (Individual verification)");
+  console.log("   ✓ Insurance ↔ AssetToken (Protection policies)");
+  console.log("   ✓ Treasury ↔ DAO (Budget governance)");
+
+  console.log("\n🎉 COMPLETE ECOSYSTEM DEMONSTRATION SUCCESSFUL!");
+  console.log("=" .repeat(80) + "\n");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

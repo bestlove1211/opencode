@@ -1,0 +1,424 @@
+const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+/**
+ * Bancafi MCP Server
+ * Provides blockchain interaction tools for the Bancafi DeFi platform
+ */
+class BancafiMCPServer {
+  constructor() {
+    this.server = new Server(
+      {
+        name: 'bancafi-mcp-server',
+        version: '1.0.0',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      }
+    );
+
+    this.setupHandlers();
+  }
+
+  setupHandlers() {
+    // List available tools
+    this.server.setRequestHandler('tools/list', async () => ({
+      tools: [
+        // READ OPERATIONS
+        {
+          name: 'get_asset_details',
+          description: 'Get details of a tokenized asset by ID',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tokenId: {
+                type: 'number',
+                description: 'The asset token ID',
+              },
+            },
+            required: ['tokenId'],
+          },
+        },
+        {
+          name: 'get_bailout_request',
+          description: 'Get bailout request details by ID',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              requestId: {
+                type: 'number',
+                description: 'The bailout request ID',
+              },
+            },
+            required: ['requestId'],
+          },
+        },
+        {
+          name: 'get_dao_proposal',
+          description: 'Get DAO proposal details and voting status',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              proposalId: {
+                type: 'string',
+                description: 'The proposal ID',
+              },
+            },
+            required: ['proposalId'],
+          },
+        },
+        {
+          name: 'get_staking_info',
+          description: 'Get staking pool information and user stake details',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              userAddress: {
+                type: 'string',
+                description: 'User wallet address (optional)',
+              },
+            },
+          },
+        },
+        {
+          name: 'get_platform_analytics',
+          description: 'Get platform-wide analytics including TVL and health score',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'get_marketplace_listings',
+          description: 'Get active marketplace listings',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tokenId: {
+                type: 'number',
+                description: 'Filter by asset token ID (optional)',
+              },
+            },
+          },
+        },
+        // WRITE OPERATIONS
+        {
+          name: 'tokenize_asset',
+          description: 'Tokenize a new real-world asset',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              to: {
+                type: 'string',
+                description: 'Owner address',
+              },
+              assetType: {
+                type: 'number',
+                description: '0=RealEstate, 1=Minerals, 2=OilAndEnergy, 3=Gold, 4=PhysicalAsset',
+              },
+              valuation: {
+                type: 'string',
+                description: 'Asset valuation in ETH (e.g., "1000000")',
+              },
+              location: {
+                type: 'string',
+                description: 'Asset location',
+              },
+              legalDocumentHash: {
+                type: 'string',
+                description: 'IPFS hash of legal documents',
+              },
+              privateKey: {
+                type: 'string',
+                description: 'Private key for transaction signing',
+              },
+            },
+            required: ['to', 'assetType', 'valuation', 'location', 'legalDocumentHash', 'privateKey'],
+          },
+        },
+        {
+          name: 'request_bailout',
+          description: 'Request an emergency bailout with collateral',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              amount: {
+                type: 'string',
+                description: 'Bailout amount in ETH',
+              },
+              reason: {
+                type: 'string',
+                description: 'Reason for bailout',
+              },
+              solvencyProof: {
+                type: 'string',
+                description: 'IPFS hash of solvency proof',
+              },
+              collateralTokenId: {
+                type: 'number',
+                description: 'Asset token ID to use as collateral',
+              },
+              repaymentMonths: {
+                type: 'number',
+                description: 'Repayment period in months',
+              },
+              privateKey: {
+                type: 'string',
+                description: 'Private key for transaction signing',
+              },
+            },
+            required: ['amount', 'reason', 'solvencyProof', 'collateralTokenId', 'repaymentMonths', 'privateKey'],
+          },
+        },
+        {
+          name: 'stake_tokens',
+          description: 'Stake governance tokens with lock period',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              amount: {
+                type: 'string',
+                description: 'Amount to stake in tokens',
+              },
+              lockPeriod: {
+                type: 'number',
+                description: '0=None, 1=3months, 2=6months, 3=1year, 4=2years',
+              },
+              privateKey: {
+                type: 'string',
+                description: 'Private key for transaction signing',
+              },
+            },
+            required: ['amount', 'lockPeriod', 'privateKey'],
+          },
+        },
+      ],
+    }));
+
+    // Handle tool calls
+    this.server.setRequestHandler('tools/call', async (request) => {
+      const { name, arguments: args } = request.params;
+
+      try {
+        let result;
+
+        switch (name) {
+          case 'get_asset_details':
+            result = await this.getAssetDetails(args.tokenId);
+            break;
+          case 'get_bailout_request':
+            result = await this.getBailoutRequest(args.requestId);
+            break;
+          case 'get_dao_proposal':
+            result = await this.getDAOProposal(args.proposalId);
+            break;
+          case 'get_staking_info':
+            result = await this.getStakingInfo(args.userAddress);
+            break;
+          case 'get_platform_analytics':
+            result = await this.getPlatformAnalytics();
+            break;
+          case 'get_marketplace_listings':
+            result = await this.getMarketplaceListings(args.tokenId);
+            break;
+          case 'tokenize_asset':
+            result = await this.tokenizeAsset(args);
+            break;
+          case 'request_bailout':
+            result = await this.requestBailout(args);
+            break;
+          case 'stake_tokens':
+            result = await this.stakeTokens(args);
+            break;
+          default:
+            throw new Error(`Unknown tool: ${name}`);
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error: ${error.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    });
+  }
+
+  // READ OPERATIONS
+  async getAssetDetails(tokenId) {
+    const asset = await blockchain.contracts.assetToken.assets(tokenId);
+    const owner = await blockchain.contracts.assetToken.ownerOf(tokenId);
+
+    return {
+      tokenId,
+      owner,
+      assetType: Number(asset.assetType),
+      valuation: ethers.formatEther(asset.valuation),
+      location: asset.location,
+      legalDocumentHash: asset.legalDocumentHash,
+      status: Number(asset.status),
+      verifiedAt: Number(asset.verifiedAt),
+      isFractionalized: asset.fractionalized,
+      totalFractions: Number(asset.totalFractions),
+    };
+  }
+
+  async getBailoutRequest(requestId) {
+    const request = await blockchain.contracts.bailout.bailoutRequests(requestId);
+
+    return {
+      requestId,
+      borrower: request.borrower,
+      amount: ethers.formatEther(request.amount),
+      reason: request.reason,
+      collateralTokenId: Number(request.collateralTokenId),
+      status: Number(request.status),
+      interestRate: Number(request.interestRate),
+      repaymentMonths: Number(request.repaymentMonths),
+      approvedAt: Number(request.approvedAt),
+      disbursedAt: Number(request.disbursedAt),
+    };
+  }
+
+  async getDAOProposal(proposalId) {
+    const state = await blockchain.contracts.dao.state(proposalId);
+    const proposalData = await blockchain.contracts.dao.proposals(proposalId);
+
+    return {
+      proposalId,
+      state: Number(state),
+      title: proposalData.title,
+      createdAt: Number(proposalData.createdAt),
+      isBailoutProposal: proposalData.isBailoutProposal,
+    };
+  }
+
+  async getStakingInfo(userAddress) {
+    const pool = await blockchain.contracts.staking.pool();
+
+    const result = {
+      pool: {
+        totalStaked: ethers.formatEther(pool.totalStaked),
+        totalVotingPower: ethers.formatEther(pool.totalVotingPower),
+        rewardsPerSecond: ethers.formatEther(pool.rewardsPerSecond),
+      },
+    };
+
+    if (userAddress) {
+      const userInfo = await blockchain.contracts.staking.userTotalStaked(userAddress);
+      result.userStaked = ethers.formatEther(userInfo);
+    }
+
+    return result;
+  }
+
+  async getPlatformAnalytics() {
+    const tvl = await blockchain.contracts.analytics.calculateTotalValueLocked();
+    const healthScore = await blockchain.contracts.analytics.calculateHealthScore();
+    const snapshot = await blockchain.contracts.analytics.getSystemSnapshot();
+
+    return {
+      totalValueLocked: ethers.formatEther(tvl),
+      healthScore: Number(healthScore),
+      totalAssets: Number(snapshot.totalAssets),
+      totalStakers: Number(snapshot.totalStakers),
+      totalMarketplaceVolume: ethers.formatEther(snapshot.totalMarketplaceVolume),
+    };
+  }
+
+  async getMarketplaceListings(tokenId) {
+    // Note: This would require event queries or an indexing solution
+    return {
+      message: 'Marketplace listing queries require event indexing',
+      suggestion: 'Use event monitoring service',
+    };
+  }
+
+  // WRITE OPERATIONS
+  async tokenizeAsset(args) {
+    const contract = blockchain.getContractWithSigner('assetToken', args.privateKey);
+
+    const tx = await contract.tokenizeAsset(
+      args.to,
+      args.assetType,
+      ethers.parseEther(args.valuation),
+      args.location,
+      args.legalDocumentHash
+    );
+
+    const receipt = await tx.wait();
+
+    return {
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+    };
+  }
+
+  async requestBailout(args) {
+    const contract = blockchain.getContractWithSigner('bailout', args.privateKey);
+
+    const tx = await contract.requestBailout(
+      ethers.parseEther(args.amount),
+      args.reason,
+      args.solvencyProof,
+      args.collateralTokenId,
+      args.repaymentMonths
+    );
+
+    const receipt = await tx.wait();
+
+    return {
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+    };
+  }
+
+  async stakeTokens(args) {
+    const contract = blockchain.getContractWithSigner('staking', args.privateKey);
+
+    const tx = await contract.stake(
+      ethers.parseEther(args.amount),
+      args.lockPeriod
+    );
+
+    const receipt = await tx.wait();
+
+    return {
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+    };
+  }
+
+  async run() {
+    // Initialize blockchain service
+    await blockchain.initialize();
+
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+
+    console.log('Bancafi MCP Server running on stdio');
+  }
+}
+
+// Run server
+const server = new BancafiMCPServer();
+server.run().catch(console.error);

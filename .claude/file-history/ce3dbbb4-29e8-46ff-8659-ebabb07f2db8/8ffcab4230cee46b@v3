@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title Errors
+ * @notice Custom errors for gas-efficient error handling across Bancafi contracts
+ */
+library Errors {
+    // ============ General Errors ============
+    error ZeroAddress();
+    error ZeroAmount();
+    error InvalidParameter();
+    error Unauthorized();
+    error ContractPaused();
+    error InvalidSignature();
+    error ExpiredDeadline();
+    error ArrayLengthMismatch();
+    error InvalidArrayLength();
+
+    // ============ DebtToken Errors ============
+    error TokenDoesNotExist();
+    error TokenAlreadyExists();
+    error NotTokenOwner();
+    error DebtAlreadyPaidOff();
+    error DebtDefaulted();
+    error InvalidDebtStatus();
+    error MaturityDateInPast();
+    error PrincipalAmountTooLow();
+    error InterestRateTooHigh();
+    error InvalidRepaymentSchedule();
+
+    // ============ Marketplace Errors ============
+    error ListingDoesNotExist();
+    error ListingExpired();
+    error ListingNotActive();
+    error NotListingSeller();
+    error InvalidListingPrice();
+    error InsufficientPayment();
+    error CannotBuyOwnListing();
+    error ListingAlreadyExists();
+    error OffersNotAllowed();
+
+    // ============ Auction Errors ============
+    error AuctionDoesNotExist();
+    error AuctionNotActive();
+    error AuctionAlreadyEnded();
+    error AuctionNotEnded();
+    error BidTooLow();
+    error CannotBidOnOwnAuction();
+    error NotAuctionWinner();
+    error NoBidsPlaced();
+
+    // ============ Offer Errors ============
+    error OfferDoesNotExist();
+    error OfferExpired();
+    error OfferAlreadyAccepted();
+    error OfferAlreadyRejected();
+    error OfferAlreadyCancelled();
+    error NotOfferBuyer();
+    error CannotOfferOnOwnToken();
+
+    // ============ Compliance Errors ============
+    error NotCompliant();
+    error InsufficientKYCLevel();
+    error UserBlacklisted();
+    error CountryRestricted();
+    error TransactionLimitExceeded();
+    error KYCExpired();
+    error VerificationPending();
+    error AlreadyWhitelisted();
+    error AlreadyBlacklisted();
+    error NotBlacklisted();
+
+    // ============ Institutional Errors ============
+    error NotInstitution();
+    error InstitutionNotVerified();
+    error InstitutionSuspended();
+    error UnauthorizedSigner();
+    error InstitutionInactive();
+    error BelowMinimumInvestment();
+
+    // ============ Collection Errors ============
+    error PaymentNotDue();
+    error PaymentAlreadyMade();
+    error InsufficientPaymentAmount();
+    error NoMissedPayments();
+    error AlreadyInDefault();
+    error CollateralAlreadyLiquidated();
+    error NoCollateralAvailable();
+    error LiquidationNotAllowed();
+
+    // ============ Slashing Errors ============
+    error NoSecurityDeposit();
+    error InsufficientSecurityDeposit();
+    error AlreadySlashed();
+    error CannotSlashSelf();
+    error SlashingNotAuthorized();
+
+    // ============ Reputation Errors ============
+    error ReputationTooLow();
+    error InvalidReputationScore();
+    error ReputationUpdateTooSoon();
+
+    // ============ Cross-chain Errors ============
+    error UnsupportedChain();
+    error BridgeTransferPending();
+    error BridgeTransferFailed();
+    error TokenAlreadyLocked();
+    error TokenNotLocked();
+    error InvalidBridgeMessage();
+    error BridgeTransferNotFound();
+
+    // ============ Oracle Errors ============
+    error StalePrice();
+    error InvalidPriceFeed();
+    error PriceDeviationTooHigh();
+    error OracleNotSet();
+
+    // ============ Access Control Errors ============
+    error NotAdmin();
+    error NotModerator();
+    error NotOperator();
+    error MissingRole(bytes32 role);
+
+    // ============ Upgrade Errors ============
+    error InvalidImplementation();
+    error UpgradeNotAuthorized();
+    error InitializationFailed();
+    error AlreadyInitialized();
+
+    // ============ Reentrancy Errors ============
+    error ReentrancyDetected();
+
+    // ============ Batch Operation Errors ============
+    error BatchOperationFailed(uint256 index);
+    error TooManyOperations();
+    error BatchSizeMismatch();
+}

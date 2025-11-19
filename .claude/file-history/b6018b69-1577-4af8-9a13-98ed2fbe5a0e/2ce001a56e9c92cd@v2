@@ -1,0 +1,75 @@
+const { DataTypes } = require('sequelize');
+
+module.exports = (sequelize) => {
+  const Transaction = sequelize.define('Transaction', {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true
+    },
+    accountId: {
+      type: DataTypes.UUID,
+      allowNull: false,
+      references: {
+        model: 'accounts',
+        key: 'id'
+      }
+    },
+    txHash: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      unique: true
+    },
+    type: {
+      type: DataTypes.ENUM('DEPOSIT', 'WITHDRAWAL', 'INTEREST_CLAIM'),
+      allowNull: false
+    },
+    amount: {
+      type: DataTypes.DECIMAL(78, 0),
+      allowNull: false
+    },
+    status: {
+      type: DataTypes.ENUM('PENDING', 'CONFIRMED', 'FAILED'),
+      defaultValue: 'PENDING'
+    },
+    blockNumber: {
+      type: DataTypes.INTEGER,
+      allowNull: true
+    },
+    timestamp: {
+      type: DataTypes.DATE,
+      allowNull: false
+    },
+    gasUsed: {
+      type: DataTypes.STRING,
+      allowNull: true
+    },
+    metadata: {
+      type: DataTypes.JSONB,
+      allowNull: true
+    }
+  }, {
+    tableName: 'transactions',
+    timestamps: true,
+    indexes: [
+      {
+        unique: true,
+        fields: ['txHash']
+      },
+      {
+        fields: ['accountId']
+      },
+      {
+        fields: ['type']
+      },
+      {
+        fields: ['status']
+      },
+      {
+        fields: ['timestamp']
+      }
+    ]
+  });
+
+  return Transaction;
+};

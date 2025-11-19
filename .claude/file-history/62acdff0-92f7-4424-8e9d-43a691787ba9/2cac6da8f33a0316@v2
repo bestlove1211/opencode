@@ -1,0 +1,261 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("BancafiAssetToken - Unit Tests", function () {
+  let assetToken;
+  let owner, verifier, user1, user2;
+
+  beforeEach(async function () {
+    [owner, verifier, user1, user2] = await ethers.getSigners();
+
+    const AssetToken = await ethers.getContractFactory("BancafiAssetToken");
+    assetToken = await upgrades.deployProxy(
+      AssetToken,
+      ["Bancafi Real World Assets", "BRWA"],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await assetToken.waitForDeployment();
+
+    // Grant verifier role
+    const VERIFIER_ROLE = await assetToken.VERIFIER_ROLE();
+    await assetToken.grantRole(VERIFIER_ROLE, verifier.address);
+  });
+
+  describe("Tokenization", function () {
+    it("Should tokenize a real estate asset", async function () {
+      const tx = await assetToken.tokenizeAsset(
+        0, // RealEstate
+        "Downtown Property",
+        "ipfs://QmTest",
+        ethers.parseEther("1000000")
+      );
+
+      await expect(tx)
+        .to.emit(assetToken, "AssetTokenized")
+        .withArgs(1, owner.address, 0, ethers.parseEther("1000000"));
+
+      const asset = await assetToken.assets(1);
+      expect(asset.assetType).to.equal(0);
+      expect(asset.description).to.equal("Downtown Property");
+      expect(asset.status).to.equal(0); // Pending
+    });
+
+    it("Should reject tokenization with zero valuation", async function () {
+      await expect(
+        assetToken.tokenizeAsset(0, "Test", "ipfs://test", 0)
+      ).to.be.revertedWith("Invalid valuation");
+    });
+
+    it("Should track total tokens minted", async function () {
+      await assetToken.tokenizeAsset(0, "Asset 1", "ipfs://1", ethers.parseEther("100"));
+      await assetToken.tokenizeAsset(1, "Asset 2", "ipfs://2", ethers.parseEther("200"));
+
+      const total = await assetToken.totalTokensMinted();
+      expect(total).to.equal(2);
+    });
+  });
+
+  describe("Verification", function () {
+    beforeEach(async function () {
+      await assetToken.tokenizeAsset(
+        0,
+        "Test Property",
+        "ipfs://test",
+        ethers.parseEther("500000")
+      );
+    });
+
+    it("Should allow verifier to verify asset", async function () {
+      await expect(assetToken.connect(verifier).verifyAsset(1))
+        .to.emit(assetToken, "AssetVerified")
+        .withArgs(1, verifier.address);
+
+      const asset = await assetToken.assets(1);
+      expect(asset.status).to.equal(1); // Verified
+    });
+
+    it("Should reject verification by non-verifier", async function () {
+      await expect(
+        assetToken.connect(user1).verifyAsset(1)
+      ).to.be.reverted;
+    });
+
+    it("Should reject verification of non-existent token", async function () {
+      await expect(
+        assetToken.connect(verifier).verifyAsset(999)
+      ).to.be.revertedWith("Token does not exist");
+    });
+  });
+
+  describe("Fractionalization", function () {
+    beforeEach(async function () {
+      await assetToken.tokenizeAsset(0, "Property", "ipfs://test", ethers.parseEther("1000000"));
+      await assetToken.connect(verifier).verifyAsset(1);
+    });
+
+    it("Should fractionalize verified asset", async function () {
+      await expect(assetToken.fractionalizeAsset(1, 1000))
+        .to.emit(assetToken, "AssetFractionalized")
+        .withArgs(1, 1000);
+
+      const asset = await assetToken.assets(1);
+      expect(asset.totalFractions).to.equal(1000);
+      expect(asset.isFractionalized).to.be.true;
+    });
+
+    it("Should reject fractionalization of unverified asset", async function () {
+      await assetToken.tokenizeAsset(0, "Unverified", "ipfs://test2", ethers.parseEther("100000"));
+
+      await expect(
+        assetToken.fractionalizeAsset(2, 500)
+      ).to.be.revertedWith("Asset not verified");
+    });
+
+    it("Should reject fractionalization with zero fractions", async function () {
+      await expect(
+        assetToken.fractionalizeAsset(1, 0)
+      ).to.be.revertedWith("Invalid fraction count");
+    });
+
+    it("Should reject double fractionalization", async function () {
+      await assetToken.fractionalizeAsset(1, 1000);
+
+      await expect(
+        assetToken.fractionalizeAsset(1, 500)
+      ).to.be.revertedWith("Already fractionalized");
+    });
+  });
+
+  describe("Fractional Transfers", function () {
+    beforeEach(async function () {
+      await assetToken.tokenizeAsset(0, "Property", "ipfs://test", ethers.parseEther("1000000"));
+      await assetToken.connect(verifier).verifyAsset(1);
+      await assetToken.fractionalizeAsset(1, 1000);
+    });
+
+    it("Should transfer fractional ownership", async function () {
+      await expect(assetToken.transferFractional(1, user1.address, 300))
+        .to.emit(assetToken, "FractionalTransfer")
+        .withArgs(1, owner.address, user1.address, 300);
+
+      const balance = await assetToken.getFractionalBalance(1, user1.address);
+      expect(balance).to.equal(300);
+    });
+
+    it("Should track owner's remaining fractions", async function () {
+      await assetToken.transferFractional(1, user1.address, 300);
+
+      const ownerBalance = await assetToken.getFractionalBalance(1, owner.address);
+      expect(ownerBalance).to.equal(700);
+    });
+
+    it("Should reject transfer exceeding balance", async function () {
+      await expect(
+        assetToken.transferFractional(1, user1.address, 1001)
+      ).to.be.revertedWith("Insufficient fractional balance");
+    });
+
+    it("Should allow multiple transfers", async function () {
+      await assetToken.transferFractional(1, user1.address, 300);
+      await assetToken.transferFractional(1, user2.address, 200);
+
+      const user1Balance = await assetToken.getFractionalBalance(1, user1.address);
+      const user2Balance = await assetToken.getFractionalBalance(1, user2.address);
+      const ownerBalance = await assetToken.getFractionalBalance(1, owner.address);
+
+      expect(user1Balance).to.equal(300);
+      expect(user2Balance).to.equal(200);
+      expect(ownerBalance).to.equal(500);
+    });
+
+    it("Should prevent NFT transfer when fractionalized", async function () {
+      await expect(
+        assetToken.transferFrom(owner.address, user1.address, 1)
+      ).to.be.revertedWith("Asset is fractionalized");
+    });
+  });
+
+  describe("Asset Updates", function () {
+    beforeEach(async function () {
+      await assetToken.tokenizeAsset(0, "Property", "ipfs://test", ethers.parseEther("1000000"));
+      await assetToken.connect(verifier).verifyAsset(1);
+    });
+
+    it("Should update asset valuation", async function () {
+      const newValuation = ethers.parseEther("1200000");
+
+      await expect(assetToken.updateAssetValuation(1, newValuation))
+        .to.emit(assetToken, "AssetValuationUpdated")
+        .withArgs(1, ethers.parseEther("1000000"), newValuation);
+
+      const asset = await assetToken.assets(1);
+      expect(asset.valuation).to.equal(newValuation);
+    });
+
+    it("Should update asset metadata", async function () {
+      await assetToken.updateAssetMetadata(1, "ipfs://newMetadata");
+
+      const asset = await assetToken.assets(1);
+      expect(asset.metadataURI).to.equal("ipfs://newMetadata");
+    });
+  });
+
+  describe("Status Management", function () {
+    beforeEach(async function () {
+      await assetToken.tokenizeAsset(0, "Property", "ipfs://test", ethers.parseEther("1000000"));
+      await assetToken.connect(verifier).verifyAsset(1);
+    });
+
+    it("Should mark asset as locked", async function () {
+      await assetToken.updateAssetStatus(1, 2); // Locked
+
+      const asset = await assetToken.assets(1);
+      expect(asset.status).to.equal(2);
+    });
+
+    it("Should mark asset as defaulted", async function () {
+      await assetToken.updateAssetStatus(1, 3); // Defaulted
+
+      const asset = await assetToken.assets(1);
+      expect(asset.status).to.equal(3);
+    });
+  });
+
+  describe("UUPS Upgradeability", function () {
+    it("Should upgrade contract with UPGRADER_ROLE", async function () {
+      const AssetTokenV2 = await ethers.getContractFactory("BancafiAssetToken");
+      const upgraded = await upgrades.upgradeProxy(assetToken.target, AssetTokenV2);
+
+      expect(upgraded.target).to.equal(assetToken.target);
+    });
+
+    it("Should preserve state after upgrade", async function () {
+      await assetToken.tokenizeAsset(0, "Property", "ipfs://test", ethers.parseEther("1000000"));
+
+      const AssetTokenV2 = await ethers.getContractFactory("BancafiAssetToken");
+      await upgrades.upgradeProxy(assetToken.target, AssetTokenV2);
+
+      const asset = await assetToken.assets(1);
+      expect(asset.description).to.equal("Property");
+    });
+  });
+
+  describe("Pausability", function () {
+    it("Should pause contract", async function () {
+      await assetToken.pause();
+
+      await expect(
+        assetToken.tokenizeAsset(0, "Test", "ipfs://test", ethers.parseEther("100"))
+      ).to.be.revertedWithCustomError(assetToken, "EnforcedPause");
+    });
+
+    it("Should unpause contract", async function () {
+      await assetToken.pause();
+      await assetToken.unpause();
+
+      await expect(
+        assetToken.tokenizeAsset(0, "Test", "ipfs://test", ethers.parseEther("100"))
+      ).to.not.be.reverted;
+    });
+  });
+});

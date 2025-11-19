@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+/**
+ * @title BancafiAssetToken
+ * @notice Tokenized Real-World Assets (RWA) with full security features
+ * @dev Upgradeable ERC721 for tokenizing physical assets with metadata
+ */
+contract BancafiAssetToken is
+    ERC721Upgradeable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+
+    // Roles
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant VERIFIER_ROLE = keccak256("VERIFIER_ROLE");
+
+    // Asset Types
+    enum AssetType {
+        RealEstate,
+        MineralResources,
+        OilAndEnergy,
+        GoldAndPreciousMetals,
+        PhysicalAssets,
+        Other
+    }
+
+    // Asset Status
+    enum AssetStatus {
+        Pending,
+        Verified,
+        Active,
+        Locked,
+        Defaulted
+    }
+
+    struct AssetMetadata {
+        AssetType assetType;
+        AssetStatus status;
+        uint256 valuation;
+        string location;
+        string legalDocumentHash; // IPFS/Arweave hash
+        address verifier;
+        uint256 createdAt;
+        uint256 lastUpdatedAt;
+        bool isFractionalized;
+        uint256 totalFractions;
+    }
+
+    // State variables
+    uint256 private _tokenIds;
+    mapping(uint256 => AssetMetadata) public assetMetadata;
+    mapping(uint256 => mapping(address => uint256)) public fractionalOwnership; // tokenId => owner => fraction amount
+    mapping(uint256 => mapping(address => mapping(address => uint256))) public fractionalAllowances; // tokenId => owner => spender => amount
+    mapping(AssetType => uint256) public assetTypeCount;
+
+    // Events
+    event AssetTokenized(
+        uint256 indexed tokenId,
+        address indexed owner,
+        AssetType assetType,
+        uint256 valuation,
+        uint256 timestamp
+    );
+
+    event AssetVerified(
+        uint256 indexed tokenId,
+        address indexed verifier,
+        uint256 timestamp
+    );
+
+    event AssetStatusUpdated(
+        uint256 indexed tokenId,
+        AssetStatus oldStatus,
+        AssetStatus newStatus,
+        uint256 timestamp
+    );
+
+    event AssetValuationUpdated(
+        uint256 indexed tokenId,
+        uint256 oldValuation,
+        uint256 newValuation,
+        uint256 timestamp
+    );
+
+    event AssetFractionalized(
+        uint256 indexed tokenId,
+        uint256 totalFractions,
+        uint256 timestamp
+    );
+
+    event FractionalTransfer(
+        uint256 indexed tokenId,
+        address indexed from,
+        address indexed to,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event FractionalApproval(
+        uint256 indexed tokenId,
+        address indexed owner,
+        address indexed spender,
+        uint256 amount
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the contract
+     * @param name_ Token name
+     * @param symbol_ Token symbol
+     */
+    function initialize(
+        string memory name_,
+        string memory symbol_
+    ) public initializer {
+        __ERC721_init(name_, symbol_);
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(VERIFIER_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Tokenize a new real-world asset
+     * @param to Owner address
+     * @param assetType_ Type of asset
+     * @param valuation_ Asset valuation in wei
+     * @param location_ Physical location
+     * @param legalDocumentHash_ IPFS hash of legal documents
+     */
+    function tokenizeAsset(
+        address to,
+        AssetType assetType_,
+        uint256 valuation_,
+        string memory location_,
+        string memory legalDocumentHash_
+    ) external whenNotPaused onlyRole(MINTER_ROLE) returns (uint256) {
+        require(to != address(0), "Invalid address");
+        require(valuation_ > 0, "Valuation must be > 0");
+        require(bytes(legalDocumentHash_).length > 0, "Legal document required");
+
+        _tokenIds++;
+        uint256 newTokenId = _tokenIds;
+
+        _safeMint(to, newTokenId);
+
+        assetMetadata[newTokenId] = AssetMetadata({
+            assetType: assetType_,
+            status: AssetStatus.Pending,
+            valuation: valuation_,
+            location: location_,
+            legalDocumentHash: legalDocumentHash_,
+            verifier: address(0),
+            createdAt: block.timestamp,
+            lastUpdatedAt: block.timestamp,
+            isFractionalized: false,
+            totalFractions: 0
+        });
+
+        assetTypeCount[assetType_]++;
+
+        emit AssetTokenized(newTokenId, to, assetType_, valuation_, block.timestamp);
+
+        return newTokenId;
+    }
+
+    /**
+     * @notice Verify an asset
+     * @param tokenId Token ID to verify
+     */
+    function verifyAsset(uint256 tokenId) external onlyRole(VERIFIER_ROLE) {
+        require(_exists(tokenId), "Token does not exist");
+        AssetMetadata storage metadata = assetMetadata[tokenId];
+        require(metadata.status == AssetStatus.Pending, "Asset already verified");
+
+        AssetStatus oldStatus = metadata.status;
+        metadata.status = AssetStatus.Verified;
+        metadata.verifier = msg.sender;
+        metadata.lastUpdatedAt = block.timestamp;
+
+        emit AssetVerified(tokenId, msg.sender, block.timestamp);
+        emit AssetStatusUpdated(tokenId, oldStatus, AssetStatus.Verified, block.timestamp);
+    }
+
+    /**
+     * @notice Update asset status
+     * @param tokenId Token ID
+     * @param newStatus New status
+     */
+    function updateAssetStatus(
+        uint256 tokenId,
+        AssetStatus newStatus
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_exists(tokenId), "Token does not exist");
+        AssetMetadata storage metadata = assetMetadata[tokenId];
+
+        AssetStatus oldStatus = metadata.status;
+        metadata.status = newStatus;
+        metadata.lastUpdatedAt = block.timestamp;
+
+        emit AssetStatusUpdated(tokenId, oldStatus, newStatus, block.timestamp);
+    }
+
+    /**
+     * @notice Update asset valuation
+     * @param tokenId Token ID
+     * @param newValuation New valuation
+     */
+    function updateValuation(
+        uint256 tokenId,
+        uint256 newValuation
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_exists(tokenId), "Token does not exist");
+        require(newValuation > 0, "Valuation must be > 0");
+
+        AssetMetadata storage metadata = assetMetadata[tokenId];
+        uint256 oldValuation = metadata.valuation;
+        metadata.valuation = newValuation;
+        metadata.lastUpdatedAt = block.timestamp;
+
+        emit AssetValuationUpdated(tokenId, oldValuation, newValuation, block.timestamp);
+    }
+
+    /**
+     * @notice Fractionalize an asset
+     * @param tokenId Token ID to fractionalize
+     * @param totalFractions_ Total number of fractions
+     */
+    function fractionalizeAsset(
+        uint256 tokenId,
+        uint256 totalFractions_
+    ) external whenNotPaused {
+        require(ownerOf(tokenId) == msg.sender, "Not the owner");
+        require(!assetMetadata[tokenId].isFractionalized, "Already fractionalized");
+        require(totalFractions_ > 1, "Must have > 1 fraction");
+
+        AssetMetadata storage metadata = assetMetadata[tokenId];
+        metadata.isFractionalized = true;
+        metadata.totalFractions = totalFractions_;
+        metadata.lastUpdatedAt = block.timestamp;
+
+        fractionalOwnership[tokenId][msg.sender] = totalFractions_;
+
+        emit AssetFractionalized(tokenId, totalFractions_, block.timestamp);
+    }
+
+    /**
+     * @notice Transfer fractional ownership
+     * @param tokenId Token ID
+     * @param to Recipient address
+     * @param amount Number of fractions to transfer
+     */
+    function transferFractional(
+        uint256 tokenId,
+        address to,
+        uint256 amount
+    ) external whenNotPaused nonReentrant {
+        require(assetMetadata[tokenId].isFractionalized, "Not fractionalized");
+        require(to != address(0), "Invalid address");
+        require(fractionalOwnership[tokenId][msg.sender] >= amount, "Insufficient fractions");
+
+        fractionalOwnership[tokenId][msg.sender] -= amount;
+        fractionalOwnership[tokenId][to] += amount;
+
+        emit FractionalTransfer(tokenId, msg.sender, to, amount, block.timestamp);
+    }
+
+    /**
+     * @notice Approve spender to transfer fractional ownership
+     * @param tokenId Token ID
+     * @param spender Address to approve
+     * @param amount Number of fractions to approve
+     */
+    function approveFractional(
+        uint256 tokenId,
+        address spender,
+        uint256 amount
+    ) external whenNotPaused {
+        require(assetMetadata[tokenId].isFractionalized, "Not fractionalized");
+        require(spender != address(0), "Invalid spender");
+
+        fractionalAllowances[tokenId][msg.sender][spender] = amount;
+
+        emit FractionalApproval(tokenId, msg.sender, spender, amount);
+    }
+
+    /**
+     * @notice Transfer fractional ownership from owner (requires approval)
+     * @param tokenId Token ID
+     * @param from Owner address
+     * @param to Recipient address
+     * @param amount Number of fractions to transfer
+     */
+    function transferFractionalFrom(
+        uint256 tokenId,
+        address from,
+        address to,
+        uint256 amount
+    ) external whenNotPaused nonReentrant {
+        require(assetMetadata[tokenId].isFractionalized, "Not fractionalized");
+        require(from != address(0), "Invalid from address");
+        require(to != address(0), "Invalid to address");
+        require(fractionalOwnership[tokenId][from] >= amount, "Insufficient fractions");
+        require(fractionalAllowances[tokenId][from][msg.sender] >= amount, "Insufficient allowance");
+
+        fractionalAllowances[tokenId][from][msg.sender] -= amount;
+        fractionalOwnership[tokenId][from] -= amount;
+        fractionalOwnership[tokenId][to] += amount;
+
+        emit FractionalTransfer(tokenId, from, to, amount, block.timestamp);
+    }
+
+    /**
+     * @notice Pause contract
+     */
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause contract
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Get total supply
+     */
+    function totalSupply() external view returns (uint256) {
+        return _tokenIds;
+    }
+
+    /**
+     * @notice Check if token exists
+     */
+    function _exists(uint256 tokenId) internal view returns (bool) {
+        return _ownerOf(tokenId) != address(0);
+    }
+
+    /**
+     * @notice Override update to check pause state
+     */
+    function _update(
+        address to,
+        uint256 tokenId,
+        address auth
+    ) internal override whenNotPaused returns (address) {
+        return super._update(to, tokenId, auth);
+    }
+
+    /**
+     * @notice Authorize upgrade
+     */
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    /**
+     * @notice Support interface
+     */
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721Upgradeable, AccessControlUpgradeable)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}

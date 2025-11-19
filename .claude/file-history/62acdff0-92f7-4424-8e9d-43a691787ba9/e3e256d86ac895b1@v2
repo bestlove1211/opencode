@@ -1,0 +1,118 @@
+const express = require('express');
+const router = express.Router();
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+// GET /api/marketplace/listings/:listingId
+router.get('/listings/:listingId', async (req, res) => {
+  try {
+    const { listingId } = req.params;
+    const listing = await blockchain.contracts.marketplace.listings(listingId);
+
+    res.json({
+      listingId: parseInt(listingId),
+      seller: listing.seller,
+      tokenId: Number(listing.tokenId),
+      fractionsAmount: Number(listing.fractionsAmount),
+      pricePerFraction: ethers.formatEther(listing.pricePerFraction),
+      listingType: Number(listing.listingType),
+      status: Number(listing.status),
+      createdAt: Number(listing.createdAt),
+      duration: Number(listing.duration),
+      expiresAt: Number(listing.createdAt) + Number(listing.duration)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/marketplace/listings
+router.post('/listings', async (req, res) => {
+  try {
+    const { tokenId, fractionsAmount, pricePerFraction, duration, listingType, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('marketplace', privateKey);
+
+    const tx = await contract.createListing(
+      tokenId,
+      fractionsAmount,
+      ethers.parseEther(pricePerFraction),
+      duration,
+      listingType
+    );
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/marketplace/listings/:listingId/buy
+router.post('/listings/:listingId/buy', async (req, res) => {
+  try {
+    const { listingId } = req.params;
+    const { privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    // Get listing details to calculate payment
+    const listing = await blockchain.contracts.marketplace.listings(listingId);
+    const totalPrice = listing.pricePerFraction * BigInt(listing.fractionsAmount);
+
+    const contract = blockchain.getContractWithSigner('marketplace', privateKey);
+
+    const tx = await contract.buyListing(listingId, {
+      value: totalPrice
+    });
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      totalPaid: ethers.formatEther(totalPrice)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/marketplace/listings/:listingId/cancel
+router.post('/listings/:listingId/cancel', async (req, res) => {
+  try {
+    const { listingId } = req.params;
+    const { privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('marketplace', privateKey);
+
+    const tx = await contract.cancelListing(listingId);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+module.exports = router;

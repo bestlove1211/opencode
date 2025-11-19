@@ -1,0 +1,703 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title BancafiWalletIntegration
+ * @notice Unified wallet integration layer for Bancafi Credit platform
+ * @dev Provides wallet abstraction, multi-sig support, and transaction batching
+ */
+contract BancafiWalletIntegration is
+    Initializable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20 for IERC20;
+
+    // ============ Constants ============
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    // ============ Enums ============
+
+    enum WalletType {
+        EOA,              // Externally Owned Account (MetaMask, etc.)
+        MultiSig,         // Multi-signature wallet
+        SmartContract,    // Contract wallet (Gnosis Safe, etc.)
+        Institutional     // Institutional custody wallet
+    }
+
+    enum TransactionStatus {
+        Pending,
+        Approved,
+        Executed,
+        Cancelled,
+        Expired
+    }
+
+    // ============ Structs ============
+
+    struct WalletProfile {
+        address wallet;
+        WalletType walletType;
+        bool isRegistered;
+        bool isVerified;
+        uint256 registeredAt;
+        uint256 transactionCount;
+        uint256 totalVolume;
+        string metadata; // IPFS hash for additional data
+    }
+
+    struct MultiSigConfig {
+        address[] signers;
+        uint256 requiredSignatures;
+        uint256 signatureTimeout; // Timeout in seconds
+        bool isActive;
+    }
+
+    struct BatchTransaction {
+        uint256 id;
+        address initiator;
+        address[] targets;
+        bytes[] calldatas;
+        uint256[] values;
+        uint256 deadline;
+        TransactionStatus status;
+        uint256 approvalCount;
+        mapping(address => bool) hasApproved;
+    }
+
+    struct DelegatedAccess {
+        address delegate;
+        address delegator;
+        bool canTransact;
+        bool canApprove;
+        uint256 expiresAt;
+        bool isActive;
+    }
+
+    // ============ State Variables ============
+
+    mapping(address => WalletProfile) public walletProfiles;
+    mapping(address => MultiSigConfig) public multiSigConfigs;
+    mapping(address => address[]) public walletDelegates; // wallet => delegates
+    mapping(address => mapping(address => DelegatedAccess)) public delegatedAccess;
+
+    // Batch transactions
+    uint256 public nextBatchId;
+    mapping(uint256 => BatchTransaction) public batchTransactions;
+    mapping(address => uint256[]) public walletBatches;
+
+    // Session management
+    mapping(address => mapping(bytes32 => uint256)) public activeSessions; // wallet => sessionHash => expiry
+    uint256 public defaultSessionDuration;
+
+    // Statistics
+    uint256 public totalWalletsRegistered;
+    uint256 public totalTransactions;
+    uint256 public totalBatchesExecuted;
+
+    // Supported platforms
+    mapping(address => bool) public trustedPlatformContracts;
+
+    // ============ Events ============
+
+    event WalletRegistered(
+        address indexed wallet,
+        WalletType walletType,
+        uint256 timestamp
+    );
+
+    event WalletVerified(
+        address indexed wallet,
+        uint256 timestamp
+    );
+
+    event MultiSigConfigured(
+        address indexed wallet,
+        address[] signers,
+        uint256 requiredSignatures
+    );
+
+    event BatchTransactionCreated(
+        uint256 indexed batchId,
+        address indexed initiator,
+        uint256 txCount,
+        uint256 deadline
+    );
+
+    event BatchTransactionApproved(
+        uint256 indexed batchId,
+        address indexed approver,
+        uint256 approvalCount
+    );
+
+    event BatchTransactionExecuted(
+        uint256 indexed batchId,
+        address indexed executor,
+        bool success
+    );
+
+    event BatchTransactionCancelled(
+        uint256 indexed batchId,
+        address indexed canceller
+    );
+
+    event DelegateAdded(
+        address indexed wallet,
+        address indexed delegate,
+        bool canTransact,
+        bool canApprove,
+        uint256 expiresAt
+    );
+
+    event DelegateRevoked(
+        address indexed wallet,
+        address indexed delegate
+    );
+
+    event SessionCreated(
+        address indexed wallet,
+        bytes32 indexed sessionHash,
+        uint256 expiresAt
+    );
+
+    event SessionRevoked(
+        address indexed wallet,
+        bytes32 indexed sessionHash
+    );
+
+    event TrustedPlatformUpdated(
+        address indexed platform,
+        bool trusted
+    );
+
+    // ============ Modifiers ============
+
+    modifier onlyRegistered() {
+        require(walletProfiles[msg.sender].isRegistered, "Wallet not registered");
+        _;
+    }
+
+    modifier onlyVerified() {
+        require(walletProfiles[msg.sender].isVerified, "Wallet not verified");
+        _;
+    }
+
+    modifier validBatch(uint256 batchId) {
+        require(batchId > 0 && batchId < nextBatchId, "Invalid batch ID");
+        require(
+            batchTransactions[batchId].status == TransactionStatus.Pending,
+            "Batch not pending"
+        );
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+
+        nextBatchId = 1;
+        defaultSessionDuration = 24 hours;
+    }
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Register a wallet with the platform
+     * @param walletType Type of wallet
+     * @param metadata IPFS hash for additional wallet data
+     */
+    function registerWallet(WalletType walletType, string calldata metadata)
+        external
+        whenNotPaused
+    {
+        require(!walletProfiles[msg.sender].isRegistered, "Already registered");
+
+        walletProfiles[msg.sender] = WalletProfile({
+            wallet: msg.sender,
+            walletType: walletType,
+            isRegistered: true,
+            isVerified: false,
+            registeredAt: block.timestamp,
+            transactionCount: 0,
+            totalVolume: 0,
+            metadata: metadata
+        });
+
+        totalWalletsRegistered++;
+
+        emit WalletRegistered(msg.sender, walletType, block.timestamp);
+    }
+
+    /**
+     * @notice Verify a wallet (admin only)
+     * @param wallet Wallet address to verify
+     */
+    function verifyWallet(address wallet) external onlyRole(ADMIN_ROLE) {
+        require(walletProfiles[wallet].isRegistered, "Wallet not registered");
+        require(!walletProfiles[wallet].isVerified, "Already verified");
+
+        walletProfiles[wallet].isVerified = true;
+
+        emit WalletVerified(wallet, block.timestamp);
+    }
+
+    /**
+     * @notice Configure multi-signature settings
+     * @param signers Array of authorized signers
+     * @param requiredSignatures Number of required signatures
+     * @param signatureTimeout Timeout for signature collection
+     */
+    function configureMultiSig(
+        address[] calldata signers,
+        uint256 requiredSignatures,
+        uint256 signatureTimeout
+    ) external onlyRegistered {
+        require(signers.length >= requiredSignatures, "Invalid signer count");
+        require(requiredSignatures > 0, "Must require at least 1 signature");
+        require(signatureTimeout > 0, "Invalid timeout");
+
+        // Verify caller is in signers list
+        bool isSignerIncluded = false;
+        for (uint256 i = 0; i < signers.length; i++) {
+            if (signers[i] == msg.sender) {
+                isSignerIncluded = true;
+                break;
+            }
+        }
+        require(isSignerIncluded, "Caller must be a signer");
+
+        multiSigConfigs[msg.sender] = MultiSigConfig({
+            signers: signers,
+            requiredSignatures: requiredSignatures,
+            signatureTimeout: signatureTimeout,
+            isActive: true
+        });
+
+        emit MultiSigConfigured(msg.sender, signers, requiredSignatures);
+    }
+
+    /**
+     * @notice Create a batch transaction
+     * @param targets Array of target addresses
+     * @param calldatas Array of calldata
+     * @param values Array of ETH values
+     * @param deadline Execution deadline
+     * @return batchId Batch transaction ID
+     */
+    function createBatchTransaction(
+        address[] calldata targets,
+        bytes[] calldata calldatas,
+        uint256[] calldata values,
+        uint256 deadline
+    ) external nonReentrant whenNotPaused onlyVerified returns (uint256) {
+        require(targets.length > 0, "Empty batch");
+        require(
+            targets.length == calldatas.length && targets.length == values.length,
+            "Array length mismatch"
+        );
+        require(deadline > block.timestamp, "Invalid deadline");
+
+        uint256 batchId = nextBatchId++;
+
+        BatchTransaction storage batch = batchTransactions[batchId];
+        batch.id = batchId;
+        batch.initiator = msg.sender;
+        batch.targets = targets;
+        batch.calldatas = calldatas;
+        batch.values = values;
+        batch.deadline = deadline;
+        batch.status = TransactionStatus.Pending;
+        batch.approvalCount = 0;
+
+        walletBatches[msg.sender].push(batchId);
+
+        emit BatchTransactionCreated(batchId, msg.sender, targets.length, deadline);
+
+        return batchId;
+    }
+
+    /**
+     * @notice Approve a batch transaction
+     * @param batchId Batch transaction ID
+     */
+    function approveBatchTransaction(uint256 batchId)
+        external
+        nonReentrant
+        validBatch(batchId)
+    {
+        BatchTransaction storage batch = batchTransactions[batchId];
+        require(block.timestamp <= batch.deadline, "Batch expired");
+        require(!batch.hasApproved[msg.sender], "Already approved");
+
+        // Check if approver is authorized
+        address initiator = batch.initiator;
+        MultiSigConfig storage config = multiSigConfigs[initiator];
+
+        bool isAuthorized = false;
+
+        // Check if msg.sender is initiator
+        if (msg.sender == initiator) {
+            isAuthorized = true;
+        }
+        // Check if msg.sender is in multi-sig signers
+        else if (config.isActive) {
+            for (uint256 i = 0; i < config.signers.length; i++) {
+                if (config.signers[i] == msg.sender) {
+                    isAuthorized = true;
+                    break;
+                }
+            }
+        }
+        // Check if msg.sender is a delegate with approval rights
+        else if (delegatedAccess[initiator][msg.sender].isActive) {
+            DelegatedAccess storage access = delegatedAccess[initiator][msg.sender];
+            if (access.canApprove && block.timestamp <= access.expiresAt) {
+                isAuthorized = true;
+            }
+        }
+
+        require(isAuthorized, "Not authorized to approve");
+
+        batch.hasApproved[msg.sender] = true;
+        batch.approvalCount++;
+
+        emit BatchTransactionApproved(batchId, msg.sender, batch.approvalCount);
+
+        // Auto-execute if requirements met
+        if (_isReadyToExecute(batchId)) {
+            _executeBatch(batchId);
+        }
+    }
+
+    /**
+     * @notice Execute a batch transaction
+     * @param batchId Batch transaction ID
+     */
+    function executeBatchTransaction(uint256 batchId)
+        external
+        nonReentrant
+        validBatch(batchId)
+    {
+        require(_isReadyToExecute(batchId), "Not ready to execute");
+        _executeBatch(batchId);
+    }
+
+    /**
+     * @notice Cancel a batch transaction
+     * @param batchId Batch transaction ID
+     */
+    function cancelBatchTransaction(uint256 batchId)
+        external
+        nonReentrant
+        validBatch(batchId)
+    {
+        BatchTransaction storage batch = batchTransactions[batchId];
+        require(
+            msg.sender == batch.initiator || hasRole(ADMIN_ROLE, msg.sender),
+            "Not authorized"
+        );
+
+        batch.status = TransactionStatus.Cancelled;
+
+        emit BatchTransactionCancelled(batchId, msg.sender);
+    }
+
+    /**
+     * @notice Add a delegate for wallet operations
+     * @param delegate Delegate address
+     * @param canTransact Can initiate transactions
+     * @param canApprove Can approve transactions
+     * @param duration Delegation duration in seconds
+     */
+    function addDelegate(
+        address delegate,
+        bool canTransact,
+        bool canApprove,
+        uint256 duration
+    ) external onlyRegistered {
+        require(delegate != address(0), "Invalid delegate");
+        require(delegate != msg.sender, "Cannot delegate to self");
+        require(duration > 0, "Invalid duration");
+
+        uint256 expiresAt = block.timestamp + duration;
+
+        delegatedAccess[msg.sender][delegate] = DelegatedAccess({
+            delegate: delegate,
+            delegator: msg.sender,
+            canTransact: canTransact,
+            canApprove: canApprove,
+            expiresAt: expiresAt,
+            isActive: true
+        });
+
+        walletDelegates[msg.sender].push(delegate);
+
+        emit DelegateAdded(msg.sender, delegate, canTransact, canApprove, expiresAt);
+    }
+
+    /**
+     * @notice Revoke delegate access
+     * @param delegate Delegate address
+     */
+    function revokeDelegate(address delegate) external {
+        DelegatedAccess storage access = delegatedAccess[msg.sender][delegate];
+        require(access.isActive, "Delegate not active");
+
+        access.isActive = false;
+
+        emit DelegateRevoked(msg.sender, delegate);
+    }
+
+    /**
+     * @notice Create a session for temporary access
+     * @param sessionHash Unique session identifier
+     * @param duration Session duration
+     */
+    function createSession(bytes32 sessionHash, uint256 duration)
+        external
+        onlyVerified
+    {
+        require(duration > 0 && duration <= 7 days, "Invalid duration");
+
+        uint256 expiresAt = block.timestamp + duration;
+        activeSessions[msg.sender][sessionHash] = expiresAt;
+
+        emit SessionCreated(msg.sender, sessionHash, expiresAt);
+    }
+
+    /**
+     * @notice Revoke an active session
+     * @param sessionHash Session identifier
+     */
+    function revokeSession(bytes32 sessionHash) external {
+        require(activeSessions[msg.sender][sessionHash] > 0, "Session not found");
+
+        delete activeSessions[msg.sender][sessionHash];
+
+        emit SessionRevoked(msg.sender, sessionHash);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get wallet profile
+     * @param wallet Wallet address
+     * @return profile Wallet profile
+     */
+    function getWalletProfile(address wallet)
+        external
+        view
+        returns (WalletProfile memory)
+    {
+        return walletProfiles[wallet];
+    }
+
+    /**
+     * @notice Get multi-sig configuration
+     * @param wallet Wallet address
+     * @return config Multi-sig config
+     */
+    function getMultiSigConfig(address wallet)
+        external
+        view
+        returns (MultiSigConfig memory)
+    {
+        return multiSigConfigs[wallet];
+    }
+
+    /**
+     * @notice Get wallet's batch transaction IDs
+     * @param wallet Wallet address
+     * @return batchIds Array of batch IDs
+     */
+    function getWalletBatches(address wallet)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        return walletBatches[wallet];
+    }
+
+    /**
+     * @notice Get wallet delegates
+     * @param wallet Wallet address
+     * @return delegates Array of delegate addresses
+     */
+    function getWalletDelegates(address wallet)
+        external
+        view
+        returns (address[] memory)
+    {
+        return walletDelegates[wallet];
+    }
+
+    /**
+     * @notice Check if session is active
+     * @param wallet Wallet address
+     * @param sessionHash Session identifier
+     * @return isActive Whether session is active
+     */
+    function isSessionActive(address wallet, bytes32 sessionHash)
+        external
+        view
+        returns (bool)
+    {
+        uint256 expiry = activeSessions[wallet][sessionHash];
+        return expiry > 0 && block.timestamp <= expiry;
+    }
+
+    /**
+     * @notice Check if batch is ready to execute
+     * @param batchId Batch transaction ID
+     * @return isReady Whether batch can be executed
+     */
+    function isReadyToExecute(uint256 batchId) external view returns (bool) {
+        return _isReadyToExecute(batchId);
+    }
+
+    /**
+     * @notice Get batch transaction details
+     * @param batchId Batch transaction ID
+     * @return initiator Batch initiator
+     * @return targets Target addresses
+     * @return status Transaction status
+     * @return approvalCount Current approvals
+     */
+    function getBatchDetails(uint256 batchId)
+        external
+        view
+        returns (
+            address initiator,
+            address[] memory targets,
+            TransactionStatus status,
+            uint256 approvalCount
+        )
+    {
+        BatchTransaction storage batch = batchTransactions[batchId];
+        return (batch.initiator, batch.targets, batch.status, batch.approvalCount);
+    }
+
+    // ============ Internal Functions ============
+
+    function _isReadyToExecute(uint256 batchId) internal view returns (bool) {
+        BatchTransaction storage batch = batchTransactions[batchId];
+
+        if (batch.status != TransactionStatus.Pending) return false;
+        if (block.timestamp > batch.deadline) return false;
+
+        address initiator = batch.initiator;
+        MultiSigConfig storage config = multiSigConfigs[initiator];
+
+        // If multi-sig is configured, check required signatures
+        if (config.isActive) {
+            return batch.approvalCount >= config.requiredSignatures;
+        }
+
+        // Otherwise, just need initiator's approval
+        return batch.hasApproved[initiator];
+    }
+
+    function _executeBatch(uint256 batchId) internal {
+        BatchTransaction storage batch = batchTransactions[batchId];
+
+        batch.status = TransactionStatus.Executed;
+        totalBatchesExecuted++;
+        totalTransactions += batch.targets.length;
+
+        // Update wallet stats
+        walletProfiles[batch.initiator].transactionCount += batch.targets.length;
+
+        bool success = true;
+
+        // Execute all transactions in batch
+        for (uint256 i = 0; i < batch.targets.length; i++) {
+            (bool txSuccess, ) = batch.targets[i].call{value: batch.values[i]}(
+                batch.calldatas[i]
+            );
+
+            if (!txSuccess) {
+                success = false;
+                // Continue executing other transactions
+            }
+        }
+
+        emit BatchTransactionExecuted(batchId, msg.sender, success);
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Set trusted platform contract
+     * @param platform Platform contract address
+     * @param trusted Whether platform is trusted
+     */
+    function setTrustedPlatform(address platform, bool trusted)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        trustedPlatformContracts[platform] = trusted;
+        emit TrustedPlatformUpdated(platform, trusted);
+    }
+
+    /**
+     * @notice Update default session duration
+     * @param duration New default duration
+     */
+    function updateDefaultSessionDuration(uint256 duration)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        require(duration > 0 && duration <= 30 days, "Invalid duration");
+        defaultSessionDuration = duration;
+    }
+
+    /**
+     * @notice Pause the contract
+     */
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {}
+
+    /**
+     * @dev Reserved storage space for future versions
+     */
+    uint256[50] private __gap;
+}

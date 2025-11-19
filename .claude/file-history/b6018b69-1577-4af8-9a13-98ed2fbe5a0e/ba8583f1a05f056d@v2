@@ -1,0 +1,78 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  // Configuration
+  const SAVINGS_ACCOUNT_ADDRESS = process.env.SAVINGS_ACCOUNT_ADDRESS || "";
+  const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || "";
+  const AMOUNT = process.env.AMOUNT || "1000000"; // Default 1M tokens
+
+  if (!SAVINGS_ACCOUNT_ADDRESS || !TOKEN_ADDRESS) {
+    console.error("❌ Error: Please set required environment variables");
+    console.log("\nUsage:");
+    console.log("SAVINGS_ACCOUNT_ADDRESS=0x... TOKEN_ADDRESS=0x... AMOUNT=1000000 npx hardhat run scripts/fund-contract.js --network <network>");
+    process.exit(1);
+  }
+
+  console.log("Funding Bancafi Savings Account Contract...");
+  console.log("Savings Account:", SAVINGS_ACCOUNT_ADDRESS);
+  console.log("Token:", TOKEN_ADDRESS);
+  console.log("Amount:", AMOUNT);
+
+  // Get signer
+  const [signer] = await ethers.getSigners();
+  console.log("Signer:", signer.address);
+
+  // Get token contract
+  const ERC20_ABI = [
+    "function balanceOf(address) view returns (uint256)",
+    "function approve(address spender, uint256 amount) returns (bool)",
+    "function decimals() view returns (uint8)",
+    "function symbol() view returns (string)"
+  ];
+
+  const token = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, signer);
+
+  // Get token info
+  const symbol = await token.symbol();
+  const decimals = await token.decimals();
+  const balance = await token.balanceOf(signer.address);
+
+  console.log("\nToken Info:");
+  console.log("Symbol:", symbol);
+  console.log("Decimals:", decimals);
+  console.log("Your balance:", ethers.formatUnits(balance, decimals), symbol);
+
+  // Parse amount
+  const amountToFund = ethers.parseUnits(AMOUNT, decimals);
+
+  if (balance < amountToFund) {
+    console.error("❌ Insufficient token balance");
+    process.exit(1);
+  }
+
+  // Approve tokens
+  console.log("\nApproving tokens...");
+  const approveTx = await token.approve(SAVINGS_ACCOUNT_ADDRESS, amountToFund);
+  console.log("Approve TX:", approveTx.hash);
+  await approveTx.wait();
+  console.log("✅ Tokens approved");
+
+  // Fund contract
+  const BancafiSavingsAccount = await ethers.getContractFactory("BancafiSavingsAccount");
+  const savingsAccount = BancafiSavingsAccount.attach(SAVINGS_ACCOUNT_ADDRESS);
+
+  console.log("\nFunding contract...");
+  const fundTx = await savingsAccount.fundContract(TOKEN_ADDRESS, amountToFund);
+  console.log("Fund TX:", fundTx.hash);
+  await fundTx.wait();
+
+  console.log("✅ Contract funded successfully!");
+  console.log("Amount funded:", ethers.formatUnits(amountToFund, decimals), symbol);
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

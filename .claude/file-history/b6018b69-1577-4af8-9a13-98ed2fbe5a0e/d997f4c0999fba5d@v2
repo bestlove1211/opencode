@@ -1,0 +1,135 @@
+# Bancafi Saving Account Wallet
+
+A comprehensive DeFi wallet system for managing cryptocurrency savings, earning yields, and accessing financial services.
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Frontend Layer                           │
+│  (Web3 Integration, Wallet Connect, User Dashboard)         │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+┌───────────────────────┴─────────────────────────────────────┐
+│                     API Gateway                              │
+│         (Authentication, Rate Limiting, Routing)             │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+┌───────▼────────┐ ┌───▼──────────┐ ┌─▼──────────────┐
+│  Wallet Service │ │ Yield Service │ │ Credit Service │
+│                 │ │               │ │                │
+└───────┬────────┘ └───┬──────────┘ └─┬──────────────┘
+        │              │               │
+        └──────────────┼───────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│              Smart Contract Layer                            │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │
+│  │ Vault    │ │ Staking  │ │   SPM    │ │ Lending  │      │
+│  │ Contract │ │ Contract │ │ Contract │ │ Contract │      │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────┐
+│           Blockchain Networks                                │
+│  (Ethereum, BSC, Polygon, Arbitrum, etc.)                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Project Structure
+
+```
+bancafi-wallet/
+├── contracts/                 # Smart contracts
+│   ├── BancafiVault.sol      # Main vault for deposits
+│   ├── StakingPool.sol       # Staking and yield generation
+│   ├── SPMMarker.sol         # Secure Payment Marker
+│   ├── CrossChainBridge.sol  # Cross-chain functionality
+│   └── LendingPool.sol       # Credit/lending collateral
+├── backend/                   # Backend services
+│   ├── src/
+│   │   ├── services/         # Business logic
+│   │   ├── controllers/      # API controllers
+│   │   ├── models/           # Database models
+│   │   ├── middleware/       # Auth, validation
+│   │   └── utils/            # Helper functions
+│   └── tests/
+├── scripts/                   # Deployment scripts
+├── docs/                      # Documentation
+└── tests/                     # Contract tests
+```
+
+## Core Features
+
+### 1. Secure Deposits
+- Multi-signature security
+- Smart contract-based custody
+- Time-lock mechanisms for large withdrawals
+
+### 2. Interest Earnings
+- Dynamic APY based on market conditions
+- Auto-compounding options
+- Multiple staking tiers
+
+### 3. Cross-Chain Support
+- LayerZero integration for seamless transfers
+- Support for ETH, BSC, Polygon, Arbitrum
+- Unified balance view across chains
+
+### 4. SPM Integration
+- Transaction verification
+- Fraud prevention
+- Audit trail for compliance
+
+### 5. Automated Savings
+- Scheduled deposits
+- Goal-based savings tracking
+- Dollar-cost averaging strategies
+
+### 6. Credit Services
+- Collateralized lending
+- Dynamic LTV ratios
+- Liquidation protection
+
+## Getting Started
+
+### Prerequisites
+- Node.js >= 18.x
+- Hardhat
+- PostgreSQL
+- Redis
+
+### Installation
+
+```bash
+# Install dependencies
+npm install
+
+# Compile contracts
+npx hardhat compile
+
+# Run tests
+npx hardhat test
+
+# Deploy contracts
+npx hardhat run scripts/deploy.js --network <network>
+
+# Start backend
+cd backend
+npm install
+npm run dev
+```
+
+## Security Features
+
+- Multi-signature wallets for large operations
+- Time-locked withdrawals
+- Rate limiting and circuit breakers
+- Regular security audits
+- Emergency pause functionality
+
+## License
+
+MIT

@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+
+/**
+ * @title EscrowSettlement
+ * @dev Manages escrow for custody operations and handles dispute resolution
+ * @notice This contract holds funds during the custody verification period
+ * and provides dispute resolution mechanisms for failed operations
+ */
+contract EscrowSettlement is ReentrancyGuard, AccessControl, Pausable {
+
+    bytes32 public constant ARBITER_ROLE = keccak256("ARBITER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    struct EscrowDeposit {
+        uint256 escrowId;
+        address depositor;
+        address beneficiary;
+        address token;              // Bond token or crypto token
+        uint256 amount;
+        uint256 createdAt;
+        uint256 releaseTime;        // Timelock for automatic release
+        EscrowStatus status;
+        EscrowType escrowType;
+        bytes32 referenceId;        // Links to custody request or other operation
+        string metadata;            // IPFS hash or additional info
+        DisputeInfo dispute;
+    }
+
+    struct DisputeInfo {
+        bool isDisputed;
+        address disputeInitiator;
+        uint256 disputeTime;
+        string disputeReason;
+        DisputeResolution resolution;
+        address arbiter;
+        uint256 resolvedAt;
+    }
+
+    enum EscrowStatus {
+        ACTIVE,              // Funds in escrow
+        RELEASED,            // Released to beneficiary
+        REFUNDED,            // Refunded to depositor
+        DISPUTED,            // Under dispute
+        RESOLVED_RELEASE,    // Dispute resolved, release to beneficiary
+        RESOLVED_REFUND,     // Dispute resolved, refund to depositor
+        EXPIRED              // Expired and ready for claim
+    }
+
+    enum EscrowType {
+        CUSTODY_DEPOSIT,     // Escrow for deposit requests
+        CUSTODY_WITHDRAWAL,  // Escrow for withdrawal requests
+        CONVERSION,          // Escrow for conversions
+        COUPON_PAYMENT,      // Escrow for coupon distributions
+        GENERAL              // General purpose escrow
+    }
+
+    enum DisputeResolution {
+        PENDING,
+        RELEASE_TO_BENEFICIARY,
+        REFUND_TO_DEPOSITOR,
+        SPLIT_PAYMENT        // Partial refund/release
+    }
+
+    // State variables
+    uint256 public nextEscrowId;
+    mapping(uint256 => EscrowDeposit) public escrows;
+    mapping(address => uint256[]) public userEscrows;
+    mapping(bytes32 => uint256) public referenceToEscrow; // Map external reference to escrow
+
+    // Configuration
+    uint256 public defaultEscrowPeriod = 7 days;
+    uint256 public disputePeriod = 14 days;
+    uint256 public minEscrowAmount = 1e6; // Minimum amount (adjust per token)
+
+    // Statistics
+    uint256 public totalEscrowed;
+    uint256 public totalReleased;
+    uint256 public totalRefunded;
+    uint256 public totalDisputes;
+
+    // Events
+    event EscrowCreated(
+        uint256 indexed escrowId,
+        address indexed depositor,
+        address indexed beneficiary,
+        address token,
+        uint256 amount,
+        EscrowType escrowType
+    );
+    event EscrowReleased(uint256 indexed escrowId, address indexed beneficiary, uint256 amount);
+    event EscrowRefunded(uint256 indexed escrowId, address indexed depositor, uint256 amount);
+    event DisputeRaised(uint256 indexed escrowId, address indexed initiator, string reason);
+    event DisputeResolved(
+        uint256 indexed escrowId,
+        DisputeResolution resolution,
+        address indexed arbiter
+    );
+    event EscrowExtended(uint256 indexed escrowId, uint256 newReleaseTime);
+    event EscrowCancelled(uint256 indexed escrowId);
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ARBITER_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+    }
+
+    /**
+     * @dev Create escrow deposit
+     * @param beneficiary Address that will receive funds upon release
+     * @param token Token address (bond token or crypto)
+     * @param amount Amount to escrow
+     * @param escrowType Type of escrow
+     * @param referenceId External reference (custody request ID, etc.)
+     * @param customReleaseTime Custom release time (0 for default)
+     */
+    function createEscrow(
+        address beneficiary,
+        address token,
+        uint256 amount,
+        EscrowType escrowType,
+        bytes32 referenceId,
+        uint256 customReleaseTime
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(beneficiary != address(0), "Invalid beneficiary");
+        require(amount >= minEscrowAmount, "Amount too low");
+        require(
+            referenceToEscrow[referenceId] == 0 || referenceId == bytes32(0),
+            "Reference already used"
+        );
+
+        // Transfer tokens to escrow
+        require(
+            IERC20(token).transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
+
+        uint256 escrowId = nextEscrowId++;
+        uint256 releaseTime = customReleaseTime > 0
+            ? block.timestamp + customReleaseTime
+            : block.timestamp + defaultEscrowPeriod;
+
+        escrows[escrowId] = EscrowDeposit({
+            escrowId: escrowId,
+            depositor: msg.sender,
+            beneficiary: beneficiary,
+            token: token,
+            amount: amount,
+            createdAt: block.timestamp,
+            releaseTime: releaseTime,
+            status: EscrowStatus.ACTIVE,
+            escrowType: escrowType,
+            referenceId: referenceId,
+            metadata: "",
+            dispute: DisputeInfo({
+                isDisputed: false,
+                disputeInitiator: address(0),
+                disputeTime: 0,
+                disputeReason: "",
+                resolution: DisputeResolution.PENDING,
+                arbiter: address(0),
+                resolvedAt: 0
+            })
+        });
+
+        userEscrows[msg.sender].push(escrowId);
+        userEscrows[beneficiary].push(escrowId);
+
+        if (referenceId != bytes32(0)) {
+            referenceToEscrow[referenceId] = escrowId;
+        }
+
+        totalEscrowed += amount;
+
+        emit EscrowCreated(
+            escrowId,
+            msg.sender,
+            beneficiary,
+            token,
+            amount,
+            escrowType
+        );
+
+        return escrowId;
+    }
+
+    /**
+     * @dev Release escrow to beneficiary (can be called by operator or after timelock)
+     */
+    function releaseEscrow(uint256 escrowId) external nonReentrant {
+        EscrowDeposit storage escrow = escrows[escrowId];
+
+        require(escrow.status == EscrowStatus.ACTIVE, "Invalid status");
+        require(!escrow.dispute.isDisputed, "Escrow is disputed");
+        require(
+            hasRole(OPERATOR_ROLE, msg.sender) ||
+            block.timestamp >= escrow.releaseTime ||
+            msg.sender == escrow.depositor,
+            "Not authorized or too early"
+        );
+
+        escrow.status = EscrowStatus.RELEASED;
+
+        require(
+            IERC20(escrow.token).transfer(escrow.beneficiary, escrow.amount),
+            "Transfer failed"
+        );
+
+        totalReleased += escrow.amount;
+
+        emit EscrowReleased(escrowId, escrow.beneficiary, escrow.amount);
+    }
+
+    /**
+     * @dev Refund escrow to depositor (operator only, or in case of failed custody)
+     */
+    function refundEscrow(uint256 escrowId, string memory reason)
+        external
+        onlyRole(OPERATOR_ROLE)
+        nonReentrant
+    {
+        EscrowDeposit storage escrow = escrows[escrowId];
+
+        require(
+            escrow.status == EscrowStatus.ACTIVE ||
+            escrow.status == EscrowStatus.DISPUTED,
+            "Invalid status"
+        );
+
+        escrow.status = EscrowStatus.REFUNDED;
+        escrow.metadata = reason;
+
+        require(
+            IERC20(escrow.token).transfer(escrow.depositor, escrow.amount),
+            "Transfer failed"
+        );
+
+        totalRefunded += escrow.amount;
+
+        emit EscrowRefunded(escrowId, escrow.depositor, escrow.amount);
+    }
+
+    /**
+     * @dev Raise dispute on escrow
+     */
+    function raiseDispute(uint256 escrowId, string memory reason) external {
+        EscrowDeposit storage escrow = escrows[escrowId];
+
+        require(escrow.status == EscrowStatus.ACTIVE, "Invalid status");
+        require(
+            msg.sender == escrow.depositor || msg.sender == escrow.beneficiary,
+            "Not authorized"
+        );
+        require(!escrow.dispute.isDisputed, "Already disputed");
+        require(
+            block.timestamp <= escrow.releaseTime + disputePeriod,
+            "Dispute period expired"
+        );
+
+        escrow.status = EscrowStatus.DISPUTED;
+        escrow.dispute.isDisputed = true;
+        escrow.dispute.disputeInitiator = msg.sender;
+        escrow.dispute.disputeTime = block.timestamp;
+        escrow.dispute.disputeReason = reason;
+
+        totalDisputes++;
+
+        emit DisputeRaised(escrowId, msg.sender, reason);
+    }
+
+    /**
+     * @dev Resolve dispute (arbiter only)
+     */
+    function resolveDispute(
+        uint256 escrowId,
+        DisputeResolution resolution,
+        uint256 refundAmount
+    ) external onlyRole(ARBITER_ROLE) nonReentrant {
+        EscrowDeposit storage escrow = escrows[escrowId];
+
+        require(escrow.status == EscrowStatus.DISPUTED, "Not disputed");
+        require(escrow.dispute.isDisputed, "No active dispute");
+
+        escrow.dispute.resolution = resolution;
+        escrow.dispute.arbiter = msg.sender;
+        escrow.dispute.resolvedAt = block.timestamp;
+
+        if (resolution == DisputeResolution.RELEASE_TO_BENEFICIARY) {
+            escrow.status = EscrowStatus.RESOLVED_RELEASE;
+            require(
+                IERC20(escrow.token).transfer(escrow.beneficiary, escrow.amount),
+                "Transfer failed"
+            );
+            totalReleased += escrow.amount;
+            emit EscrowReleased(escrowId, escrow.beneficiary, escrow.amount);
+
+        } else if (resolution == DisputeResolution.REFUND_TO_DEPOSITOR) {
+            escrow.status = EscrowStatus.RESOLVED_REFUND;
+            require(
+                IERC20(escrow.token).transfer(escrow.depositor, escrow.amount),
+                "Transfer failed"
+            );
+            totalRefunded += escrow.amount;
+            emit EscrowRefunded(escrowId, escrow.depositor, escrow.amount);
+
+        } else if (resolution == DisputeResolution.SPLIT_PAYMENT) {
+            require(refundAmount <= escrow.amount, "Invalid split amount");
+            escrow.status = EscrowStatus.RESOLVED_RELEASE;
+
+            uint256 releaseAmount = escrow.amount - refundAmount;
+
+            if (refundAmount > 0) {
+                require(
+                    IERC20(escrow.token).transfer(escrow.depositor, refundAmount),
+                    "Refund failed"
+                );
+                totalRefunded += refundAmount;
+            }
+
+            if (releaseAmount > 0) {
+                require(
+                    IERC20(escrow.token).transfer(escrow.beneficiary, releaseAmount),
+                    "Release failed"
+                );
+                totalReleased += releaseAmount;
+            }
+        }
+
+        emit DisputeResolved(escrowId, resolution, msg.sender);
+    }
+
+    /**
+     * @dev Extend escrow release time (operator only)
+     */
+    function extendEscrow(uint256 escrowId, uint256 additionalTime)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        EscrowDeposit storage escrow = escrows[escrowId];
+
+        require(escrow.status == EscrowStatus.ACTIVE, "Invalid status");
+        require(additionalTime > 0 && additionalTime <= 30 days, "Invalid extension");
+
+        escrow.releaseTime += additionalTime;
+
+        emit EscrowExtended(escrowId, escrow.releaseTime);
+    }
+
+    /**
+     * @dev Cancel and refund escrow before release time (depositor only, within grace period)
+     */
+    function cancelEscrow(uint256 escrowId) external nonReentrant {
+        EscrowDeposit storage escrow = escrows[escrowId];
+
+        require(escrow.status == EscrowStatus.ACTIVE, "Invalid status");
+        require(msg.sender == escrow.depositor, "Not depositor");
+        require(
+            block.timestamp < escrow.createdAt + 1 hours,
+            "Cancellation period expired"
+        );
+
+        escrow.status = EscrowStatus.REFUNDED;
+
+        require(
+            IERC20(escrow.token).transfer(escrow.depositor, escrow.amount),
+            "Transfer failed"
+        );
+
+        totalRefunded += escrow.amount;
+
+        emit EscrowCancelled(escrowId);
+        emit EscrowRefunded(escrowId, escrow.depositor, escrow.amount);
+    }
+
+    /**
+     * @dev Batch release multiple escrows (operator only)
+     */
+    function batchReleaseEscrow(uint256[] calldata escrowIds)
+        external
+        onlyRole(OPERATOR_ROLE)
+        nonReentrant
+    {
+        for (uint256 i = 0; i < escrowIds.length; i++) {
+            uint256 escrowId = escrowIds[i];
+            EscrowDeposit storage escrow = escrows[escrowId];
+
+            if (escrow.status == EscrowStatus.ACTIVE && !escrow.dispute.isDisputed) {
+                escrow.status = EscrowStatus.RELEASED;
+
+                require(
+                    IERC20(escrow.token).transfer(escrow.beneficiary, escrow.amount),
+                    "Transfer failed"
+                );
+
+                totalReleased += escrow.amount;
+
+                emit EscrowReleased(escrowId, escrow.beneficiary, escrow.amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Get escrow by reference ID
+     */
+    function getEscrowByReference(bytes32 referenceId)
+        external
+        view
+        returns (EscrowDeposit memory)
+    {
+        uint256 escrowId = referenceToEscrow[referenceId];
+        require(escrowId > 0, "Escrow not found");
+        return escrows[escrowId];
+    }
+
+    /**
+     * @dev Get user's escrow IDs
+     */
+    function getUserEscrows(address user)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        return userEscrows[user];
+    }
+
+    /**
+     * @dev Get escrow statistics
+     */
+    function getEscrowStats()
+        external
+        view
+        returns (
+            uint256 _totalEscrowed,
+            uint256 _totalReleased,
+            uint256 _totalRefunded,
+            uint256 _totalDisputes,
+            uint256 _activeEscrows
+        )
+    {
+        return (
+            totalEscrowed,
+            totalReleased,
+            totalRefunded,
+            totalDisputes,
+            nextEscrowId
+        );
+    }
+
+    /**
+     * @dev Check if escrow is ready for release
+     */
+    function isEscrowReleasable(uint256 escrowId)
+        external
+        view
+        returns (bool)
+    {
+        EscrowDeposit storage escrow = escrows[escrowId];
+        return escrow.status == EscrowStatus.ACTIVE &&
+               !escrow.dispute.isDisputed &&
+               block.timestamp >= escrow.releaseTime;
+    }
+
+    /**
+     * @dev Update configuration (admin only)
+     */
+    function updateConfig(
+        uint256 _defaultEscrowPeriod,
+        uint256 _disputePeriod,
+        uint256 _minEscrowAmount
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_defaultEscrowPeriod <= 30 days, "Period too long");
+        require(_disputePeriod <= 90 days, "Dispute period too long");
+
+        defaultEscrowPeriod = _defaultEscrowPeriod;
+        disputePeriod = _disputePeriod;
+        minEscrowAmount = _minEscrowAmount;
+    }
+
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @dev Emergency withdraw (admin only, for stuck funds)
+     */
+    function emergencyWithdraw(
+        address token,
+        address recipient,
+        uint256 amount
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(paused(), "Not in emergency mode");
+        require(
+            IERC20(token).transfer(recipient, amount),
+            "Transfer failed"
+        );
+    }
+}

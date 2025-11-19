@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "./DataTypes.sol";
+
+/**
+ * @title Events
+ * @notice Centralized event definitions for all Bancafi contracts
+ * @dev Events are organized by contract/module for easier indexing
+ */
+library Events {
+    // ============ DebtToken Events ============
+
+    event DebtTokenMinted(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        address indexed originalCreditor,
+        uint256 principalAmount,
+        string currency,
+        uint256 maturityDate
+    );
+
+    event DebtMetadataUpdated(
+        uint256 indexed tokenId,
+        bytes32 oldMetadataHash,
+        bytes32 newMetadataHash
+    );
+
+    event RepaymentMade(
+        uint256 indexed tokenId,
+        address indexed payer,
+        uint256 amount,
+        uint256 principalPaid,
+        uint256 interestPaid,
+        uint256 remainingBalance
+    );
+
+    event DebtStatusChanged(
+        uint256 indexed tokenId,
+        DataTypes.DebtStatus oldStatus,
+        DataTypes.DebtStatus newStatus
+    );
+
+    event DebtDefaulted(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        uint256 missedPayments,
+        uint256 outstandingAmount
+    );
+
+    event DebtPaidOff(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        uint256 totalAmountPaid
+    );
+
+    event CollateralAdded(
+        uint256 indexed tokenId,
+        DataTypes.CollateralType collateralType,
+        uint256 valuationAmount
+    );
+
+    event CollateralLiquidated(
+        uint256 indexed tokenId,
+        uint256 liquidationAmount,
+        address liquidator
+    );
+
+    // ============ Marketplace Events ============
+
+    event ListingCreated(
+        uint256 indexed listingId,
+        uint256 indexed tokenId,
+        address indexed seller,
+        uint256 price,
+        DataTypes.ListingType listingType,
+        uint256 expiresAt
+    );
+
+    event ListingUpdated(
+        uint256 indexed listingId,
+        uint256 oldPrice,
+        uint256 newPrice
+    );
+
+    event ListingCancelled(
+        uint256 indexed listingId,
+        address indexed seller
+    );
+
+    event ListingExpired(
+        uint256 indexed listingId
+    );
+
+    event TradeExecuted(
+        uint256 indexed listingId,
+        uint256 indexed tokenId,
+        address indexed buyer,
+        address seller,
+        uint256 price,
+        uint256 timestamp
+    );
+
+    event BatchTradeExecuted(
+        address indexed buyer,
+        uint256 totalAmount,
+        uint256 numberOfTokens
+    );
+
+    // ============ Auction Events ============
+
+    event AuctionStarted(
+        uint256 indexed auctionId,
+        uint256 indexed tokenId,
+        address indexed seller,
+        uint256 startingBid,
+        uint256 endTime
+    );
+
+    event BidPlaced(
+        uint256 indexed auctionId,
+        address indexed bidder,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event BidRefunded(
+        uint256 indexed auctionId,
+        address indexed bidder,
+        uint256 amount
+    );
+
+    event AuctionEnded(
+        uint256 indexed auctionId,
+        address indexed winner,
+        uint256 finalPrice
+    );
+
+    event AuctionCancelled(
+        uint256 indexed auctionId
+    );
+
+    // ============ Offer Events ============
+
+    event OfferMade(
+        uint256 indexed offerId,
+        uint256 indexed tokenId,
+        address indexed buyer,
+        uint256 amount,
+        uint256 expiresAt
+    );
+
+    event OfferAccepted(
+        uint256 indexed offerId,
+        uint256 indexed tokenId,
+        address seller,
+        address buyer,
+        uint256 amount
+    );
+
+    event OfferRejected(
+        uint256 indexed offerId,
+        address indexed seller,
+        string reason
+    );
+
+    event OfferCancelled(
+        uint256 indexed offerId,
+        address indexed buyer
+    );
+
+    event OfferExpired(
+        uint256 indexed offerId
+    );
+
+    // ============ Compliance Events ============
+
+    event KYCStatusUpdated(
+        address indexed user,
+        DataTypes.KYCLevel oldLevel,
+        DataTypes.KYCLevel newLevel,
+        DataTypes.ComplianceStatus status
+    );
+
+    event KYCVerificationSubmitted(
+        address indexed user,
+        DataTypes.KYCLevel requestedLevel,
+        string provider
+    );
+
+    event KYCExpired(
+        address indexed user,
+        DataTypes.KYCLevel level
+    );
+
+    event UserWhitelisted(
+        address indexed user,
+        address indexed addedBy,
+        uint256 timestamp
+    );
+
+    event UserBlacklisted(
+        address indexed user,
+        address indexed addedBy,
+        string reason,
+        uint256 timestamp
+    );
+
+    event UserRemovedFromBlacklist(
+        address indexed user,
+        address indexed removedBy,
+        uint256 timestamp
+    );
+
+    event GeographicRestrictionAdded(
+        string countryCode,
+        address indexed addedBy
+    );
+
+    event GeographicRestrictionRemoved(
+        string countryCode,
+        address indexed removedBy
+    );
+
+    event TransactionLimitUpdated(
+        DataTypes.KYCLevel level,
+        uint256 oldLimit,
+        uint256 newLimit
+    );
+
+    event ComplianceViolation(
+        address indexed user,
+        string violationType,
+        uint256 timestamp
+    );
+
+    // ============ Institutional Events ============
+
+    event InstitutionalAccountCreated(
+        address indexed institution,
+        string entityName,
+        string registrationNumber,
+        uint256 timestamp
+    );
+
+    event InstitutionVerified(
+        address indexed institution,
+        address indexed verifier,
+        uint256 timestamp
+    );
+
+    event InstitutionSuspended(
+        address indexed institution,
+        string reason,
+        uint256 timestamp
+    );
+
+    event InstitutionReactivated(
+        address indexed institution,
+        uint256 timestamp
+    );
+
+    event AuthorizedSignerAdded(
+        address indexed institution,
+        address indexed signer
+    );
+
+    event AuthorizedSignerRemoved(
+        address indexed institution,
+        address indexed signer
+    );
+
+    event OTCAccessGranted(
+        address indexed institution
+    );
+
+    event OTCAccessRevoked(
+        address indexed institution
+    );
+
+    event InstitutionalTradeLimitUpdated(
+        address indexed institution,
+        uint256 oldLimit,
+        uint256 newLimit
+    );
+
+    // ============ Collection Automator Events ============
+
+    event PaymentScheduled(
+        uint256 indexed tokenId,
+        uint256 dueDate,
+        uint256 amount
+    );
+
+    event PaymentCollected(
+        uint256 indexed tokenId,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event LatePayment(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        uint256 daysLate,
+        uint256 lateFee
+    );
+
+    event DefaultWarningIssued(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        uint8 warningLevel,
+        uint256 timestamp
+    );
+
+    event DefaultDeclared(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        uint256 outstandingAmount,
+        uint256 timestamp
+    );
+
+    event GracePeriodExtended(
+        uint256 indexed tokenId,
+        uint256 newGracePeriodDays
+    );
+
+    event DebtRestructured(
+        uint256 indexed tokenId,
+        uint256 newPrincipal,
+        uint256 newInterestRate,
+        uint256 newMaturityDate
+    );
+
+    // ============ Slashing Events ============
+
+    event ReputationSlashed(
+        address indexed user,
+        uint256 tokenId,
+        uint256 oldScore,
+        uint256 newScore,
+        string reason
+    );
+
+    event SecurityDepositSlashed(
+        address indexed user,
+        uint256 amount,
+        string reason
+    );
+
+    event TradingPrivilegesSuspended(
+        address indexed user,
+        uint256 suspensionEnd,
+        string reason
+    );
+
+    event TradingPrivilegesRestored(
+        address indexed user,
+        uint256 timestamp
+    );
+
+    event DebtorBlacklisted(
+        address indexed debtor,
+        uint256 indexed tokenId,
+        string reason
+    );
+
+    // ============ Reputation Events ============
+
+    event ReputationScoreUpdated(
+        address indexed user,
+        uint256 oldScore,
+        uint256 newScore
+    );
+
+    event ReputationMilestoneReached(
+        address indexed user,
+        string milestone,
+        uint256 score
+    );
+
+    event RehabilitationStarted(
+        address indexed debtor,
+        uint256 planId,
+        uint256 duration
+    );
+
+    event RehabilitationCompleted(
+        address indexed debtor,
+        uint256 planId
+    );
+
+    // ============ Cross-chain Bridge Events ============
+
+    event TokensLocked(
+        uint256 indexed tokenId,
+        address indexed user,
+        uint256 targetChain,
+        bytes32 transferId
+    );
+
+    event TokensMinted(
+        uint256 indexed tokenId,
+        address indexed user,
+        uint256 sourceChain,
+        bytes32 transferId
+    );
+
+    event TokensBurned(
+        uint256 indexed tokenId,
+        address indexed user,
+        uint256 targetChain,
+        bytes32 transferId
+    );
+
+    event TokensUnlocked(
+        uint256 indexed tokenId,
+        address indexed user,
+        bytes32 transferId
+    );
+
+    event BridgeTransferInitiated(
+        bytes32 indexed transferId,
+        uint256 tokenId,
+        uint256 sourceChain,
+        uint256 targetChain,
+        address sender
+    );
+
+    event BridgeTransferCompleted(
+        bytes32 indexed transferId,
+        uint256 timestamp
+    );
+
+    event BridgeTransferFailed(
+        bytes32 indexed transferId,
+        string reason
+    );
+
+    event ChainAdded(
+        uint256 chainId,
+        address bridgeAddress
+    );
+
+    event ChainRemoved(
+        uint256 chainId
+    );
+
+    // ============ Price Oracle Events ============
+
+    event PriceFeedUpdated(
+        string asset,
+        address feedAddress
+    );
+
+    event PriceUpdated(
+        string asset,
+        uint256 price,
+        uint256 timestamp
+    );
+
+    event PriceDeviationDetected(
+        string asset,
+        uint256 currentPrice,
+        uint256 expectedPrice,
+        uint256 deviation
+    );
+
+    // ============ Administrative Events ============
+
+    event ContractPaused(
+        address indexed pausedBy,
+        uint256 timestamp
+    );
+
+    event ContractUnpaused(
+        address indexed unpausedBy,
+        uint256 timestamp
+    );
+
+    event EmergencyWithdrawal(
+        address indexed token,
+        address indexed recipient,
+        uint256 amount
+    );
+
+    event FeeUpdated(
+        string feeType,
+        uint256 oldFee,
+        uint256 newFee
+    );
+
+    event TreasuryUpdated(
+        address indexed oldTreasury,
+        address indexed newTreasury
+    );
+
+    event RoleGranted(
+        bytes32 indexed role,
+        address indexed account,
+        address indexed sender
+    );
+
+    event RoleRevoked(
+        bytes32 indexed role,
+        address indexed account,
+        address indexed sender
+    );
+
+    // ============ Notification Events (for off-chain services) ============
+
+    event PaymentReminderNeeded(
+        uint256 indexed tokenId,
+        address indexed debtor,
+        uint256 dueDate,
+        uint256 amount
+    );
+
+    event AlertTriggered(
+        address indexed user,
+        string alertType,
+        string message
+    );
+
+    event SystemNotification(
+        string notificationType,
+        string message,
+        uint256 timestamp
+    );
+}

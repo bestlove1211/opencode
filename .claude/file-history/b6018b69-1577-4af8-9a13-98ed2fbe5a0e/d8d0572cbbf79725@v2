@@ -1,0 +1,94 @@
+const { ethers, upgrades } = require("hardhat");
+
+async function main() {
+  console.log("Deploying Bancafi Savings Account Contract...");
+
+  // Get the deployer account
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying contracts with account:", deployer.address);
+
+  // Get account balance
+  const balance = await ethers.provider.getBalance(deployer.address);
+  console.log("Account balance:", ethers.formatEther(balance), "ETH");
+
+  // Deploy parameters
+  const BASE_APY = 450;  // 4.5%
+  const BONUS_APY = 250; // 2.5% (total up to 7%)
+  const BONUS_THRESHOLD = 90 * 24 * 60 * 60; // 90 days in seconds
+
+  // Get contract factory
+  const BancafiSavingsAccount = await ethers.getContractFactory("BancafiSavingsAccount");
+
+  // Deploy as upgradeable proxy
+  console.log("\nDeploying BancafiSavingsAccount...");
+  const savingsAccount = await upgrades.deployProxy(
+    BancafiSavingsAccount,
+    [BASE_APY, BONUS_APY, BONUS_THRESHOLD],
+    {
+      initializer: "initialize",
+      kind: "uups"
+    }
+  );
+
+  await savingsAccount.waitForDeployment();
+  const address = await savingsAccount.getAddress();
+
+  console.log("\n✅ BancafiSavingsAccount deployed to:", address);
+  console.log("Base APY:", BASE_APY / 100, "%");
+  console.log("Bonus APY:", BONUS_APY / 100, "%");
+  console.log("Bonus Threshold:", BONUS_THRESHOLD / (24 * 60 * 60), "days");
+
+  // Save deployment info
+  const deploymentInfo = {
+    network: (await ethers.provider.getNetwork()).name,
+    chainId: (await ethers.provider.getNetwork()).chainId,
+    contract: "BancafiSavingsAccount",
+    address: address,
+    deployer: deployer.address,
+    timestamp: new Date().toISOString(),
+    parameters: {
+      baseAPY: BASE_APY,
+      bonusAPY: BONUS_APY,
+      bonusThreshold: BONUS_THRESHOLD
+    }
+  };
+
+  console.log("\n📄 Deployment Info:");
+  console.log(JSON.stringify(deploymentInfo, null, 2));
+
+  // Save to file
+  const fs = require("fs");
+  const path = require("path");
+
+  const deploymentsDir = path.join(__dirname, "../deployments");
+  if (!fs.existsSync(deploymentsDir)) {
+    fs.mkdirSync(deploymentsDir, { recursive: true });
+  }
+
+  const filename = `${deploymentInfo.network}-${Date.now()}.json`;
+  fs.writeFileSync(
+    path.join(deploymentsDir, filename),
+    JSON.stringify(deploymentInfo, null, 2)
+  );
+
+  console.log("\n💾 Deployment info saved to:", filename);
+
+  // Instructions for adding tokens
+  console.log("\n📝 Next Steps:");
+  console.log("1. Add supported tokens:");
+  console.log(`   await savingsAccount.addSupportedToken("<TOKEN_ADDRESS>")`);
+  console.log("\n2. Fund the contract for interest payments:");
+  console.log(`   await savingsAccount.fundContract("<TOKEN_ADDRESS>", amount)`);
+  console.log("\n3. Verify the contract on block explorer:");
+  console.log(`   npx hardhat verify --network <NETWORK> ${address}`);
+
+  return savingsAccount;
+}
+
+// Execute deployment
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

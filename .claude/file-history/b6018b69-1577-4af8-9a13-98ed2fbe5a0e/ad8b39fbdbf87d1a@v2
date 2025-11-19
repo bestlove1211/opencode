@@ -1,0 +1,713 @@
+# Bancafi Savings Account - Technical Documentation
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Smart Contract Specification](#smart-contract-specification)
+4. [Backend API](#backend-api)
+5. [Interest Calculation](#interest-calculation)
+6. [Security Considerations](#security-considerations)
+7. [Deployment Guide](#deployment-guide)
+8. [Integration Guide](#integration-guide)
+
+---
+
+## Overview
+
+The Bancafi Savings Account is a blockchain-based savings system that provides traditional bank savings account functionality with cryptocurrency. Users can deposit supported tokens, earn interest (4.5% - 7% APY), and withdraw funds at any time.
+
+### Key Features
+
+- **Fixed APY**: Base rate of 4.5%, up to 7% with loyalty bonus
+- **Instant Liquidity**: Withdraw anytime without penalties
+- **Multi-Token Support**: Support for multiple ERC20 tokens
+- **Automatic Interest**: Interest automatically compounds into balance
+- **Secure**: Audited smart contracts with reentrancy protection
+- **Upgradeable**: Proxy pattern for future improvements
+
+---
+
+## Architecture
+
+### System Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Frontend Layer                        │
+│         (Web3 Wallet Integration, UI/UX)                │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+┌───────────────────┴─────────────────────────────────────┐
+│                  Backend API (REST)                      │
+│  - Account Management                                    │
+│  - Transaction Tracking                                  │
+│  - Statistics & Analytics                                │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+        ┌───────────┼───────────┐
+        │           │           │
+┌───────▼─────┐ ┌──▼────────┐ ┌▼──────────┐
+│ PostgreSQL  │ │  Redis    │ │  Web3     │
+│  Database   │ │  Cache    │ │ Provider  │
+└─────────────┘ └───────────┘ └─────┬─────┘
+                                     │
+┌────────────────────────────────────▼─────────────────────┐
+│         BancafiSavingsAccount Smart Contract             │
+│  - Deposit/Withdrawal Management                         │
+│  - Interest Calculation & Distribution                   │
+│  - Token Management                                      │
+└──────────────────────────────────────────────────────────┘
+                    │
+┌───────────────────▼──────────────────────────────────────┐
+│              Blockchain Network                          │
+│      (Ethereum, BSC, Polygon, Arbitrum)                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Technology Stack
+
+**Smart Contracts:**
+- Solidity 0.8.20
+- OpenZeppelin Contracts (Upgradeable)
+- Hardhat for development & testing
+
+**Backend:**
+- Node.js with Express.js
+- PostgreSQL + Sequelize ORM
+- ethers.js for blockchain interaction
+- Redis for caching (optional)
+
+**Security:**
+- ReentrancyGuard
+- Pausable pattern
+- Role-based access control
+- Rate limiting
+
+---
+
+## Smart Contract Specification
+
+### Contract: BancafiSavingsAccount
+
+**File:** `contracts/BancafiSavingsAccount.sol`
+
+#### State Variables
+
+```solidity
+// APY Configuration
+uint256 public baseAPY;           // Base APY in basis points (450 = 4.5%)
+uint256 public bonusAPY;          // Bonus APY in basis points (250 = 2.5%)
+uint256 public bonusThreshold;    // Time threshold for bonus (90 days)
+
+// Account tracking
+mapping(address => mapping(address => SavingsAccount)) public accounts;
+mapping(address => bool) public supportedTokens;
+
+// Statistics
+uint256 public totalDeposits;
+uint256 public totalInterestPaid;
+uint256 public totalAccounts;
+```
+
+#### Structs
+
+```solidity
+struct SavingsAccount {
+    uint256 balance;              // Current balance including interest
+    uint256 lastInterestUpdate;   // Last time interest was calculated
+    uint256 totalInterestEarned;  // Cumulative interest earned
+    uint256 accountOpenDate;      // Account creation timestamp
+    bool isActive;                // Whether account is active
+}
+```
+
+#### Core Functions
+
+##### 1. Deposit
+
+```solidity
+function deposit(address token, uint256 amount) external nonReentrant whenNotPaused
+```
+
+**Description:** Deposit tokens into savings account
+
+**Parameters:**
+- `token`: Address of ERC20 token to deposit
+- `amount`: Amount to deposit (must be >= MIN_DEPOSIT)
+
+**Requirements:**
+- Token must be supported
+- Amount >= 10 tokens (MIN_DEPOSIT)
+- User must have approved contract to spend tokens
+- Contract must not be paused
+
+**Effects:**
+- Creates new account if first deposit
+- Claims pending interest if account exists
+- Increases user balance
+- Emits `Deposit` event
+
+**Gas Cost:** ~150k-200k gas
+
+---
+
+##### 2. Withdraw
+
+```solidity
+function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused
+```
+
+**Description:** Withdraw tokens from savings account
+
+**Parameters:**
+- `token`: Address of token to withdraw
+- `amount`: Amount to withdraw (0 = withdraw all)
+
+**Requirements:**
+- Active account must exist
+- Sufficient balance
+- Contract must not be paused
+
+**Effects:**
+- Claims pending interest first
+- Decreases user balance
+- Closes account if balance reaches zero
+- Transfers tokens to user
+- Emits `Withdrawal` event
+
+**Gas Cost:** ~120k-180k gas
+
+---
+
+##### 3. Calculate Interest
+
+```solidity
+function calculateInterest(address user, address token) public view returns (uint256)
+```
+
+**Description:** Calculate pending interest for an account
+
+**Formula:**
+```
+interest = (balance × effectiveAPY × timeElapsed) / (10000 × SECONDS_PER_YEAR)
+
+where:
+- effectiveAPY = baseAPY + (bonusAPY if eligible)
+- timeElapsed = current time - lastInterestUpdate
+- SECONDS_PER_YEAR = 31,536,000
+```
+
+**Returns:** Pending interest amount in token units
+
+---
+
+##### 4. Get Account Info
+
+```solidity
+function getAccountInfo(address user, address token) external view
+    returns (
+        uint256 balance,
+        uint256 totalInterestEarned,
+        uint256 currentAPY,
+        uint256 pendingInterest,
+        uint256 accountAge,
+        bool isActive
+    )
+```
+
+**Description:** Get comprehensive account information
+
+**Returns:**
+- `balance`: Current balance
+- `totalInterestEarned`: Cumulative interest earned
+- `currentAPY`: Current APY rate (with bonus if eligible)
+- `pendingInterest`: Interest accrued since last update
+- `accountAge`: Time since account opened (seconds)
+- `isActive`: Whether account is active
+
+---
+
+#### Admin Functions
+
+##### Update APY
+
+```solidity
+function updateAPY(uint256 newBaseAPY, uint256 newBonusAPY) external onlyOwner
+```
+
+Update interest rates. Constraints:
+- Base APY: 4.5% - 7% (450-700 basis points)
+- Bonus APY: max 2.5% (250 basis points)
+- Total APY: cannot exceed 7%
+
+##### Add/Remove Supported Token
+
+```solidity
+function addSupportedToken(address token) external onlyOwner
+function removeSupportedToken(address token) external onlyOwner
+```
+
+Manage supported token list.
+
+##### Fund Contract
+
+```solidity
+function fundContract(address token, uint256 amount) external onlyOwner
+```
+
+Add liquidity for interest payments.
+
+##### Emergency Controls
+
+```solidity
+function pause() external onlyOwner
+function unpause() external onlyOwner
+```
+
+Emergency pause/unpause for security incidents.
+
+---
+
+## Interest Calculation
+
+### APY Structure
+
+#### Base APY: 4.5%
+
+All accounts earn a base APY of 4.5% from day one.
+
+#### Bonus APY: Up to 2.5%
+
+Accounts older than the bonus threshold (default: 90 days) earn an additional 2.5%, bringing total APY to 7%.
+
+### Calculation Formula
+
+```javascript
+// Calculate effective APY
+effectiveAPY = baseAPY + (accountAge >= bonusThreshold ? bonusAPY : 0)
+
+// Calculate interest
+timeElapsed = currentTimestamp - lastInterestUpdate
+interest = (balance * effectiveAPY * timeElapsed) / (10000 * 31536000)
+```
+
+### Example Calculations
+
+**Example 1: New Account (< 90 days)**
+- Deposit: 1,000 USDC
+- APY: 4.5%
+- Time: 30 days
+
+```
+interest = (1000 * 450 * 2592000) / (10000 * 31536000)
+interest = 3.69 USDC
+```
+
+**Example 2: Mature Account (> 90 days)**
+- Deposit: 1,000 USDC
+- APY: 7% (4.5% + 2.5% bonus)
+- Time: 365 days
+
+```
+interest = (1000 * 700 * 31536000) / (10000 * 31536000)
+interest = 70 USDC
+```
+
+### Compounding
+
+Interest is **automatically compounded** into the account balance whenever:
+- User makes a new deposit
+- User withdraws funds
+- User explicitly claims interest
+
+This means interest earns interest, maximizing returns.
+
+---
+
+## Security Considerations
+
+### Smart Contract Security
+
+#### 1. Reentrancy Protection
+
+All state-changing functions use OpenZeppelin's `ReentrancyGuard`:
+
+```solidity
+function deposit(...) external nonReentrant { ... }
+function withdraw(...) external nonReentrant { ... }
+```
+
+#### 2. Pausability
+
+Emergency pause mechanism for security incidents:
+
+```solidity
+function deposit(...) external whenNotPaused { ... }
+```
+
+#### 3. Access Control
+
+Owner-only functions for critical operations:
+
+```solidity
+function updateAPY(...) external onlyOwner { ... }
+```
+
+#### 4. Input Validation
+
+- Minimum deposit requirements
+- APY bounds checking (4.5% - 7%)
+- Address validation
+
+#### 5. Safe Math
+
+Using Solidity 0.8.x built-in overflow protection.
+
+#### 6. Safe ERC20 Operations
+
+Using OpenZeppelin's `SafeERC20` for token transfers:
+
+```solidity
+IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+```
+
+### Backend Security
+
+#### 1. Rate Limiting
+
+100 requests per 15 minutes per IP address.
+
+#### 2. Input Validation
+
+Express-validator for all API inputs:
+- Ethereum address validation
+- Amount validation
+- Type validation
+
+#### 3. SQL Injection Prevention
+
+Using Sequelize ORM with parameterized queries.
+
+#### 4. CORS Configuration
+
+Configurable CORS policy.
+
+#### 5. Security Headers
+
+Helmet.js for security headers.
+
+### Best Practices
+
+1. **Never expose private keys**
+2. **Use hardware wallets** for contract ownership
+3. **Multi-signature wallets** for large value operations
+4. **Regular security audits**
+5. **Monitor contract events** for suspicious activity
+6. **Keep sufficient liquidity** for interest payments
+7. **Test thoroughly** before mainnet deployment
+
+---
+
+## Deployment Guide
+
+### Prerequisites
+
+- Node.js >= 18.x
+- Hardhat installed
+- RPC endpoint (Alchemy, Infura, etc.)
+- Deployment wallet with ETH for gas
+
+### Step 1: Environment Setup
+
+```bash
+# Clone repository
+git clone <repo>
+cd bancafi-wallet
+
+# Install dependencies
+npm install
+
+# Copy environment file
+cp .env.example .env
+```
+
+### Step 2: Configure Environment
+
+Edit `.env`:
+
+```bash
+# Network RPC
+ETHEREUM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+
+# Deployment wallet
+PRIVATE_KEY=your_private_key_here
+
+# API keys for verification
+ETHERSCAN_API_KEY=your_etherscan_key
+```
+
+### Step 3: Compile Contracts
+
+```bash
+npx hardhat compile
+```
+
+### Step 4: Run Tests
+
+```bash
+# Run all tests
+npx hardhat test
+
+# Run with gas reporting
+REPORT_GAS=true npx hardhat test
+
+# Run coverage
+npx hardhat coverage
+```
+
+### Step 5: Deploy to Testnet
+
+```bash
+# Deploy to Sepolia
+npx hardhat run scripts/deploy.js --network sepolia
+```
+
+Save the deployed contract address.
+
+### Step 6: Verify Contract
+
+```bash
+npx hardhat verify --network sepolia <CONTRACT_ADDRESS>
+```
+
+### Step 7: Configure Contract
+
+```bash
+# Add supported token (e.g., USDC)
+SAVINGS_ACCOUNT_ADDRESS=0x... TOKEN_ADDRESS=0x... \
+  npx hardhat run scripts/add-token.js --network sepolia
+
+# Fund contract for interest payments
+SAVINGS_ACCOUNT_ADDRESS=0x... TOKEN_ADDRESS=0x... AMOUNT=1000000 \
+  npx hardhat run scripts/fund-contract.js --network sepolia
+```
+
+### Step 8: Deploy Backend
+
+```bash
+cd backend
+
+# Install dependencies
+npm install
+
+# Configure database
+createdb bancafi_dev
+
+# Set environment variables
+cp .env.example .env
+# Edit .env with contract address and database URL
+
+# Start server
+npm run dev
+```
+
+### Step 9: Mainnet Deployment
+
+**Important:** Before mainnet deployment:
+
+1. Complete security audit
+2. Test extensively on testnet
+3. Use multi-sig wallet for ownership
+4. Start with small liquidity pool
+5. Monitor closely for 24-48 hours
+
+```bash
+# Deploy to mainnet
+npx hardhat run scripts/deploy.js --network ethereum
+
+# Verify
+npx hardhat verify --network ethereum <CONTRACT_ADDRESS>
+```
+
+---
+
+## Integration Guide
+
+### Frontend Integration
+
+#### 1. Install Dependencies
+
+```bash
+npm install ethers@6
+```
+
+#### 2. Connect to Contract
+
+```javascript
+import { ethers } from 'ethers';
+
+const provider = new ethers.BrowserProvider(window.ethereum);
+const signer = await provider.getSigner();
+
+const contractAddress = '0x...'; // Your deployed contract
+const contractABI = [...]; // Import from artifacts
+
+const savingsContract = new ethers.Contract(
+  contractAddress,
+  contractABI,
+  signer
+);
+```
+
+#### 3. Deposit Tokens
+
+```javascript
+async function deposit(tokenAddress, amount) {
+  // First approve contract to spend tokens
+  const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+
+  const approveTx = await token.approve(contractAddress, amount);
+  await approveTx.wait();
+
+  // Then deposit
+  const depositTx = await savingsContract.deposit(tokenAddress, amount);
+  await depositTx.wait();
+
+  console.log('Deposit successful!');
+}
+```
+
+#### 4. Withdraw Tokens
+
+```javascript
+async function withdraw(tokenAddress, amount) {
+  // amount = 0 to withdraw all
+  const tx = await savingsContract.withdraw(tokenAddress, amount);
+  await tx.wait();
+
+  console.log('Withdrawal successful!');
+}
+```
+
+#### 5. Check Balance
+
+```javascript
+async function getAccountInfo(walletAddress, tokenAddress) {
+  const info = await savingsContract.getAccountInfo(walletAddress, tokenAddress);
+
+  return {
+    balance: ethers.formatUnits(info.balance, 18),
+    totalInterest: ethers.formatUnits(info.totalInterestEarned, 18),
+    currentAPY: Number(info.currentAPY) / 100,
+    pendingInterest: ethers.formatUnits(info.pendingInterest, 18),
+    accountAge: Number(info.accountAge),
+    isActive: info.isActive
+  };
+}
+```
+
+#### 6. Listen to Events
+
+```javascript
+// Listen for deposits
+savingsContract.on('Deposit', (user, token, amount, newBalance) => {
+  console.log(`User ${user} deposited ${ethers.formatUnits(amount, 18)}`);
+});
+
+// Listen for withdrawals
+savingsContract.on('Withdrawal', (user, token, amount, remaining) => {
+  console.log(`User ${user} withdrew ${ethers.formatUnits(amount, 18)}`);
+});
+
+// Listen for interest payments
+savingsContract.on('InterestPaid', (user, token, interest, newBalance) => {
+  console.log(`User ${user} earned ${ethers.formatUnits(interest, 18)} interest`);
+});
+```
+
+### Backend API Integration
+
+#### Get Account Info
+
+```javascript
+const response = await fetch(`https://api.bancafi.com/api/accounts/${walletAddress}`);
+const data = await response.json();
+
+console.log(data.accounts);
+```
+
+#### Get Transaction History
+
+```javascript
+const response = await fetch(
+  `https://api.bancafi.com/api/transactions/${walletAddress}?page=1&limit=20`
+);
+const data = await response.json();
+
+console.log(data.transactions);
+```
+
+#### Get Global Stats
+
+```javascript
+const response = await fetch('https://api.bancafi.com/api/stats/global');
+const data = await response.json();
+
+console.log('Total Deposits:', data.onChain.totalDeposits);
+console.log('Total Interest Paid:', data.onChain.totalInterestPaid);
+```
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+#### 1. Transaction Fails with "Token not supported"
+
+**Solution:** Ensure token has been added via `addSupportedToken()` by contract owner.
+
+#### 2. "Amount below minimum deposit"
+
+**Solution:** Minimum deposit is 10 tokens. Increase deposit amount.
+
+#### 3. "Insufficient balance" on withdrawal
+
+**Solution:** Check actual balance including pending interest. Use `getAccountInfo()`.
+
+#### 4. High gas costs
+
+**Solution:**
+- Batch operations when possible
+- Deploy on L2 solutions (Polygon, Arbitrum)
+- Wait for lower gas periods
+
+#### 5. Interest not updating
+
+**Solution:** Interest is calculated dynamically but only applied on interactions (deposit, withdraw, claim).
+
+---
+
+## Glossary
+
+- **APY (Annual Percentage Yield)**: The annual rate of return accounting for compound interest
+- **Basis Points (BPS)**: 1/100th of a percent (100 BPS = 1%)
+- **Liquidity**: Available funds for withdrawals
+- **Reentrancy**: Attack vector where function is called recursively
+- **Upgradeable Contract**: Contract that can be upgraded without changing address
+
+---
+
+## Support & Contact
+
+- **Documentation**: https://docs.bancafi.com
+- **GitHub**: https://github.com/bancafi
+- **Discord**: https://discord.gg/bancafi
+- **Email**: support@bancafi.com
+
+---
+
+**Version:** 1.0.0
+**Last Updated:** 2024
+**License:** MIT

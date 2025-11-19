@@ -1,0 +1,857 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/ICreditScore.sol";
+import "./interfaces/ICollateralManager.sol";
+import "./interfaces/IDebtCollection.sol";
+import "./libraries/FlashLoanProtection.sol";
+
+/**
+ * @title BancafiLending
+ * @notice Core upgradeable lending contract for Bancafi Credit platform
+ * @dev Handles loan creation, repayment, and management with collateral support
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiLending is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    FlashLoanGuard
+{
+    using SafeERC20 for IERC20;
+    using FlashLoanProtection for FlashLoanProtection.ProtectionState;
+
+    // ============ Structs ============
+
+    struct Loan {
+        uint256 id;
+        address borrower;
+        address lender;
+        address asset;
+        uint256 principal;
+        uint256 interestRate; // in basis points (1% = 100)
+        uint256 collateralAmount;
+        address collateralAsset;
+        uint256 startTime;
+        uint256 duration;
+        uint256 repaidAmount;
+        LoanStatus status;
+        bool hasCollateral;
+        uint256 lastUpdateTime;
+    }
+
+    struct LendingOffer {
+        uint256 id;
+        address lender;
+        address asset;
+        uint256 amount;
+        uint256 minInterestRate; // in basis points
+        uint256 maxDuration;
+        uint256 minCreditScore;
+        bool isActive;
+        uint256 createdAt;
+        uint256 filledAmount;
+    }
+
+    struct BorrowRequest {
+        uint256 id;
+        address borrower;
+        address asset;
+        uint256 amount;
+        uint256 maxInterestRate;
+        uint256 duration;
+        address collateralAsset;
+        uint256 collateralAmount;
+        bool isActive;
+        uint256 createdAt;
+    }
+
+    enum LoanStatus {
+        Active,
+        Repaid,
+        Defaulted,
+        Liquidated,
+        PartiallyRepaid
+    }
+
+    // ============ State Variables ============
+
+    ICreditScore public creditScoreContract;
+    ICollateralManager public collateralManager;
+    IDebtCollection public debtCollection;
+
+    uint256 public nextLoanId;
+    uint256 public nextOfferId;
+    uint256 public nextRequestId;
+
+    uint256 public platformFee; // in basis points
+    uint256 public constant MAX_INTEREST_RATE = 10000; // 100%
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MAX_PLATFORM_FEE = 500; // 5%
+
+    uint256 public totalLoansCreated;
+    uint256 public totalActiveLoans;
+    uint256 public totalVolumeProcessed;
+
+    mapping(uint256 => Loan) public loans;
+    mapping(uint256 => LendingOffer) public lendingOffers;
+    mapping(uint256 => BorrowRequest) public borrowRequests;
+    mapping(address => uint256[]) public userLoans;
+    mapping(address => uint256[]) public userOffers;
+    mapping(address => uint256[]) public userRequests;
+    mapping(address => bool) public supportedAssets;
+
+    // ============ Events ============
+
+    // Loan Events
+    event LoanCreated(
+        uint256 indexed loanId,
+        address indexed borrower,
+        address indexed lender,
+        address asset,
+        uint256 amount,
+        uint256 interestRate,
+        uint256 duration,
+        bool hasCollateral
+    );
+
+    event LoanRepayment(
+        uint256 indexed loanId,
+        address indexed borrower,
+        uint256 amount,
+        uint256 remainingAmount,
+        uint256 timestamp
+    );
+
+    event LoanFullyRepaid(
+        uint256 indexed loanId,
+        address indexed borrower,
+        uint256 totalRepaid,
+        uint256 timestamp
+    );
+
+    event LoanDefaulted(
+        uint256 indexed loanId,
+        address indexed borrower,
+        address indexed lender,
+        uint256 outstandingAmount,
+        uint256 timestamp
+    );
+
+    event LoanLiquidated(
+        uint256 indexed loanId,
+        address indexed borrower,
+        uint256 collateralSeized,
+        uint256 debtCovered,
+        uint256 timestamp
+    );
+
+    // Offer Events
+    event LendingOfferCreated(
+        uint256 indexed offerId,
+        address indexed lender,
+        address asset,
+        uint256 amount,
+        uint256 minInterestRate,
+        uint256 maxDuration,
+        uint256 minCreditScore
+    );
+
+    event LendingOfferUpdated(
+        uint256 indexed offerId,
+        uint256 newAmount,
+        uint256 newMinInterestRate
+    );
+
+    event LendingOfferCancelled(
+        uint256 indexed offerId,
+        address indexed lender,
+        uint256 refundedAmount
+    );
+
+    event LendingOfferAccepted(
+        uint256 indexed offerId,
+        uint256 indexed loanId,
+        address indexed borrower,
+        uint256 amount
+    );
+
+    // Request Events
+    event BorrowRequestCreated(
+        uint256 indexed requestId,
+        address indexed borrower,
+        address asset,
+        uint256 amount,
+        uint256 maxInterestRate,
+        uint256 duration,
+        bool hasCollateral
+    );
+
+    event BorrowRequestCancelled(
+        uint256 indexed requestId,
+        address indexed borrower
+    );
+
+    event BorrowRequestAccepted(
+        uint256 indexed requestId,
+        uint256 indexed loanId,
+        address indexed lender,
+        uint256 interestRate
+    );
+
+    // Platform Events
+    event PlatformFeeUpdated(uint256 oldFee, uint256 newFee);
+    event AssetSupportUpdated(address indexed asset, bool supported);
+    event ContractUpgraded(address indexed newImplementation, uint256 timestamp);
+    event EmergencyWithdrawal(address indexed asset, uint256 amount, address indexed recipient);
+
+    // ============ Modifiers ============
+
+    modifier onlySupportedAsset(address asset) {
+        require(supportedAssets[asset], "Asset not supported");
+        _;
+    }
+
+    modifier validLoan(uint256 loanId) {
+        require(loanId > 0 && loanId < nextLoanId, "Invalid loan ID");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        address _creditScoreContract,
+        address _collateralManager,
+        address _debtCollection,
+        uint256 _platformFee
+    ) public initializer {
+        require(_creditScoreContract != address(0), "Invalid credit score address");
+        require(_collateralManager != address(0), "Invalid collateral manager address");
+        require(_debtCollection != address(0), "Invalid debt collection address");
+        require(_platformFee <= MAX_PLATFORM_FEE, "Platform fee too high");
+
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        creditScoreContract = ICreditScore(_creditScoreContract);
+        collateralManager = ICollateralManager(_collateralManager);
+        debtCollection = IDebtCollection(_debtCollection);
+        platformFee = _platformFee;
+
+        nextLoanId = 1;
+        nextOfferId = 1;
+        nextRequestId = 1;
+
+        // Initialize flash loan protection (max 3 actions per block)
+        _initializeFlashLoanProtection(3);
+    }
+
+    // ============ User Functions - Lending Offers ============
+
+    /**
+     * @notice Create a lending offer
+     * @param asset The asset to lend
+     * @param amount The amount to lend
+     * @param minInterestRate Minimum acceptable interest rate (in basis points)
+     * @param maxDuration Maximum loan duration in seconds
+     * @param minCreditScore Minimum borrower credit score required
+     * @return offerId The created offer ID
+     */
+    function createLendingOffer(
+        address asset,
+        uint256 amount,
+        uint256 minInterestRate,
+        uint256 maxDuration,
+        uint256 minCreditScore
+    ) external nonReentrant whenNotPaused onlySupportedAsset(asset) returns (uint256) {
+        require(amount > 0, "Amount must be positive");
+        require(minInterestRate <= MAX_INTEREST_RATE, "Interest rate too high");
+        require(maxDuration > 0, "Duration must be positive");
+        require(minCreditScore <= 1000, "Invalid credit score");
+
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 offerId = nextOfferId++;
+        lendingOffers[offerId] = LendingOffer({
+            id: offerId,
+            lender: msg.sender,
+            asset: asset,
+            amount: amount,
+            minInterestRate: minInterestRate,
+            maxDuration: maxDuration,
+            minCreditScore: minCreditScore,
+            isActive: true,
+            createdAt: block.timestamp,
+            filledAmount: 0
+        });
+
+        userOffers[msg.sender].push(offerId);
+
+        emit LendingOfferCreated(
+            offerId,
+            msg.sender,
+            asset,
+            amount,
+            minInterestRate,
+            maxDuration,
+            minCreditScore
+        );
+
+        return offerId;
+    }
+
+    /**
+     * @notice Cancel a lending offer and refund tokens
+     * @param offerId The offer ID to cancel
+     */
+    function cancelLendingOffer(uint256 offerId) external nonReentrant {
+        LendingOffer storage offer = lendingOffers[offerId];
+        require(offer.lender == msg.sender, "Not offer owner");
+        require(offer.isActive, "Offer not active");
+
+        uint256 refundAmount = offer.amount - offer.filledAmount;
+        offer.isActive = false;
+
+        if (refundAmount > 0) {
+            IERC20(offer.asset).safeTransfer(msg.sender, refundAmount);
+        }
+
+        emit LendingOfferCancelled(offerId, msg.sender, refundAmount);
+    }
+
+    // ============ User Functions - Borrow Requests ============
+
+    /**
+     * @notice Create a borrow request
+     * @param asset The asset to borrow
+     * @param amount The amount to borrow
+     * @param maxInterestRate Maximum interest rate willing to pay (basis points)
+     * @param duration Loan duration in seconds
+     * @param collateralAsset Collateral asset address (address(0) if none)
+     * @param collateralAmount Collateral amount
+     * @return requestId The created request ID
+     */
+    function createBorrowRequest(
+        address asset,
+        uint256 amount,
+        uint256 maxInterestRate,
+        uint256 duration,
+        address collateralAsset,
+        uint256 collateralAmount
+    ) external nonReentrant whenNotPaused onlySupportedAsset(asset) returns (uint256) {
+        require(amount > 0, "Amount must be positive");
+        require(maxInterestRate <= MAX_INTEREST_RATE, "Interest rate too high");
+        require(duration > 0, "Duration must be positive");
+
+        bool hasCollateral = collateralAsset != address(0) && collateralAmount > 0;
+
+        // Lock collateral if provided
+        if (hasCollateral) {
+            require(supportedAssets[collateralAsset], "Collateral asset not supported");
+            IERC20(collateralAsset).safeTransferFrom(
+                msg.sender,
+                address(collateralManager),
+                collateralAmount
+            );
+            collateralManager.lockCollateral(msg.sender, collateralAsset, collateralAmount);
+        }
+
+        uint256 requestId = nextRequestId++;
+        borrowRequests[requestId] = BorrowRequest({
+            id: requestId,
+            borrower: msg.sender,
+            asset: asset,
+            amount: amount,
+            maxInterestRate: maxInterestRate,
+            duration: duration,
+            collateralAsset: collateralAsset,
+            collateralAmount: collateralAmount,
+            isActive: true,
+            createdAt: block.timestamp
+        });
+
+        userRequests[msg.sender].push(requestId);
+
+        emit BorrowRequestCreated(
+            requestId,
+            msg.sender,
+            asset,
+            amount,
+            maxInterestRate,
+            duration,
+            hasCollateral
+        );
+
+        return requestId;
+    }
+
+    /**
+     * @notice Cancel a borrow request
+     * @param requestId The request ID to cancel
+     */
+    function cancelBorrowRequest(uint256 requestId) external nonReentrant {
+        BorrowRequest storage request = borrowRequests[requestId];
+        require(request.borrower == msg.sender, "Not request owner");
+        require(request.isActive, "Request not active");
+
+        request.isActive = false;
+
+        // Release collateral if locked
+        if (request.collateralAsset != address(0) && request.collateralAmount > 0) {
+            collateralManager.releaseCollateral(
+                msg.sender,
+                request.collateralAsset,
+                request.collateralAmount
+            );
+        }
+
+        emit BorrowRequestCancelled(requestId, msg.sender);
+    }
+
+    // ============ User Functions - Matching ============
+
+    /**
+     * @notice Accept a borrow request as a lender
+     * @param requestId The borrow request ID
+     * @param interestRate The interest rate to offer (basis points)
+     * @return loanId The created loan ID
+     */
+    function acceptBorrowRequest(
+        uint256 requestId,
+        uint256 interestRate
+    ) external nonReentrant whenNotPaused flashLoanProtected returns (uint256) {
+        BorrowRequest storage request = borrowRequests[requestId];
+        require(request.isActive, "Request not active");
+        require(interestRate <= request.maxInterestRate, "Interest rate too high");
+        require(interestRate <= MAX_INTEREST_RATE, "Interest rate exceeds maximum");
+
+        // Check credit score
+        uint256 creditScore = creditScoreContract.getCreditScore(request.borrower);
+        require(creditScore > 0, "Borrower has no credit score");
+
+        // Create loan
+        uint256 loanId = _createLoan(
+            request.borrower,
+            msg.sender,
+            request.asset,
+            request.amount,
+            interestRate,
+            request.duration,
+            request.collateralAsset,
+            request.collateralAmount
+        );
+
+        // Deactivate request
+        request.isActive = false;
+
+        // Transfer funds
+        _transferLoanFunds(msg.sender, request.borrower, request.asset, request.amount);
+
+        emit BorrowRequestAccepted(requestId, loanId, msg.sender, interestRate);
+
+        return loanId;
+    }
+
+    /**
+     * @notice Accept a lending offer as a borrower
+     * @param offerId The lending offer ID
+     * @param amount Amount to borrow from the offer
+     * @param duration Loan duration in seconds
+     * @param collateralAsset Collateral asset (address(0) if none)
+     * @param collateralAmount Collateral amount
+     * @return loanId The created loan ID
+     */
+    function acceptLendingOffer(
+        uint256 offerId,
+        uint256 amount,
+        uint256 duration,
+        address collateralAsset,
+        uint256 collateralAmount
+    ) external nonReentrant whenNotPaused flashLoanProtected returns (uint256) {
+        LendingOffer storage offer = lendingOffers[offerId];
+        require(offer.isActive, "Offer not active");
+        require(amount > 0 && amount <= (offer.amount - offer.filledAmount), "Invalid amount");
+        require(duration <= offer.maxDuration, "Duration exceeds maximum");
+
+        // Check credit score
+        uint256 creditScore = creditScoreContract.getCreditScore(msg.sender);
+        require(creditScore >= offer.minCreditScore, "Credit score too low");
+
+        bool hasCollateral = collateralAsset != address(0) && collateralAmount > 0;
+
+        // Lock collateral if provided
+        if (hasCollateral) {
+            require(supportedAssets[collateralAsset], "Collateral asset not supported");
+            IERC20(collateralAsset).safeTransferFrom(
+                msg.sender,
+                address(collateralManager),
+                collateralAmount
+            );
+            collateralManager.lockCollateral(msg.sender, collateralAsset, collateralAmount);
+        }
+
+        // Create loan
+        uint256 loanId = _createLoan(
+            msg.sender,
+            offer.lender,
+            offer.asset,
+            amount,
+            offer.minInterestRate,
+            duration,
+            collateralAsset,
+            collateralAmount
+        );
+
+        // Update offer
+        offer.filledAmount += amount;
+        if (offer.filledAmount >= offer.amount) {
+            offer.isActive = false;
+        }
+
+        // Transfer funds
+        _transferLoanFunds(address(this), msg.sender, offer.asset, amount);
+
+        emit LendingOfferAccepted(offerId, loanId, msg.sender, amount);
+
+        return loanId;
+    }
+
+    // ============ User Functions - Loan Management ============
+
+    /**
+     * @notice Repay a loan (partial or full)
+     * @param loanId The loan ID
+     * @param amount The amount to repay
+     */
+    function repayLoan(uint256 loanId, uint256 amount) external nonReentrant validLoan(loanId) flashLoanProtected {
+        Loan storage loan = loans[loanId];
+        require(loan.status == LoanStatus.Active || loan.status == LoanStatus.PartiallyRepaid, "Loan not active");
+        require(msg.sender == loan.borrower, "Only borrower can repay");
+
+        uint256 totalOwed = calculateTotalOwed(loanId);
+        uint256 remainingDebt = totalOwed - loan.repaidAmount;
+        require(amount > 0 && amount <= remainingDebt, "Invalid repayment amount");
+
+        loan.repaidAmount += amount;
+        loan.lastUpdateTime = block.timestamp;
+
+        IERC20(loan.asset).safeTransferFrom(msg.sender, loan.lender, amount);
+
+        emit LoanRepayment(loanId, msg.sender, amount, remainingDebt - amount, block.timestamp);
+
+        // Check if fully repaid
+        if (loan.repaidAmount >= totalOwed) {
+            loan.status = LoanStatus.Repaid;
+            totalActiveLoans--;
+
+            // Release collateral
+            if (loan.hasCollateral) {
+                collateralManager.releaseCollateral(
+                    loan.borrower,
+                    loan.collateralAsset,
+                    loan.collateralAmount
+                );
+            }
+
+            // Update credit score
+            creditScoreContract.recordRepayment(loan.borrower, loanId, true);
+
+            emit LoanFullyRepaid(loanId, msg.sender, loan.repaidAmount, block.timestamp);
+        } else {
+            loan.status = LoanStatus.PartiallyRepaid;
+        }
+    }
+
+    /**
+     * @notice Liquidate a defaulted loan
+     * @param loanId The loan ID
+     */
+    function liquidateLoan(uint256 loanId) external nonReentrant validLoan(loanId) {
+        Loan storage loan = loans[loanId];
+        require(
+            loan.status == LoanStatus.Active || loan.status == LoanStatus.PartiallyRepaid,
+            "Loan not active"
+        );
+        require(block.timestamp > loan.startTime + loan.duration, "Loan not overdue");
+        require(
+            msg.sender == loan.lender || msg.sender == owner(),
+            "Only lender or owner can liquidate"
+        );
+
+        uint256 totalOwed = calculateTotalOwed(loanId);
+        uint256 remainingDebt = totalOwed - loan.repaidAmount;
+
+        loan.status = LoanStatus.Defaulted;
+        loan.lastUpdateTime = block.timestamp;
+        totalActiveLoans--;
+
+        uint256 debtCovered = 0;
+
+        // Handle collateral if present
+        if (loan.hasCollateral) {
+            uint256 collateralValue = collateralManager.getCollateralValue(
+                loan.collateralAsset,
+                loan.collateralAmount
+            );
+
+            collateralManager.liquidateCollateral(
+                loan.borrower,
+                loan.lender,
+                loan.collateralAsset,
+                loan.collateralAmount
+            );
+
+            debtCovered = collateralValue < remainingDebt ? collateralValue : remainingDebt;
+
+            emit LoanLiquidated(loanId, loan.borrower, loan.collateralAmount, debtCovered, block.timestamp);
+
+            loan.status = LoanStatus.Liquidated;
+        }
+
+        // Initiate debt collection for remaining balance
+        if (remainingDebt > debtCovered) {
+            debtCollection.initiateCollection(loanId, loan.borrower, remainingDebt - debtCovered);
+        }
+
+        // Update credit score
+        creditScoreContract.recordRepayment(loan.borrower, loanId, false);
+
+        emit LoanDefaulted(loanId, loan.borrower, loan.lender, remainingDebt, block.timestamp);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Calculate total amount owed for a loan including interest
+     * @param loanId The loan ID
+     * @return Total amount owed
+     */
+    function calculateTotalOwed(uint256 loanId) public view validLoan(loanId) returns (uint256) {
+        Loan memory loan = loans[loanId];
+        uint256 interest = (loan.principal * loan.interestRate * loan.duration) / (365 days * BASIS_POINTS);
+        return loan.principal + interest;
+    }
+
+    /**
+     * @notice Get detailed loan information
+     * @param loanId The loan ID
+     * @return Loan struct
+     */
+    function getLoan(uint256 loanId) external view validLoan(loanId) returns (Loan memory) {
+        return loans[loanId];
+    }
+
+    /**
+     * @notice Get user's loan IDs
+     * @param user The user address
+     * @return Array of loan IDs
+     */
+    function getUserLoans(address user) external view returns (uint256[] memory) {
+        return userLoans[user];
+    }
+
+    /**
+     * @notice Get user's lending offer IDs
+     * @param user The user address
+     * @return Array of offer IDs
+     */
+    function getUserOffers(address user) external view returns (uint256[] memory) {
+        return userOffers[user];
+    }
+
+    /**
+     * @notice Get user's borrow request IDs
+     * @param user The user address
+     * @return Array of request IDs
+     */
+    function getUserRequests(address user) external view returns (uint256[] memory) {
+        return userRequests[user];
+    }
+
+    /**
+     * @notice Get lending offer details
+     * @param offerId The offer ID
+     * @return LendingOffer struct
+     */
+    function getLendingOffer(uint256 offerId) external view returns (LendingOffer memory) {
+        return lendingOffers[offerId];
+    }
+
+    /**
+     * @notice Get borrow request details
+     * @param requestId The request ID
+     * @return BorrowRequest struct
+     */
+    function getBorrowRequest(uint256 requestId) external view returns (BorrowRequest memory) {
+        return borrowRequests[requestId];
+    }
+
+    /**
+     * @notice Get platform statistics
+     * @return totalLoans Total number of loans created
+     * @return activeLoans Number of currently active loans
+     * @return totalVolume Total volume processed
+     */
+    function getPlatformStats() external view returns (
+        uint256 totalLoans,
+        uint256 activeLoans,
+        uint256 totalVolume
+    ) {
+        return (totalLoansCreated, totalActiveLoans, totalVolumeProcessed);
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update platform fee
+     * @param newFee New fee in basis points (max 5%)
+     */
+    function updatePlatformFee(uint256 newFee) external onlyOwner {
+        require(newFee <= MAX_PLATFORM_FEE, "Fee too high");
+        uint256 oldFee = platformFee;
+        platformFee = newFee;
+        emit PlatformFeeUpdated(oldFee, newFee);
+    }
+
+    /**
+     * @notice Update asset support status
+     * @param asset Asset address
+     * @param supported Whether asset is supported
+     */
+    function setAssetSupport(address asset, bool supported) external onlyOwner {
+        require(asset != address(0), "Invalid asset address");
+        supportedAssets[asset] = supported;
+        emit AssetSupportUpdated(asset, supported);
+    }
+
+    /**
+     * @notice Pause the contract
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @notice Emergency withdrawal function (only for stuck funds)
+     * @param asset Asset address
+     * @param amount Amount to withdraw
+     * @param recipient Recipient address
+     */
+    function emergencyWithdraw(
+        address asset,
+        uint256 amount,
+        address recipient
+    ) external onlyOwner {
+        require(recipient != address(0), "Invalid recipient");
+        IERC20(asset).safeTransfer(recipient, amount);
+        emit EmergencyWithdrawal(asset, amount, recipient);
+    }
+
+    // ============ Internal Functions ============
+
+    function _createLoan(
+        address borrower,
+        address lender,
+        address asset,
+        uint256 principal,
+        uint256 interestRate,
+        uint256 duration,
+        address collateralAsset,
+        uint256 collateralAmount
+    ) internal returns (uint256) {
+        uint256 loanId = nextLoanId++;
+        bool hasCollateral = collateralAsset != address(0) && collateralAmount > 0;
+
+        loans[loanId] = Loan({
+            id: loanId,
+            borrower: borrower,
+            lender: lender,
+            asset: asset,
+            principal: principal,
+            interestRate: interestRate,
+            collateralAmount: collateralAmount,
+            collateralAsset: collateralAsset,
+            startTime: block.timestamp,
+            duration: duration,
+            repaidAmount: 0,
+            status: LoanStatus.Active,
+            hasCollateral: hasCollateral,
+            lastUpdateTime: block.timestamp
+        });
+
+        userLoans[borrower].push(loanId);
+        userLoans[lender].push(loanId);
+
+        totalLoansCreated++;
+        totalActiveLoans++;
+        totalVolumeProcessed += principal;
+
+        emit LoanCreated(
+            loanId,
+            borrower,
+            lender,
+            asset,
+            principal,
+            interestRate,
+            duration,
+            hasCollateral
+        );
+
+        return loanId;
+    }
+
+    function _transferLoanFunds(
+        address from,
+        address to,
+        address asset,
+        uint256 amount
+    ) internal {
+        uint256 feeAmount = (amount * platformFee) / BASIS_POINTS;
+        uint256 borrowerAmount = amount - feeAmount;
+
+        if (from == address(this)) {
+            IERC20(asset).safeTransfer(to, borrowerAmount);
+            if (feeAmount > 0) {
+                IERC20(asset).safeTransfer(owner(), feeAmount);
+            }
+        } else {
+            IERC20(asset).safeTransferFrom(from, to, borrowerAmount);
+            if (feeAmount > 0) {
+                IERC20(asset).safeTransferFrom(from, owner(), feeAmount);
+            }
+        }
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        emit ContractUpgraded(newImplementation, block.timestamp);
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     */
+    uint256[50] private __gap;
+}

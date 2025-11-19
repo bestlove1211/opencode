@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "../libraries/DataTypes.sol";
+
+/**
+ * @title IComplianceManager
+ * @dev Interface for compliance and KYC/AML management
+ */
+interface IComplianceManager {
+    /**
+     * @dev Check if a user is compliant for a specific action
+     * @param user Address of the user
+     * @param requiredLevel Minimum KYC level required
+     * @return bool True if user is compliant
+     */
+    function isCompliant(
+        address user,
+        DataTypes.KYCLevel requiredLevel
+    ) external view returns (bool);
+
+    /**
+     * @dev Get user's current KYC level
+     * @param user Address of the user
+     * @return DataTypes.KYCLevel Current KYC level
+     */
+    function getUserKYCLevel(address user) external view returns (DataTypes.KYCLevel);
+
+    /**
+     * @dev Get user's compliance status
+     * @param user Address of the user
+     * @return DataTypes.ComplianceStatus Current status
+     */
+    function getComplianceStatus(
+        address user
+    ) external view returns (DataTypes.ComplianceStatus);
+
+    /**
+     * @dev Check if user is whitelisted
+     * @param user Address of the user
+     * @return bool True if whitelisted
+     */
+    function isWhitelisted(address user) external view returns (bool);
+
+    /**
+     * @dev Check if user is blacklisted
+     * @param user Address of the user
+     * @return bool True if blacklisted
+     */
+    function isBlacklisted(address user) external view returns (bool);
+}

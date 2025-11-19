@@ -1,0 +1,539 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/**
+ * @title BancafiVesting
+ * @notice Token vesting contract with industry-standard schedules
+ * @dev Supports predefined categories: Team, Advisors, Seed, Private Sale, Public Sale, Strategic, Ecosystem
+ */
+contract BancafiVesting is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant VESTING_MANAGER_ROLE = keccak256("VESTING_MANAGER_ROLE");
+
+    enum VestingCategory {
+        Team,           // 4 years, 1 year cliff, monthly release
+        Advisors,       // 3 years, 6 months cliff, monthly release
+        SeedInvestors,  // 2 years, 12 months cliff, monthly release
+        PrivateSale,    // 18 months, 6 months cliff, monthly release
+        PublicSale,     // 12 months, 3 months cliff, monthly release
+        Strategic,      // 3 years, 9 months cliff, quarterly release
+        Ecosystem,      // 5 years, no cliff, monthly release
+        Custom          // Custom parameters
+    }
+
+    enum ReleaseType {
+        Monthly,
+        Quarterly,
+        Linear
+    }
+
+    struct VestingSchedule {
+        uint256 scheduleId;
+        address beneficiary;
+        VestingCategory category;
+        uint256 totalAmount;
+        uint256 startTime;
+        uint256 cliffDuration;
+        uint256 vestingDuration;
+        ReleaseType releaseType;
+        uint256 amountClaimed;
+        bool revocable;
+        bool revoked;
+        uint256 createdAt;
+    }
+
+    struct CategoryConfig {
+        uint256 cliffMonths;
+        uint256 vestingMonths;
+        ReleaseType releaseType;
+        bool revocable;
+    }
+
+    IERC20 public vestingToken;
+
+    uint256 private _scheduleIds;
+    mapping(uint256 => VestingSchedule) public vestingSchedules;
+    mapping(address => uint256[]) public beneficiarySchedules;
+    mapping(VestingCategory => CategoryConfig) public categoryConfigs;
+
+    uint256 public totalVestingAmount;
+    uint256 public totalClaimedAmount;
+
+    // Allocation tracking per category
+    mapping(VestingCategory => uint256) public categoryAllocated;
+    mapping(VestingCategory => uint256) public categoryClaimed;
+
+    // Events
+    event VestingScheduleCreated(
+        uint256 indexed scheduleId,
+        address indexed beneficiary,
+        VestingCategory category,
+        uint256 totalAmount,
+        uint256 cliffMonths,
+        uint256 vestingMonths,
+        uint256 timestamp
+    );
+
+    event TokensClaimed(
+        uint256 indexed scheduleId,
+        address indexed beneficiary,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event VestingRevoked(
+        uint256 indexed scheduleId,
+        address indexed beneficiary,
+        uint256 unvestedAmount,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address vestingToken_) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(VESTING_MANAGER_ROLE, msg.sender);
+
+        vestingToken = IERC20(vestingToken_);
+
+        // Set industry-standard vesting configurations
+        _setDefaultConfigs();
+    }
+
+    /**
+     * @notice Set default vesting configurations
+     */
+    function _setDefaultConfigs() internal {
+        // Team: 4 years total, 1 year cliff, monthly vesting
+        categoryConfigs[VestingCategory.Team] = CategoryConfig({
+            cliffMonths: 12,
+            vestingMonths: 48,
+            releaseType: ReleaseType.Monthly,
+            revocable: true
+        });
+
+        // Advisors: 3 years total, 6 months cliff, monthly vesting
+        categoryConfigs[VestingCategory.Advisors] = CategoryConfig({
+            cliffMonths: 6,
+            vestingMonths: 36,
+            releaseType: ReleaseType.Monthly,
+            revocable: true
+        });
+
+        // Seed Investors: 2 years total, 12 months cliff, monthly vesting
+        categoryConfigs[VestingCategory.SeedInvestors] = CategoryConfig({
+            cliffMonths: 12,
+            vestingMonths: 24,
+            releaseType: ReleaseType.Monthly,
+            revocable: false
+        });
+
+        // Private Sale: 18 months total, 6 months cliff, monthly vesting
+        categoryConfigs[VestingCategory.PrivateSale] = CategoryConfig({
+            cliffMonths: 6,
+            vestingMonths: 18,
+            releaseType: ReleaseType.Monthly,
+            revocable: false
+        });
+
+        // Public Sale: 12 months total, 3 months cliff, monthly vesting
+        categoryConfigs[VestingCategory.PublicSale] = CategoryConfig({
+            cliffMonths: 3,
+            vestingMonths: 12,
+            releaseType: ReleaseType.Monthly,
+            revocable: false
+        });
+
+        // Strategic Partners: 3 years total, 9 months cliff, quarterly vesting
+        categoryConfigs[VestingCategory.Strategic] = CategoryConfig({
+            cliffMonths: 9,
+            vestingMonths: 36,
+            releaseType: ReleaseType.Quarterly,
+            revocable: true
+        });
+
+        // Ecosystem/Treasury: 5 years total, no cliff, monthly vesting
+        categoryConfigs[VestingCategory.Ecosystem] = CategoryConfig({
+            cliffMonths: 0,
+            vestingMonths: 60,
+            releaseType: ReleaseType.Monthly,
+            revocable: true
+        });
+    }
+
+    /**
+     * @notice Create vesting schedule with predefined category
+     */
+    function createVestingSchedule(
+        address beneficiary_,
+        VestingCategory category_,
+        uint256 totalAmount_,
+        uint256 startTime_
+    ) external onlyRole(VESTING_MANAGER_ROLE) whenNotPaused nonReentrant returns (uint256) {
+        require(beneficiary_ != address(0), "Invalid beneficiary");
+        require(totalAmount_ > 0, "Invalid amount");
+        require(startTime_ >= block.timestamp, "Start time in past");
+        require(category_ != VestingCategory.Custom, "Use createCustomSchedule");
+
+        CategoryConfig memory config = categoryConfigs[category_];
+
+        // Transfer tokens to contract
+        require(
+            vestingToken.transferFrom(msg.sender, address(this), totalAmount_),
+            "Transfer failed"
+        );
+
+        _scheduleIds++;
+        uint256 newScheduleId = _scheduleIds;
+
+        vestingSchedules[newScheduleId] = VestingSchedule({
+            scheduleId: newScheduleId,
+            beneficiary: beneficiary_,
+            category: category_,
+            totalAmount: totalAmount_,
+            startTime: startTime_,
+            cliffDuration: config.cliffMonths * 30 days,
+            vestingDuration: config.vestingMonths * 30 days,
+            releaseType: config.releaseType,
+            amountClaimed: 0,
+            revocable: config.revocable,
+            revoked: false,
+            createdAt: block.timestamp
+        });
+
+        beneficiarySchedules[beneficiary_].push(newScheduleId);
+        totalVestingAmount += totalAmount_;
+        categoryAllocated[category_] += totalAmount_;
+
+        emit VestingScheduleCreated(
+            newScheduleId,
+            beneficiary_,
+            category_,
+            totalAmount_,
+            config.cliffMonths,
+            config.vestingMonths,
+            block.timestamp
+        );
+
+        return newScheduleId;
+    }
+
+    /**
+     * @notice Create custom vesting schedule
+     */
+    function createCustomSchedule(
+        address beneficiary_,
+        uint256 totalAmount_,
+        uint256 startTime_,
+        uint256 cliffMonths_,
+        uint256 vestingMonths_,
+        ReleaseType releaseType_,
+        bool revocable_
+    ) external onlyRole(VESTING_MANAGER_ROLE) whenNotPaused nonReentrant returns (uint256) {
+        require(beneficiary_ != address(0), "Invalid beneficiary");
+        require(totalAmount_ > 0, "Invalid amount");
+        require(startTime_ >= block.timestamp, "Start time in past");
+        require(vestingMonths_ > 0, "Invalid vesting duration");
+
+        // Transfer tokens to contract
+        require(
+            vestingToken.transferFrom(msg.sender, address(this), totalAmount_),
+            "Transfer failed"
+        );
+
+        _scheduleIds++;
+        uint256 newScheduleId = _scheduleIds;
+
+        vestingSchedules[newScheduleId] = VestingSchedule({
+            scheduleId: newScheduleId,
+            beneficiary: beneficiary_,
+            category: VestingCategory.Custom,
+            totalAmount: totalAmount_,
+            startTime: startTime_,
+            cliffDuration: cliffMonths_ * 30 days,
+            vestingDuration: vestingMonths_ * 30 days,
+            releaseType: releaseType_,
+            amountClaimed: 0,
+            revocable: revocable_,
+            revoked: false,
+            createdAt: block.timestamp
+        });
+
+        beneficiarySchedules[beneficiary_].push(newScheduleId);
+        totalVestingAmount += totalAmount_;
+        categoryAllocated[VestingCategory.Custom] += totalAmount_;
+
+        emit VestingScheduleCreated(
+            newScheduleId,
+            beneficiary_,
+            VestingCategory.Custom,
+            totalAmount_,
+            cliffMonths_,
+            vestingMonths_,
+            block.timestamp
+        );
+
+        return newScheduleId;
+    }
+
+    /**
+     * @notice Batch create vesting schedules (e.g., for multiple team members)
+     */
+    function batchCreateVesting(
+        address[] memory beneficiaries_,
+        VestingCategory category_,
+        uint256[] memory amounts_,
+        uint256 startTime_
+    ) external onlyRole(VESTING_MANAGER_ROLE) whenNotPaused {
+        require(beneficiaries_.length == amounts_.length, "Length mismatch");
+        require(beneficiaries_.length > 0, "Empty arrays");
+
+        for (uint256 i = 0; i < beneficiaries_.length; i++) {
+            this.createVestingSchedule(
+                beneficiaries_[i],
+                category_,
+                amounts_[i],
+                startTime_
+            );
+        }
+    }
+
+    /**
+     * @notice Claim vested tokens
+     */
+    function claimVestedTokens(uint256 scheduleId_) external nonReentrant {
+        VestingSchedule storage schedule = vestingSchedules[scheduleId_];
+
+        require(schedule.beneficiary == msg.sender, "Not beneficiary");
+        require(!schedule.revoked, "Schedule revoked");
+
+        uint256 claimable = _calculateClaimableAmount(schedule);
+        require(claimable > 0, "No tokens to claim");
+
+        schedule.amountClaimed += claimable;
+        totalClaimedAmount += claimable;
+        categoryClaimed[schedule.category] += claimable;
+
+        require(vestingToken.transfer(msg.sender, claimable), "Transfer failed");
+
+        emit TokensClaimed(scheduleId_, msg.sender, claimable, block.timestamp);
+    }
+
+    /**
+     * @notice Batch claim all vested tokens for beneficiary
+     */
+    function claimAllVestedTokens() external nonReentrant {
+        uint256[] memory scheduleIds = beneficiarySchedules[msg.sender];
+        require(scheduleIds.length > 0, "No schedules");
+
+        uint256 totalClaimable = 0;
+
+        for (uint256 i = 0; i < scheduleIds.length; i++) {
+            VestingSchedule storage schedule = vestingSchedules[scheduleIds[i]];
+
+            if (!schedule.revoked) {
+                uint256 claimable = _calculateClaimableAmount(schedule);
+
+                if (claimable > 0) {
+                    schedule.amountClaimed += claimable;
+                    totalClaimable += claimable;
+                    categoryClaimed[schedule.category] += claimable;
+
+                    emit TokensClaimed(scheduleIds[i], msg.sender, claimable, block.timestamp);
+                }
+            }
+        }
+
+        require(totalClaimable > 0, "No tokens to claim");
+
+        totalClaimedAmount += totalClaimable;
+        require(vestingToken.transfer(msg.sender, totalClaimable), "Transfer failed");
+    }
+
+    /**
+     * @notice Revoke vesting schedule (only if revocable)
+     */
+    function revokeVesting(uint256 scheduleId_) external onlyRole(VESTING_MANAGER_ROLE) nonReentrant {
+        VestingSchedule storage schedule = vestingSchedules[scheduleId_];
+
+        require(schedule.revocable, "Not revocable");
+        require(!schedule.revoked, "Already revoked");
+
+        uint256 vested = _calculateVestedAmount(schedule);
+        uint256 claimable = vested - schedule.amountClaimed;
+
+        // Claim any vested tokens for beneficiary
+        if (claimable > 0) {
+            schedule.amountClaimed += claimable;
+            totalClaimedAmount += claimable;
+            categoryClaimed[schedule.category] += claimable;
+            require(vestingToken.transfer(schedule.beneficiary, claimable), "Transfer failed");
+        }
+
+        uint256 unvested = schedule.totalAmount - vested;
+
+        schedule.revoked = true;
+        totalVestingAmount -= unvested;
+        categoryAllocated[schedule.category] -= unvested;
+
+        // Return unvested tokens to admin
+        if (unvested > 0) {
+            require(vestingToken.transfer(msg.sender, unvested), "Transfer failed");
+        }
+
+        emit VestingRevoked(scheduleId_, schedule.beneficiary, unvested, block.timestamp);
+    }
+
+    /**
+     * @notice Calculate claimable amount
+     */
+    function _calculateClaimableAmount(VestingSchedule memory schedule_) internal view returns (uint256) {
+        uint256 vested = _calculateVestedAmount(schedule_);
+        return vested - schedule_.amountClaimed;
+    }
+
+    /**
+     * @notice Calculate vested amount based on release type
+     */
+    function _calculateVestedAmount(VestingSchedule memory schedule_) internal view returns (uint256) {
+        // Before cliff
+        if (block.timestamp < schedule_.startTime + schedule_.cliffDuration) {
+            return 0;
+        }
+
+        // After full vesting
+        if (block.timestamp >= schedule_.startTime + schedule_.vestingDuration) {
+            return schedule_.totalAmount;
+        }
+
+        uint256 timeFromStart = block.timestamp - schedule_.startTime;
+
+        if (schedule_.releaseType == ReleaseType.Linear) {
+            // Continuous linear vesting
+            return (schedule_.totalAmount * timeFromStart) / schedule_.vestingDuration;
+        } else if (schedule_.releaseType == ReleaseType.Monthly) {
+            // Monthly stepped vesting
+            uint256 monthsPassed = timeFromStart / 30 days;
+            uint256 totalMonths = schedule_.vestingDuration / 30 days;
+            return (schedule_.totalAmount * monthsPassed) / totalMonths;
+        } else {
+            // Quarterly stepped vesting
+            uint256 quartersPassed = timeFromStart / 90 days;
+            uint256 totalQuarters = schedule_.vestingDuration / 90 days;
+            return (schedule_.totalAmount * quartersPassed) / totalQuarters;
+        }
+    }
+
+    /**
+     * @notice Get claimable amount for schedule
+     */
+    function getClaimableAmount(uint256 scheduleId_) external view returns (uint256) {
+        VestingSchedule memory schedule = vestingSchedules[scheduleId_];
+        if (schedule.revoked) return 0;
+        return _calculateClaimableAmount(schedule);
+    }
+
+    /**
+     * @notice Get total claimable for beneficiary
+     */
+    function getTotalClaimable(address beneficiary_) external view returns (uint256) {
+        uint256[] memory scheduleIds = beneficiarySchedules[beneficiary_];
+        uint256 total = 0;
+
+        for (uint256 i = 0; i < scheduleIds.length; i++) {
+            VestingSchedule memory schedule = vestingSchedules[scheduleIds[i]];
+            if (!schedule.revoked) {
+                total += _calculateClaimableAmount(schedule);
+            }
+        }
+
+        return total;
+    }
+
+    /**
+     * @notice Get category statistics
+     */
+    function getCategoryStats(VestingCategory category_) external view returns (
+        uint256 allocated,
+        uint256 claimed,
+        uint256 remaining
+    ) {
+        return (
+            categoryAllocated[category_],
+            categoryClaimed[category_],
+            categoryAllocated[category_] - categoryClaimed[category_]
+        );
+    }
+
+    /**
+     * @notice Get vesting schedule details
+     */
+    function getVestingSchedule(uint256 scheduleId_) external view returns (VestingSchedule memory) {
+        return vestingSchedules[scheduleId_];
+    }
+
+    /**
+     * @notice Get beneficiary schedules
+     */
+    function getBeneficiarySchedules(address beneficiary_) external view returns (uint256[] memory) {
+        return beneficiarySchedules[beneficiary_];
+    }
+
+    /**
+     * @notice Get overall vesting statistics
+     */
+    function getVestingStats() external view returns (
+        uint256 totalVesting,
+        uint256 totalClaimed,
+        uint256 totalRemaining
+    ) {
+        return (
+            totalVestingAmount,
+            totalClaimedAmount,
+            totalVestingAmount - totalClaimedAmount
+        );
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

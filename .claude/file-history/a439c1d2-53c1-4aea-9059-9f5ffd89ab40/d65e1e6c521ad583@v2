@@ -1,0 +1,713 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+/**
+ * @title InstitutionalOnboarding
+ * @notice Handles KYC/KYB, compliance, and onboarding for institutional participants
+ * @dev Manages institutional verification, accreditation, and access control
+ * @custom:security-contact security@bancafi.com
+ */
+contract InstitutionalOnboarding is
+    Initializable,
+    OwnableUpgradeable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    // ============ Roles ============
+
+    bytes32 public constant COMPLIANCE_OFFICER_ROLE = keccak256("COMPLIANCE_OFFICER_ROLE");
+    bytes32 public constant KYC_VERIFIER_ROLE = keccak256("KYC_VERIFIER_ROLE");
+    bytes32 public constant INSTITUTIONAL_ROLE = keccak256("INSTITUTIONAL_ROLE");
+
+    // ============ Enums ============
+
+    enum ApplicationStatus {
+        Pending,           // Application submitted, awaiting review
+        UnderReview,       // Being reviewed by compliance
+        AdditionalInfoRequired, // More information needed
+        Approved,          // Approved and active
+        Rejected,          // Application rejected
+        Suspended,         // Temporarily suspended
+        Revoked           // Permanently revoked
+    }
+
+    enum InstitutionType {
+        Bank,
+        HedgeFund,
+        PensionFund,
+        InsuranceCompany,
+        AssetManager,
+        FamilyOffice,
+        Corporation,
+        DAO,
+        Other
+    }
+
+    enum ComplianceLevel {
+        Basic,      // Basic KYB verification
+        Enhanced,   // Enhanced due diligence
+        Premium     // Highest level of verification
+    }
+
+    // ============ Structs ============
+
+    struct InstitutionalApplication {
+        uint256 id;
+        address institutionAddress;
+        string institutionName;
+        string registrationNumber;
+        string jurisdiction;
+        InstitutionType institutionType;
+        ComplianceLevel requestedLevel;
+        string documentHash; // IPFS hash of supporting documents
+        uint256 submittedAt;
+        uint256 reviewedAt;
+        ApplicationStatus status;
+        string rejectionReason;
+        address reviewedBy;
+    }
+
+    struct InstitutionalProfile {
+        uint256 applicationId;
+        address institutionAddress;
+        string institutionName;
+        InstitutionType institutionType;
+        ComplianceLevel complianceLevel;
+        bool isAccredited;
+        bool isActive;
+        uint256 approvedAt;
+        uint256 creditLimit;
+        uint256 utilizationLimit;
+        string[] licenses;
+        address[] authorizedSigners;
+        uint256 lastAuditDate;
+        uint256 nextAuditDue;
+    }
+
+    struct ComplianceCheck {
+        uint256 institutionId;
+        string checkType;
+        bool passed;
+        uint256 timestamp;
+        address performedBy;
+        string notes;
+    }
+
+    struct AuditRecord {
+        uint256 institutionId;
+        uint256 timestamp;
+        address auditor;
+        bool passed;
+        string findings;
+        uint256 nextAuditDue;
+    }
+
+    // ============ State Variables ============
+
+    uint256 public nextApplicationId;
+    uint256 public nextInstitutionId;
+
+    mapping(uint256 => InstitutionalApplication) public applications;
+    mapping(uint256 => InstitutionalProfile) public institutions;
+    mapping(address => uint256) public addressToInstitutionId;
+    mapping(address => uint256[]) public addressApplications;
+
+    mapping(uint256 => ComplianceCheck[]) public complianceHistory;
+    mapping(uint256 => AuditRecord[]) public auditHistory;
+    mapping(address => bool) public blacklistedAddresses;
+    mapping(string => bool) public blacklistedJurisdictions;
+
+    // Statistics
+    uint256 public totalApplications;
+    uint256 public totalApproved;
+    uint256 public totalRejected;
+    uint256 public totalActiveInstitutions;
+
+    // Compliance parameters
+    uint256 public auditFrequency; // in seconds
+    uint256 public minCreditLimit;
+    uint256 public maxCreditLimit;
+
+    // ============ Events ============
+
+    event ApplicationSubmitted(
+        uint256 indexed applicationId,
+        address indexed institutionAddress,
+        string institutionName,
+        InstitutionType institutionType
+    );
+
+    event ApplicationStatusUpdated(
+        uint256 indexed applicationId,
+        ApplicationStatus oldStatus,
+        ApplicationStatus newStatus,
+        address indexed reviewer
+    );
+
+    event InstitutionApproved(
+        uint256 indexed institutionId,
+        address indexed institutionAddress,
+        string institutionName,
+        ComplianceLevel complianceLevel
+    );
+
+    event InstitutionSuspended(
+        uint256 indexed institutionId,
+        address indexed institutionAddress,
+        string reason
+    );
+
+    event InstitutionRevoked(
+        uint256 indexed institutionId,
+        address indexed institutionAddress,
+        string reason
+    );
+
+    event ComplianceCheckPerformed(
+        uint256 indexed institutionId,
+        string checkType,
+        bool passed,
+        address indexed performer
+    );
+
+    event AuditCompleted(
+        uint256 indexed institutionId,
+        address indexed auditor,
+        bool passed,
+        uint256 nextAuditDue
+    );
+
+    event CreditLimitUpdated(
+        uint256 indexed institutionId,
+        uint256 oldLimit,
+        uint256 newLimit
+    );
+
+    event AuthorizedSignerAdded(
+        uint256 indexed institutionId,
+        address indexed signer
+    );
+
+    event AuthorizedSignerRemoved(
+        uint256 indexed institutionId,
+        address indexed signer
+    );
+
+    event AddressBlacklisted(address indexed account, string reason);
+    event AddressRemovedFromBlacklist(address indexed account);
+    event JurisdictionBlacklisted(string jurisdiction, string reason);
+
+    // ============ Modifiers ============
+
+    modifier notBlacklisted(address account) {
+        require(!blacklistedAddresses[account], "Address is blacklisted");
+        _;
+    }
+
+    modifier onlyActiveInstitution() {
+        uint256 institutionId = addressToInstitutionId[msg.sender];
+        require(institutionId > 0, "Not an institution");
+        require(institutions[institutionId].isActive, "Institution not active");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        uint256 _auditFrequency,
+        uint256 _minCreditLimit,
+        uint256 _maxCreditLimit
+    ) public initializer {
+        __Ownable_init(msg.sender);
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(COMPLIANCE_OFFICER_ROLE, msg.sender);
+        _grantRole(KYC_VERIFIER_ROLE, msg.sender);
+
+        nextApplicationId = 1;
+        nextInstitutionId = 1;
+        auditFrequency = _auditFrequency;
+        minCreditLimit = _minCreditLimit;
+        maxCreditLimit = _maxCreditLimit;
+    }
+
+    // ============ Application Functions ============
+
+    /**
+     * @notice Submit institutional onboarding application
+     * @param institutionName Name of institution
+     * @param registrationNumber Business registration number
+     * @param jurisdiction Legal jurisdiction
+     * @param institutionType Type of institution
+     * @param requestedLevel Requested compliance level
+     * @param documentHash IPFS hash of KYB documents
+     * @return applicationId The created application ID
+     */
+    function submitApplication(
+        string calldata institutionName,
+        string calldata registrationNumber,
+        string calldata jurisdiction,
+        InstitutionType institutionType,
+        ComplianceLevel requestedLevel,
+        string calldata documentHash
+    ) external nonReentrant whenNotPaused notBlacklisted(msg.sender) returns (uint256) {
+        require(bytes(institutionName).length > 0, "Institution name required");
+        require(bytes(registrationNumber).length > 0, "Registration number required");
+        require(!blacklistedJurisdictions[jurisdiction], "Jurisdiction not supported");
+        require(addressToInstitutionId[msg.sender] == 0, "Institution already registered");
+
+        uint256 applicationId = nextApplicationId++;
+
+        applications[applicationId] = InstitutionalApplication({
+            id: applicationId,
+            institutionAddress: msg.sender,
+            institutionName: institutionName,
+            registrationNumber: registrationNumber,
+            jurisdiction: jurisdiction,
+            institutionType: institutionType,
+            requestedLevel: requestedLevel,
+            documentHash: documentHash,
+            submittedAt: block.timestamp,
+            reviewedAt: 0,
+            status: ApplicationStatus.Pending,
+            rejectionReason: "",
+            reviewedBy: address(0)
+        });
+
+        addressApplications[msg.sender].push(applicationId);
+        totalApplications++;
+
+        emit ApplicationSubmitted(applicationId, msg.sender, institutionName, institutionType);
+
+        return applicationId;
+    }
+
+    /**
+     * @notice Update application status
+     * @param applicationId Application ID
+     * @param newStatus New status
+     * @param notes Optional notes/reason
+     */
+    function updateApplicationStatus(
+        uint256 applicationId,
+        ApplicationStatus newStatus,
+        string calldata notes
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalApplication storage app = applications[applicationId];
+        require(app.id > 0, "Application not found");
+
+        ApplicationStatus oldStatus = app.status;
+        app.status = newStatus;
+        app.reviewedBy = msg.sender;
+        app.reviewedAt = block.timestamp;
+
+        if (newStatus == ApplicationStatus.Rejected) {
+            app.rejectionReason = notes;
+            totalRejected++;
+        }
+
+        emit ApplicationStatusUpdated(applicationId, oldStatus, newStatus, msg.sender);
+    }
+
+    /**
+     * @notice Approve institutional application
+     * @param applicationId Application ID
+     * @param creditLimit Approved credit limit
+     * @param licenses Array of license identifiers
+     */
+    function approveApplication(
+        uint256 applicationId,
+        uint256 creditLimit,
+        string[] calldata licenses
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalApplication storage app = applications[applicationId];
+        require(app.id > 0, "Application not found");
+        require(app.status == ApplicationStatus.UnderReview, "Application not under review");
+        require(creditLimit >= minCreditLimit && creditLimit <= maxCreditLimit, "Invalid credit limit");
+
+        uint256 institutionId = nextInstitutionId++;
+
+        institutions[institutionId] = InstitutionalProfile({
+            applicationId: applicationId,
+            institutionAddress: app.institutionAddress,
+            institutionName: app.institutionName,
+            institutionType: app.institutionType,
+            complianceLevel: app.requestedLevel,
+            isAccredited: true,
+            isActive: true,
+            approvedAt: block.timestamp,
+            creditLimit: creditLimit,
+            utilizationLimit: creditLimit,
+            licenses: licenses,
+            authorizedSigners: new address[](0),
+            lastAuditDate: block.timestamp,
+            nextAuditDue: block.timestamp + auditFrequency
+        });
+
+        // Add institution address as authorized signer
+        institutions[institutionId].authorizedSigners.push(app.institutionAddress);
+
+        addressToInstitutionId[app.institutionAddress] = institutionId;
+        app.status = ApplicationStatus.Approved;
+        app.reviewedAt = block.timestamp;
+        app.reviewedBy = msg.sender;
+
+        totalApproved++;
+        totalActiveInstitutions++;
+
+        // Grant institutional role
+        _grantRole(INSTITUTIONAL_ROLE, app.institutionAddress);
+
+        emit InstitutionApproved(institutionId, app.institutionAddress, app.institutionName, app.requestedLevel);
+    }
+
+    // ============ Institution Management ============
+
+    /**
+     * @notice Suspend an institution
+     * @param institutionId Institution ID
+     * @param reason Suspension reason
+     */
+    function suspendInstitution(
+        uint256 institutionId,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(institution.isActive, "Institution not active");
+
+        institution.isActive = false;
+
+        emit InstitutionSuspended(institutionId, institution.institutionAddress, reason);
+    }
+
+    /**
+     * @notice Reactivate a suspended institution
+     * @param institutionId Institution ID
+     */
+    function reactivateInstitution(uint256 institutionId) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(!institution.isActive, "Institution already active");
+
+        institution.isActive = true;
+        totalActiveInstitutions++;
+    }
+
+    /**
+     * @notice Revoke institution permanently
+     * @param institutionId Institution ID
+     * @param reason Revocation reason
+     */
+    function revokeInstitution(
+        uint256 institutionId,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(institution.isAccredited, "Institution not accredited");
+
+        institution.isActive = false;
+        institution.isAccredited = false;
+
+        if (totalActiveInstitutions > 0) {
+            totalActiveInstitutions--;
+        }
+
+        // Revoke institutional role
+        _revokeRole(INSTITUTIONAL_ROLE, institution.institutionAddress);
+
+        emit InstitutionRevoked(institutionId, institution.institutionAddress, reason);
+    }
+
+    /**
+     * @notice Update institution credit limit
+     * @param institutionId Institution ID
+     * @param newLimit New credit limit
+     */
+    function updateCreditLimit(
+        uint256 institutionId,
+        uint256 newLimit
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(institution.isActive, "Institution not active");
+        require(newLimit >= minCreditLimit && newLimit <= maxCreditLimit, "Invalid credit limit");
+
+        uint256 oldLimit = institution.creditLimit;
+        institution.creditLimit = newLimit;
+        institution.utilizationLimit = newLimit;
+
+        emit CreditLimitUpdated(institutionId, oldLimit, newLimit);
+    }
+
+    /**
+     * @notice Add authorized signer to institution
+     * @param institutionId Institution ID
+     * @param signer Signer address to add
+     */
+    function addAuthorizedSigner(
+        uint256 institutionId,
+        address signer
+    ) external {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(msg.sender == institution.institutionAddress || hasRole(COMPLIANCE_OFFICER_ROLE, msg.sender), "Not authorized");
+        require(institution.isActive, "Institution not active");
+        require(signer != address(0), "Invalid signer address");
+        require(!blacklistedAddresses[signer], "Signer is blacklisted");
+
+        institution.authorizedSigners.push(signer);
+
+        emit AuthorizedSignerAdded(institutionId, signer);
+    }
+
+    /**
+     * @notice Remove authorized signer from institution
+     * @param institutionId Institution ID
+     * @param signer Signer address to remove
+     */
+    function removeAuthorizedSigner(
+        uint256 institutionId,
+        address signer
+    ) external {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(msg.sender == institution.institutionAddress || hasRole(COMPLIANCE_OFFICER_ROLE, msg.sender), "Not authorized");
+
+        address[] storage signers = institution.authorizedSigners;
+        for (uint256 i = 0; i < signers.length; i++) {
+            if (signers[i] == signer) {
+                signers[i] = signers[signers.length - 1];
+                signers.pop();
+                emit AuthorizedSignerRemoved(institutionId, signer);
+                return;
+            }
+        }
+    }
+
+    // ============ Compliance Functions ============
+
+    /**
+     * @notice Perform compliance check
+     * @param institutionId Institution ID
+     * @param checkType Type of compliance check
+     * @param passed Whether check passed
+     * @param notes Check notes
+     */
+    function performComplianceCheck(
+        uint256 institutionId,
+        string calldata checkType,
+        bool passed,
+        string calldata notes
+    ) external onlyRole(KYC_VERIFIER_ROLE) {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(institution.isAccredited, "Institution not accredited");
+
+        complianceHistory[institutionId].push(ComplianceCheck({
+            institutionId: institutionId,
+            checkType: checkType,
+            passed: passed,
+            timestamp: block.timestamp,
+            performedBy: msg.sender,
+            notes: notes
+        }));
+
+        emit ComplianceCheckPerformed(institutionId, checkType, passed, msg.sender);
+
+        // Suspend if failed critical checks
+        if (!passed && institution.isActive) {
+            institution.isActive = false;
+            emit InstitutionSuspended(institutionId, institution.institutionAddress, "Failed compliance check");
+        }
+    }
+
+    /**
+     * @notice Conduct institutional audit
+     * @param institutionId Institution ID
+     * @param passed Whether audit passed
+     * @param findings Audit findings
+     */
+    function conductAudit(
+        uint256 institutionId,
+        bool passed,
+        string calldata findings
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        InstitutionalProfile storage institution = institutions[institutionId];
+        require(institution.isAccredited, "Institution not accredited");
+
+        uint256 nextAuditDue = block.timestamp + auditFrequency;
+
+        auditHistory[institutionId].push(AuditRecord({
+            institutionId: institutionId,
+            timestamp: block.timestamp,
+            auditor: msg.sender,
+            passed: passed,
+            findings: findings,
+            nextAuditDue: nextAuditDue
+        }));
+
+        institution.lastAuditDate = block.timestamp;
+        institution.nextAuditDue = nextAuditDue;
+
+        emit AuditCompleted(institutionId, msg.sender, passed, nextAuditDue);
+
+        if (!passed && institution.isActive) {
+            institution.isActive = false;
+            emit InstitutionSuspended(institutionId, institution.institutionAddress, "Failed audit");
+        }
+    }
+
+    // ============ Blacklist Management ============
+
+    /**
+     * @notice Blacklist an address
+     * @param account Address to blacklist
+     * @param reason Blacklist reason
+     */
+    function blacklistAddress(
+        address account,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        require(account != address(0), "Invalid address");
+        blacklistedAddresses[account] = true;
+        emit AddressBlacklisted(account, reason);
+    }
+
+    /**
+     * @notice Remove address from blacklist
+     * @param account Address to remove
+     */
+    function removeFromBlacklist(address account) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        blacklistedAddresses[account] = false;
+        emit AddressRemovedFromBlacklist(account);
+    }
+
+    /**
+     * @notice Blacklist a jurisdiction
+     * @param jurisdiction Jurisdiction to blacklist
+     * @param reason Blacklist reason
+     */
+    function blacklistJurisdiction(
+        string calldata jurisdiction,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        blacklistedJurisdictions[jurisdiction] = true;
+        emit JurisdictionBlacklisted(jurisdiction, reason);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get application details
+     */
+    function getApplication(uint256 applicationId) external view returns (InstitutionalApplication memory) {
+        return applications[applicationId];
+    }
+
+    /**
+     * @notice Get institution profile
+     */
+    function getInstitution(uint256 institutionId) external view returns (InstitutionalProfile memory) {
+        return institutions[institutionId];
+    }
+
+    /**
+     * @notice Get institution by address
+     */
+    function getInstitutionByAddress(address institutionAddress) external view returns (InstitutionalProfile memory) {
+        uint256 institutionId = addressToInstitutionId[institutionAddress];
+        require(institutionId > 0, "Institution not found");
+        return institutions[institutionId];
+    }
+
+    /**
+     * @notice Check if address is authorized signer
+     */
+    function isAuthorizedSigner(uint256 institutionId, address signer) external view returns (bool) {
+        InstitutionalProfile memory institution = institutions[institutionId];
+        address[] memory signers = institution.authorizedSigners;
+
+        for (uint256 i = 0; i < signers.length; i++) {
+            if (signers[i] == signer) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @notice Get compliance check history
+     */
+    function getComplianceHistory(uint256 institutionId) external view returns (ComplianceCheck[] memory) {
+        return complianceHistory[institutionId];
+    }
+
+    /**
+     * @notice Get audit history
+     */
+    function getAuditHistory(uint256 institutionId) external view returns (AuditRecord[] memory) {
+        return auditHistory[institutionId];
+    }
+
+    /**
+     * @notice Get user's applications
+     */
+    function getUserApplications(address user) external view returns (uint256[] memory) {
+        return addressApplications[user];
+    }
+
+    /**
+     * @notice Get platform statistics
+     */
+    function getPlatformStats() external view returns (
+        uint256 applications,
+        uint256 approved,
+        uint256 rejected,
+        uint256 active
+    ) {
+        return (totalApplications, totalApproved, totalRejected, totalActiveInstitutions);
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update audit frequency
+     */
+    function updateAuditFrequency(uint256 newFrequency) external onlyOwner {
+        auditFrequency = newFrequency;
+    }
+
+    /**
+     * @notice Update credit limit bounds
+     */
+    function updateCreditLimitBounds(uint256 newMin, uint256 newMax) external onlyOwner {
+        require(newMin < newMax, "Invalid bounds");
+        minCreditLimit = newMin;
+        maxCreditLimit = newMax;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    uint256[50] private __gap;
+}

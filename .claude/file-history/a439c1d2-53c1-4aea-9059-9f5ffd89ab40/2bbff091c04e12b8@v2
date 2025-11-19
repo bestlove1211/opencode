@@ -1,0 +1,301 @@
+/**
+ * System Configuration Script
+ * Configures deployed contracts with production-ready settings
+ */
+
+import { ethers } from 'hardhat';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
+async function main() {
+  console.log('⚙️  Starting system configuration...\n');
+
+  const [deployer] = await ethers.getSigners();
+  const network = await ethers.provider.getNetwork();
+
+  // Load deployment addresses
+  const deploymentPath = join(__dirname, '../deployments', `${network.name}-latest.json`);
+  const addresses = JSON.parse(readFileSync(deploymentPath, 'utf-8'));
+
+  console.log('Network:', network.name);
+  console.log('Deployer:', deployer.address, '\n');
+
+  // ============ Configure Price Oracle ============
+  console.log('📊 Configuring Price Oracle...');
+  const priceOracle = await ethers.getContractAt('BancafiPriceOracle', addresses.priceOracle);
+
+  // Configure supported assets with Chainlink feeds
+  const assetConfigs = getAssetConfigs(network.chainId);
+
+  for (const config of assetConfigs) {
+    try {
+      await priceOracle.addAsset(
+        config.asset,
+        config.chainlinkFeed,
+        config.heartbeat,
+        config.minPrice,
+        config.maxPrice
+      );
+      console.log(`✅ Configured ${config.name}`);
+    } catch (error: any) {
+      if (error.message.includes('Asset already added')) {
+        console.log(`⏭️  ${config.name} already configured`);
+      } else {
+        console.error(`❌ Failed to configure ${config.name}:`, error.message);
+      }
+    }
+  }
+  console.log('');
+
+  // ============ Configure Multi-Asset Collateral ============
+  console.log('🎯 Configuring Multi-Asset Collateral...');
+  const multiAssetCollateral = await ethers.getContractAt(
+    'MultiAssetCollateralManager',
+    addresses.multiAssetCollateral
+  );
+
+  const collateralConfigs = getCollateralConfigs(network.chainId);
+
+  for (const config of collateralConfigs) {
+    try {
+      await multiAssetCollateral.configureAsset(
+        config.asset,
+        true, // isSupported
+        config.liquidationThreshold,
+        config.minCollateralRatio,
+        config.liquidationBonus,
+        config.maxAllocation,
+        config.decimals
+      );
+      console.log(`✅ Configured ${config.name} collateral`);
+    } catch (error: any) {
+      console.error(`❌ Failed to configure ${config.name}:`, error.message);
+    }
+  }
+  console.log('');
+
+  // ============ Configure Compliance ============
+  console.log('🔐 Configuring Compliance System...');
+  const compliance = await ethers.getContractAt('BancafiCompliance', addresses.compliance);
+
+  // Add sanctioned countries (OFAC list)
+  const sanctionedCountries = ['KP', 'IR', 'CU', 'SY'];
+  for (const country of sanctionedCountries) {
+    try {
+      await compliance.addSanctionedCountry(country);
+      console.log(`✅ Added ${country} to sanctions list`);
+    } catch (error: any) {
+      if (error.message.includes('already sanctioned')) {
+        console.log(`⏭️  ${country} already sanctioned`);
+      }
+    }
+  }
+
+  // Set KYC expiry duration (365 days)
+  await compliance.setKycExpiryDuration(365 * 24 * 3600);
+  console.log('✅ KYC expiry set to 365 days');
+  console.log('');
+
+  // ============ Configure Lending Platform ============
+  console.log('💰 Configuring Lending Platform...');
+  const lending = await ethers.getContractAt('BancafiLending', addresses.bancafiLending);
+
+  await lending.setPlatformFee(50); // 0.5%
+  console.log('✅ Platform fee: 0.5%');
+
+  await lending.setMinLoanDuration(7 * 24 * 3600); // 7 days
+  console.log('✅ Min loan duration: 7 days');
+
+  await lending.setMaxLoanDuration(365 * 24 * 3600); // 365 days
+  console.log('✅ Max loan duration: 365 days');
+
+  await lending.setMaxInterestRate(10000); // 100%
+  console.log('✅ Max interest rate: 100%');
+  console.log('');
+
+  // ============ Configure Insurance Pool ============
+  console.log('🛡️  Configuring Insurance Pool...');
+  const insurance = await ethers.getContractAt('BancafiInsurance', addresses.insurance);
+
+  await insurance.setMinimumCoverageRatio(2000); // 20%
+  console.log('✅ Min coverage ratio: 20%');
+
+  await insurance.setMaximumClaimRatio(9000); // 90%
+  console.log('✅ Max claim ratio: 90%');
+  console.log('');
+
+  // ============ Configure Private Credit Line ============
+  console.log('💳 Configuring Private Credit Line...');
+  const creditLine = await ethers.getContractAt(
+    'BancafiPrivateCreditLine',
+    addresses.privateCreditLine
+  );
+
+  const tiers = [
+    { name: 'Bronze', minScore: 0, maxCredit: ethers.utils.parseEther('10000'), apr: 700 },
+    { name: 'Silver', minScore: 600, maxCredit: ethers.utils.parseEther('50000'), apr: 650 },
+    { name: 'Gold', minScore: 700, maxCredit: ethers.utils.parseEther('100000'), apr: 600 },
+    { name: 'Platinum', minScore: 800, maxCredit: ethers.utils.parseEther('250000'), apr: 550 },
+    { name: 'Diamond', minScore: 900, maxCredit: ethers.utils.parseEther('500000'), apr: 500 },
+  ];
+
+  for (let i = 0; i < tiers.length; i++) {
+    const tier = tiers[i];
+    try {
+      await creditLine.updateTier(
+        i,
+        tier.minScore,
+        tier.maxCredit,
+        tier.apr,
+        `${tier.name} Tier`
+      );
+      console.log(`✅ Configured ${tier.name} tier: ${tier.apr / 100}% APR`);
+    } catch (error: any) {
+      console.error(`❌ Failed to configure ${tier.name}:`, error.message);
+    }
+  }
+  console.log('');
+
+  // ============ Grant Roles ============
+  console.log('👥 Configuring Roles...');
+
+  // Grant DEBT_COLLECTOR_ROLE to Lending contract
+  const debtCollection = await ethers.getContractAt('DebtCollection', addresses.debtCollection);
+  const DEBT_COLLECTOR_ROLE = ethers.utils.id('DEBT_COLLECTOR_ROLE');
+
+  try {
+    await debtCollection.grantRole(DEBT_COLLECTOR_ROLE, lending.address);
+    console.log('✅ Granted DEBT_COLLECTOR_ROLE to Lending contract');
+  } catch (error: any) {
+    if (error.message.includes('already has role')) {
+      console.log('⏭️  Lending contract already has DEBT_COLLECTOR_ROLE');
+    }
+  }
+
+  // Grant MANAGER_ROLE to Lending for collateral management
+  const MANAGER_ROLE = ethers.utils.id('MANAGER_ROLE');
+  try {
+    await multiAssetCollateral.grantRole(MANAGER_ROLE, lending.address);
+    console.log('✅ Granted MANAGER_ROLE to Lending contract');
+  } catch (error: any) {
+    if (error.message.includes('already has role')) {
+      console.log('⏭️  Lending contract already has MANAGER_ROLE');
+    }
+  }
+
+  console.log('');
+
+  // ============ Configuration Summary ============
+  console.log('========================================');
+  console.log('✅ CONFIGURATION COMPLETE!');
+  console.log('========================================\n');
+
+  console.log('Configured Components:');
+  console.log('✅ Price Oracle with Chainlink feeds');
+  console.log('✅ Multi-asset collateral parameters');
+  console.log('✅ Compliance and sanctions list');
+  console.log('✅ Lending platform limits and fees');
+  console.log('✅ Insurance pool parameters');
+  console.log('✅ Private credit line tiers');
+  console.log('✅ Role-based access control');
+  console.log('\n========================================\n');
+
+  console.log('Next Steps:');
+  console.log('1. Test all configurations');
+  console.log('2. Add KYC verifiers and compliance officers');
+  console.log('3. Fund insurance pool with initial capital');
+  console.log('4. Launch frontend with contract addresses');
+  console.log('5. Begin user onboarding\n');
+}
+
+function getAssetConfigs(chainId: number) {
+  // Ethereum Mainnet
+  if (chainId === 1) {
+    return [
+      {
+        name: 'WETH',
+        asset: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        chainlinkFeed: '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419',
+        heartbeat: 3600,
+        minPrice: ethers.utils.parseEther('500'),
+        maxPrice: ethers.utils.parseEther('10000'),
+      },
+      {
+        name: 'WBTC',
+        asset: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
+        chainlinkFeed: '0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c',
+        heartbeat: 3600,
+        minPrice: ethers.utils.parseEther('10000'),
+        maxPrice: ethers.utils.parseEther('100000'),
+      },
+      {
+        name: 'USDC',
+        asset: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+        chainlinkFeed: '0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6',
+        heartbeat: 86400,
+        minPrice: ethers.utils.parseUnits('0.95', 18),
+        maxPrice: ethers.utils.parseUnits('1.05', 18),
+      },
+    ];
+  }
+
+  // Sepolia Testnet
+  if (chainId === 11155111) {
+    return [
+      {
+        name: 'ETH',
+        asset: '0x0000000000000000000000000000000000000000',
+        chainlinkFeed: '0x694AA1769357215DE4FAC081bf1f309aDC325306',
+        heartbeat: 3600,
+        minPrice: ethers.utils.parseEther('500'),
+        maxPrice: ethers.utils.parseEther('10000'),
+      },
+    ];
+  }
+
+  return [];
+}
+
+function getCollateralConfigs(chainId: number) {
+  // Ethereum Mainnet
+  if (chainId === 1) {
+    return [
+      {
+        name: 'WETH',
+        asset: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        liquidationThreshold: 8000, // 80%
+        minCollateralRatio: 15000, // 150%
+        liquidationBonus: 500, // 5%
+        maxAllocation: 7000, // 70%
+        decimals: 18,
+      },
+      {
+        name: 'WBTC',
+        asset: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
+        liquidationThreshold: 7500, // 75%
+        minCollateralRatio: 16000, // 160%
+        liquidationBonus: 500, // 5%
+        maxAllocation: 7000, // 70%
+        decimals: 8,
+      },
+      {
+        name: 'USDC',
+        asset: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+        liquidationThreshold: 9000, // 90%
+        minCollateralRatio: 11000, // 110%
+        liquidationBonus: 200, // 2%
+        maxAllocation: 5000, // 50%
+        decimals: 6,
+      },
+    ];
+  }
+
+  return [];
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

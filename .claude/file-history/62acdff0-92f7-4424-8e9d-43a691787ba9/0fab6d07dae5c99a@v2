@@ -1,0 +1,293 @@
+# Bancafi Backend API with MCP
+
+Express.js backend API for the Bancafi DeFi platform with Model Context Protocol (MCP) server integration.
+
+## Features
+
+- **REST API**: Complete HTTP API for all contract interactions
+- **MCP Server**: Model Context Protocol server for AI agent integration
+- **Real-time Events**: WebSocket support for blockchain event monitoring
+- **Analytics**: Platform-wide metrics, TVL, and health scoring
+- **Security**: Rate limiting, CORS, helmet protection
+
+## Architecture
+
+```
+backend/
+├── src/
+│   ├── controllers/      # REST API endpoints
+│   │   ├── assets.js     # Asset tokenization & management
+│   │   ├── bailouts.js   # Bailout requests & repayments
+│   │   ├── dao.js        # DAO proposals & voting
+│   │   ├── staking.js    # Staking & rewards
+│   │   ├── analytics.js  # Platform analytics & metrics
+│   │   └── marketplace.js# Marketplace listings & trading
+│   ├── services/         # Core services
+│   │   └── blockchain.js # Blockchain connection & contract loading
+│   ├── mcp/             # MCP server
+│   │   └── server.js    # MCP tool definitions
+│   └── index.js         # Main Express server
+├── config/              # Configuration files
+├── package.json
+└── .env                 # Environment variables
+```
+
+## Installation
+
+```bash
+cd backend
+npm install
+```
+
+## Configuration
+
+Create a `.env` file:
+
+```bash
+# Server
+PORT=3000
+NODE_ENV=development
+
+# Blockchain
+BLOCKCHAIN_NETWORK=localhost
+RPC_URL=http://127.0.0.1:8545
+
+# Contract Addresses (loaded from deployment files)
+# These are auto-loaded from ../deployment-complete.json
+
+# API
+ENABLE_RATE_LIMIT=true
+CORS_ORIGIN=http://localhost:3001
+
+# Private Keys (for write operations)
+ADMIN_PRIVATE_KEY=your_private_key_here
+```
+
+## Usage
+
+### Start REST API Server
+
+```bash
+npm start
+```
+
+Server runs on `http://localhost:3000`
+
+### Start MCP Server
+
+```bash
+npm run mcp
+```
+
+MCP server runs on stdio for AI agent integration.
+
+### Development Mode
+
+```bash
+npm run dev
+```
+
+Uses nodemon for auto-restart on file changes.
+
+## API Endpoints
+
+### Health Check
+```
+GET /health
+```
+
+### Assets
+```
+GET    /api/assets/:tokenId
+GET    /api/assets/:tokenId/fractional-ownership/:address
+POST   /api/assets/tokenize
+POST   /api/assets/:tokenId/verify
+POST   /api/assets/:tokenId/fractionalize
+POST   /api/assets/:tokenId/transfer-fractional
+```
+
+### Bailouts
+```
+GET    /api/bailouts/:requestId
+GET    /api/bailouts/treasury/balance
+POST   /api/bailouts/request
+POST   /api/bailouts/:requestId/approve
+POST   /api/bailouts/:requestId/repay
+```
+
+### DAO
+```
+GET    /api/dao/proposals/:proposalId
+POST   /api/dao/proposals
+POST   /api/dao/proposals/:proposalId/vote
+```
+
+### Staking
+```
+GET    /api/staking/pool
+GET    /api/staking/user/:address
+POST   /api/staking/stake
+POST   /api/staking/:stakeId/unstake
+POST   /api/staking/claim-rewards
+```
+
+### Analytics
+```
+GET    /api/analytics/tvl
+GET    /api/analytics/health-score
+GET    /api/analytics/snapshot
+GET    /api/analytics/metrics
+```
+
+### Marketplace
+```
+GET    /api/marketplace/listings/:listingId
+POST   /api/marketplace/listings
+POST   /api/marketplace/listings/:listingId/buy
+POST   /api/marketplace/listings/:listingId/cancel
+```
+
+## MCP Tools
+
+The MCP server provides the following tools for AI agents:
+
+### Read Operations
+- `get_asset_details` - Get tokenized asset information
+- `get_bailout_request` - Get bailout request details
+- `get_dao_proposal` - Get DAO proposal status
+- `get_staking_info` - Get staking pool and user info
+- `get_platform_analytics` - Get TVL and health score
+- `get_marketplace_listings` - Get active listings
+
+### Write Operations
+- `tokenize_asset` - Tokenize a new real-world asset
+- `request_bailout` - Request emergency bailout
+- `stake_tokens` - Stake governance tokens
+
+## Example Requests
+
+### Tokenize an Asset
+
+```bash
+curl -X POST http://localhost:3000/api/assets/tokenize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "assetType": 0,
+    "valuation": "1000000",
+    "location": "123 Main St, Dubai",
+    "legalDocumentHash": "ipfs://Qm...",
+    "privateKey": "0x..."
+  }'
+```
+
+### Get Platform Analytics
+
+```bash
+curl http://localhost:3000/api/analytics/snapshot
+```
+
+### Request Bailout
+
+```bash
+curl -X POST http://localhost:3000/api/bailouts/request \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": "50000",
+    "reason": "Market liquidity crisis",
+    "solvencyProof": "ipfs://Qm...",
+    "collateralTokenId": 1,
+    "repaymentMonths": 12,
+    "privateKey": "0x..."
+  }'
+```
+
+### Vote on Proposal
+
+```bash
+curl -X POST http://localhost:3000/api/dao/proposals/1/vote \
+  -H "Content-Type: application/json" \
+  -d '{
+    "support": 1,
+    "privateKey": "0x..."
+  }'
+```
+
+## Security
+
+- **Rate Limiting**: 100 requests per 15 minutes per IP
+- **CORS**: Configurable allowed origins
+- **Helmet**: Security headers
+- **Private Keys**: Never log or expose private keys
+- **Input Validation**: All inputs sanitized
+
+## Development
+
+### Project Structure
+
+- `controllers/` - Route handlers for each contract feature
+- `services/blockchain.js` - Contract initialization and management
+- `mcp/server.js` - MCP protocol implementation
+- `index.js` - Main Express app setup
+
+### Adding New Endpoints
+
+1. Create controller in `src/controllers/`
+2. Import in `src/index.js`
+3. Add route: `app.use('/api/your-route', yourController)`
+
+### Testing
+
+```bash
+# Test health endpoint
+curl http://localhost:3000/health
+
+# Test with hardhat node running
+npx hardhat node
+npm start
+```
+
+## Deployment
+
+### Production Setup
+
+1. Set `NODE_ENV=production`
+2. Use secure RPC endpoints (Infura, Alchemy)
+3. Enable rate limiting
+4. Use environment variables for all secrets
+5. Deploy behind reverse proxy (nginx)
+6. Enable HTTPS
+7. Set up monitoring
+
+### Docker (Optional)
+
+```dockerfile
+FROM node:18
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]
+```
+
+## Troubleshooting
+
+### Cannot connect to blockchain
+- Ensure hardhat node is running
+- Check RPC_URL in .env
+- Verify network is accessible
+
+### Contract not found
+- Run deployment scripts first
+- Check deployment JSON files exist
+- Verify contract addresses
+
+### Transaction fails
+- Check account has sufficient ETH
+- Verify account has required roles
+- Check contract is not paused
+
+## License
+
+MIT

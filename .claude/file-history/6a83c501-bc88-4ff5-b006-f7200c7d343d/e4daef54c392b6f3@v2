@@ -1,0 +1,2138 @@
+# Bancafi Transitional Token Bonds (BTTB)
+## Technical Architecture Specifications v1.0
+
+---
+
+## Table of Contents
+
+1. [System Architecture Overview](#1-system-architecture-overview)
+2. [Smart Contract Architecture](#2-smart-contract-architecture)
+3. [Custody & Bridge Layer](#3-custody--bridge-layer)
+4. [Oracle Integration](#4-oracle-integration)
+5. [Cross-Chain Messaging](#5-cross-chain-messaging)
+6. [Security Architecture](#6-security-architecture)
+7. [API Specifications](#7-api-specifications)
+8. [Data Models](#8-data-models)
+9. [Deployment Architecture](#9-deployment-architecture)
+10. [Monitoring & Observability](#10-monitoring--observability)
+
+---
+
+## 1. System Architecture Overview
+
+### 1.1 High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        User Interface Layer                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   Web App    │  │  Mobile App  │  │  API Gateway │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Application Services Layer                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   KYC/AML    │  │  Compliance  │  │  Analytics   │              │
+│  │   Service    │  │   Service    │  │   Service    │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Blockchain Abstraction Layer                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   Transaction│  │    Wallet    │  │   Event      │              │
+│  │   Manager    │  │   Manager    │  │   Listener   │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Smart Contract Layer                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │  Bond Token  │  │  Custody     │  │  Conversion  │              │
+│  │  Contract    │  │  Bridge      │  │  Engine      │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   Coupon     │  │  Governance  │  │  Registry    │              │
+│  │  Distributor │  │   Module     │  │  Contract    │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+┌──────────────────────────────┐  ┌──────────────────────────────┐
+│   Oracle Network Layer       │  │   Cross-Chain Layer          │
+│  ┌────────────────────────┐  │  │  ┌────────────────────────┐  │
+│  │  Price Feeds (Chainlink)│  │  │  │  LayerZero / Axelar   │  │
+│  │  Yield Curve Data      │  │  │  │  Cross-Chain Messaging │  │
+│  │  Bond Rating Data      │  │  │  └────────────────────────┘  │
+│  └────────────────────────┘  │  └──────────────────────────────┘
+└──────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   External Integration Layer                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │  Custodian   │  │  Bond Market │  │  Fiat On/Off │           │
+│  │  API         │  │  Data        │  │  Ramp        │           │
+│  └──────────────┘  └──────────────┘  └──────────────┘           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 Core Components
+
+| Component | Technology Stack | Purpose |
+|-----------|-----------------|---------|
+| Smart Contracts | Solidity 0.8.25 | Core bond tokenization logic |
+| Primary Chain | Ethereum L1/L2 (Arbitrum) | Main deployment chain |
+| Cross-Chain | LayerZero V2 / Axelar | Multi-chain support |
+| Backend Services | Node.js / TypeScript | Application logic |
+| Database | PostgreSQL + Redis | Data persistence & caching |
+| Oracle Network | Chainlink | Price feeds & external data |
+| IPFS | Pinata / Web3.Storage | Document storage |
+| Frontend | React + Web3.js/Ethers.js | User interface |
+
+### 1.3 Supported Chains (Phase 1)
+
+- **Primary**: Ethereum (Mainnet) or Arbitrum One
+- **Secondary**: Polygon PoS, Binance Smart Chain
+- **Future**: Avalanche, Optimism, Base
+
+---
+
+## 2. Smart Contract Architecture
+
+### 2.1 Contract Overview
+
+```
+Core Contracts:
+├── BondToken.sol (ERC-3643 compliant)
+├── CustodyBridge.sol
+├── ConversionEngine.sol
+├── CouponDistributor.sol
+├── BondRegistry.sol
+├── GovernanceModule.sol
+└── EmergencyPause.sol
+
+Supporting Contracts:
+├── IdentityRegistry.sol (ERC-3643)
+├── ComplianceModule.sol (ERC-3643)
+├── TrustedIssuersRegistry.sol
+└── ClaimTopicsRegistry.sol
+```
+
+### 2.2 BondToken Contract (ERC-3643)
+
+**Why ERC-3643?**
+- Permissioned transfers (KYC/AML compliant)
+- On-chain identity verification
+- Regulatory compliance built-in
+- Transfer restrictions
+
+**Contract Specification:**
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@onchain-id/solidity/contracts/interface/IIdentity.sol";
+import "@tokenysolutions/t-rex/contracts/token/Token.sol";
+
+/**
+ * @title BondToken
+ * @dev ERC-3643 compliant bond token with coupon payments
+ */
+contract BondToken is Token {
+
+    // Bond Metadata
+    struct BondMetadata {
+        string isin;              // International Securities Identification Number
+        string cusip;             // CUSIP identifier (US bonds)
+        uint256 faceValue;        // Face value in smallest unit
+        uint256 couponRate;       // Annual coupon rate in basis points (e.g., 500 = 5%)
+        uint256 issueDate;        // Unix timestamp
+        uint256 maturityDate;     // Unix timestamp
+        uint256 frequency;        // Coupon payment frequency (1=annual, 2=semi-annual, 4=quarterly)
+        address issuer;           // Bond issuer address
+        string bondType;          // "GOVERNMENT" | "CORPORATE" | "MUNICIPAL"
+        string rating;            // Credit rating (e.g., "AAA", "AA+")
+        string jurisdiction;      // Legal jurisdiction
+        string documentHash;      // IPFS hash of bond documentation
+    }
+
+    BondMetadata public bondMetadata;
+
+    // Coupon tracking
+    uint256 public lastCouponDate;
+    uint256 public nextCouponDate;
+    uint256[] public couponPaymentHistory;
+
+    // Redemption tracking
+    bool public isMatured;
+    bool public redemptionEnabled;
+    mapping(address => bool) public hasRedeemed;
+
+    // Collateral tracking (underlying bond custody)
+    uint256 public totalCollateral;
+    address public custodianAddress;
+
+    // Events
+    event CouponPaid(uint256 indexed paymentId, uint256 amount, uint256 timestamp);
+    event BondMatured(uint256 timestamp);
+    event RedemptionRequested(address indexed holder, uint256 amount);
+    event RedemptionCompleted(address indexed holder, uint256 amount);
+    event CollateralDeposited(uint256 amount, uint256 timestamp);
+    event CollateralWithdrawn(uint256 amount, uint256 timestamp);
+    event MetadataUpdated(string field, string newValue);
+
+    constructor(
+        address identityRegistry_,
+        address compliance_,
+        string memory name_,
+        string memory symbol_,
+        uint8 decimals_,
+        BondMetadata memory metadata_
+    ) Token(identityRegistry_, compliance_, name_, symbol_, decimals_, address(0)) {
+        bondMetadata = metadata_;
+        lastCouponDate = metadata_.issueDate;
+        nextCouponDate = calculateNextCouponDate(metadata_.issueDate);
+    }
+
+    /**
+     * @dev Calculate next coupon payment date
+     */
+    function calculateNextCouponDate(uint256 fromDate) public view returns (uint256) {
+        uint256 periodSeconds = 365 days / bondMetadata.frequency;
+        uint256 nextDate = fromDate + periodSeconds;
+
+        if (nextDate > bondMetadata.maturityDate) {
+            return bondMetadata.maturityDate;
+        }
+
+        return nextDate;
+    }
+
+    /**
+     * @dev Get current bond value (face value + accrued interest)
+     */
+    function getCurrentBondValue() public view returns (uint256) {
+        uint256 accruedInterest = calculateAccruedInterest();
+        return bondMetadata.faceValue + accruedInterest;
+    }
+
+    /**
+     * @dev Calculate accrued interest since last coupon payment
+     */
+    function calculateAccruedInterest() public view returns (uint256) {
+        if (block.timestamp <= lastCouponDate) return 0;
+
+        uint256 timeSinceLastCoupon = block.timestamp - lastCouponDate;
+        uint256 periodSeconds = 365 days / bondMetadata.frequency;
+        uint256 couponAmount = (bondMetadata.faceValue * bondMetadata.couponRate) / 10000;
+
+        // Pro-rata accrued interest
+        return (couponAmount * timeSinceLastCoupon) / periodSeconds;
+    }
+
+    /**
+     * @dev Check if bond has matured
+     */
+    function checkMaturity() public {
+        require(!isMatured, "Bond already matured");
+
+        if (block.timestamp >= bondMetadata.maturityDate) {
+            isMatured = true;
+            redemptionEnabled = true;
+            emit BondMatured(block.timestamp);
+        }
+    }
+
+    /**
+     * @dev Request redemption at maturity
+     */
+    function requestRedemption(uint256 amount) external {
+        require(isMatured, "Bond not yet matured");
+        require(redemptionEnabled, "Redemption not enabled");
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+        require(!hasRedeemed[msg.sender], "Already redeemed");
+
+        emit RedemptionRequested(msg.sender, amount);
+    }
+
+    /**
+     * @dev Override transfer to check compliance and update coupon eligibility
+     */
+    function transfer(address to, uint256 amount)
+        public
+        override
+        returns (bool)
+    {
+        require(!isMatured || redemptionEnabled, "Transfers locked at maturity");
+        return super.transfer(to, amount);
+    }
+
+    /**
+     * @dev Admin function to deposit collateral (underlying bonds)
+     */
+    function depositCollateral(uint256 amount) external onlyAgent {
+        totalCollateral += amount;
+        emit CollateralDeposited(amount, block.timestamp);
+    }
+
+    /**
+     * @dev Get bond health ratio (collateral / total supply)
+     */
+    function getHealthRatio() external view returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return 0;
+        return (totalCollateral * 10000) / supply; // Returns basis points
+    }
+
+    /**
+     * @dev Update bond rating (by authorized oracle or governance)
+     */
+    function updateRating(string memory newRating) external onlyOwner {
+        bondMetadata.rating = newRating;
+        emit MetadataUpdated("rating", newRating);
+    }
+}
+```
+
+### 2.3 CustodyBridge Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+
+/**
+ * @title CustodyBridge
+ * @dev Manages custody of traditional bonds and minting/burning of bond tokens
+ */
+contract CustodyBridge is ReentrancyGuard, AccessControl, Pausable {
+
+    bytes32 public constant CUSTODIAN_ROLE = keccak256("CUSTODIAN_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE_ROLE");
+
+    struct CustodyRequest {
+        uint256 requestId;
+        address requester;
+        address bondToken;
+        uint256 amount;
+        string bondIdentifier;      // ISIN or CUSIP
+        RequestType requestType;
+        RequestStatus status;
+        uint256 timestamp;
+        string custodyReference;    // External custody system reference
+        bytes32 proofHash;          // Hash of custody proof documents
+    }
+
+    enum RequestType { DEPOSIT, WITHDRAWAL }
+    enum RequestStatus { PENDING, VERIFIED, COMPLETED, REJECTED, CANCELLED }
+
+    // State variables
+    uint256 public nextRequestId;
+    mapping(uint256 => CustodyRequest) public custodyRequests;
+    mapping(address => uint256[]) public userRequests;
+    mapping(address => address) public bondTokenToCustodian; // BondToken => Custodian address
+    mapping(address => uint256) public custodianCollateral; // Tracked collateral per custodian
+
+    // Configuration
+    uint256 public minCollateralizationRatio = 10000; // 100% in basis points
+    uint256 public processingTimeLimit = 7 days;
+
+    // Events
+    event CustodyRequestCreated(
+        uint256 indexed requestId,
+        address indexed requester,
+        RequestType requestType,
+        uint256 amount
+    );
+    event CustodyRequestVerified(uint256 indexed requestId, address indexed verifier);
+    event CustodyRequestCompleted(uint256 indexed requestId);
+    event CustodyRequestRejected(uint256 indexed requestId, string reason);
+    event CollateralUpdated(address indexed custodian, uint256 newAmount);
+    event CustodianAssigned(address indexed bondToken, address indexed custodian);
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+    }
+
+    /**
+     * @dev Create deposit request (tokenize traditional bond)
+     */
+    function createDepositRequest(
+        address bondToken,
+        uint256 amount,
+        string memory bondIdentifier,
+        bytes32 proofHash
+    ) external whenNotPaused returns (uint256) {
+        require(amount > 0, "Invalid amount");
+        require(bondTokenToCustodian[bondToken] != address(0), "No custodian assigned");
+
+        uint256 requestId = nextRequestId++;
+
+        custodyRequests[requestId] = CustodyRequest({
+            requestId: requestId,
+            requester: msg.sender,
+            bondToken: bondToken,
+            amount: amount,
+            bondIdentifier: bondIdentifier,
+            requestType: RequestType.DEPOSIT,
+            status: RequestStatus.PENDING,
+            timestamp: block.timestamp,
+            custodyReference: "",
+            proofHash: proofHash
+        });
+
+        userRequests[msg.sender].push(requestId);
+
+        emit CustodyRequestCreated(requestId, msg.sender, RequestType.DEPOSIT, amount);
+
+        return requestId;
+    }
+
+    /**
+     * @dev Custodian verifies deposit and provides custody reference
+     */
+    function verifyDeposit(
+        uint256 requestId,
+        string memory custodyReference
+    ) external onlyRole(CUSTODIAN_ROLE) {
+        CustodyRequest storage request = custodyRequests[requestId];
+
+        require(request.status == RequestStatus.PENDING, "Invalid status");
+        require(request.requestType == RequestType.DEPOSIT, "Not a deposit request");
+        require(
+            bondTokenToCustodian[request.bondToken] == msg.sender,
+            "Not assigned custodian"
+        );
+
+        request.status = RequestStatus.VERIFIED;
+        request.custodyReference = custodyReference;
+
+        emit CustodyRequestVerified(requestId, msg.sender);
+    }
+
+    /**
+     * @dev Complete deposit by minting bond tokens (after compliance approval)
+     */
+    function completeDeposit(uint256 requestId)
+        external
+        onlyRole(COMPLIANCE_ROLE)
+        nonReentrant
+    {
+        CustodyRequest storage request = custodyRequests[requestId];
+
+        require(request.status == RequestStatus.VERIFIED, "Not verified");
+        require(request.requestType == RequestType.DEPOSIT, "Not a deposit request");
+
+        // Update collateral tracking
+        address custodian = bondTokenToCustodian[request.bondToken];
+        custodianCollateral[custodian] += request.amount;
+
+        // Mint bond tokens to requester
+        BondToken(request.bondToken).mint(request.requester, request.amount);
+
+        request.status = RequestStatus.COMPLETED;
+
+        emit CustodyRequestCompleted(requestId);
+        emit CollateralUpdated(custodian, custodianCollateral[custodian]);
+    }
+
+    /**
+     * @dev Create withdrawal request (redeem bond tokens for traditional bonds)
+     */
+    function createWithdrawalRequest(
+        address bondToken,
+        uint256 amount,
+        string memory bondIdentifier
+    ) external whenNotPaused returns (uint256) {
+        require(amount > 0, "Invalid amount");
+        require(
+            BondToken(bondToken).balanceOf(msg.sender) >= amount,
+            "Insufficient bond tokens"
+        );
+
+        uint256 requestId = nextRequestId++;
+
+        custodyRequests[requestId] = CustodyRequest({
+            requestId: requestId,
+            requester: msg.sender,
+            bondToken: bondToken,
+            amount: amount,
+            bondIdentifier: bondIdentifier,
+            requestType: RequestType.WITHDRAWAL,
+            status: RequestStatus.PENDING,
+            timestamp: block.timestamp,
+            custodyReference: "",
+            proofHash: bytes32(0)
+        });
+
+        userRequests[msg.sender].push(requestId);
+
+        // Burn bond tokens immediately (held in escrow logic could be alternative)
+        BondToken(bondToken).burn(msg.sender, amount);
+
+        emit CustodyRequestCreated(requestId, msg.sender, RequestType.WITHDRAWAL, amount);
+
+        return requestId;
+    }
+
+    /**
+     * @dev Custodian completes withdrawal by transferring traditional bonds
+     */
+    function completeWithdrawal(
+        uint256 requestId,
+        string memory custodyReference
+    ) external onlyRole(CUSTODIAN_ROLE) {
+        CustodyRequest storage request = custodyRequests[requestId];
+
+        require(request.status == RequestStatus.PENDING, "Invalid status");
+        require(request.requestType == RequestType.WITHDRAWAL, "Not a withdrawal request");
+        require(
+            bondTokenToCustodian[request.bondToken] == msg.sender,
+            "Not assigned custodian"
+        );
+
+        // Update collateral tracking
+        custodianCollateral[msg.sender] -= request.amount;
+
+        request.status = RequestStatus.COMPLETED;
+        request.custodyReference = custodyReference;
+
+        emit CustodyRequestCompleted(requestId);
+        emit CollateralUpdated(msg.sender, custodianCollateral[msg.sender]);
+    }
+
+    /**
+     * @dev Reject a custody request with reason
+     */
+    function rejectRequest(
+        uint256 requestId,
+        string memory reason
+    ) external {
+        CustodyRequest storage request = custodyRequests[requestId];
+
+        require(
+            hasRole(CUSTODIAN_ROLE, msg.sender) || hasRole(COMPLIANCE_ROLE, msg.sender),
+            "Unauthorized"
+        );
+        require(request.status == RequestStatus.PENDING, "Invalid status");
+
+        request.status = RequestStatus.REJECTED;
+
+        // If withdrawal was rejected, refund the burned tokens
+        if (request.requestType == RequestType.WITHDRAWAL) {
+            BondToken(request.bondToken).mint(request.requester, request.amount);
+        }
+
+        emit CustodyRequestRejected(requestId, reason);
+    }
+
+    /**
+     * @dev Assign custodian to bond token
+     */
+    function assignCustodian(address bondToken, address custodian)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(custodian != address(0), "Invalid custodian");
+        bondTokenToCustodian[bondToken] = custodian;
+        _grantRole(CUSTODIAN_ROLE, custodian);
+        emit CustodianAssigned(bondToken, custodian);
+    }
+
+    /**
+     * @dev Get user's custody requests
+     */
+    function getUserRequests(address user) external view returns (uint256[] memory) {
+        return userRequests[user];
+    }
+
+    /**
+     * @dev Check if sufficient collateralization
+     */
+    function checkCollateralization(address bondToken) external view returns (bool) {
+        uint256 totalSupply = BondToken(bondToken).totalSupply();
+        address custodian = bondTokenToCustodian[bondToken];
+        uint256 collateral = custodianCollateral[custodian];
+
+        if (totalSupply == 0) return true;
+
+        uint256 ratio = (collateral * 10000) / totalSupply;
+        return ratio >= minCollateralizationRatio;
+    }
+
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+}
+```
+
+### 2.4 ConversionEngine Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+/**
+ * @title ConversionEngine
+ * @dev Handles crypto <-> bond token conversions with pricing
+ */
+contract ConversionEngine is ReentrancyGuard, AccessControl {
+
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    struct ConversionPair {
+        address cryptoToken;           // USDC, USDT, DAI, etc.
+        address bondToken;
+        AggregatorV3Interface priceFeed; // Chainlink price feed
+        uint256 conversionFee;         // Fee in basis points
+        bool isActive;
+        uint256 minConversionAmount;
+        uint256 maxConversionAmount;
+    }
+
+    struct ConversionOrder {
+        uint256 orderId;
+        address user;
+        address fromToken;
+        address toToken;
+        uint256 fromAmount;
+        uint256 toAmount;
+        uint256 executionPrice;        // Price at execution
+        uint256 fee;
+        uint256 timestamp;
+        OrderStatus status;
+    }
+
+    enum OrderStatus { PENDING, EXECUTED, CANCELLED, FAILED }
+
+    // State
+    uint256 public nextOrderId;
+    mapping(bytes32 => ConversionPair) public conversionPairs; // hash(crypto, bond) => pair
+    mapping(uint256 => ConversionOrder) public orders;
+    mapping(address => uint256[]) public userOrders;
+
+    // Fee collection
+    address public feeCollector;
+    mapping(address => uint256) public collectedFees;
+
+    // Events
+    event ConversionPairAdded(address indexed cryptoToken, address indexed bondToken);
+    event ConversionPairUpdated(address indexed cryptoToken, address indexed bondToken);
+    event ConversionExecuted(
+        uint256 indexed orderId,
+        address indexed user,
+        address fromToken,
+        address toToken,
+        uint256 fromAmount,
+        uint256 toAmount
+    );
+    event ConversionCancelled(uint256 indexed orderId);
+    event FeesCollected(address indexed token, uint256 amount);
+
+    constructor(address feeCollector_) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        feeCollector = feeCollector_;
+    }
+
+    /**
+     * @dev Add conversion pair
+     */
+    function addConversionPair(
+        address cryptoToken,
+        address bondToken,
+        address priceFeed,
+        uint256 conversionFee,
+        uint256 minAmount,
+        uint256 maxAmount
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        bytes32 pairId = getPairId(cryptoToken, bondToken);
+
+        conversionPairs[pairId] = ConversionPair({
+            cryptoToken: cryptoToken,
+            bondToken: bondToken,
+            priceFeed: AggregatorV3Interface(priceFeed),
+            conversionFee: conversionFee,
+            isActive: true,
+            minConversionAmount: minAmount,
+            maxConversionAmount: maxAmount
+        });
+
+        emit ConversionPairAdded(cryptoToken, bondToken);
+    }
+
+    /**
+     * @dev Convert crypto to bond tokens
+     */
+    function convertCryptoToBond(
+        address cryptoToken,
+        address bondToken,
+        uint256 cryptoAmount
+    ) external nonReentrant returns (uint256) {
+        bytes32 pairId = getPairId(cryptoToken, bondToken);
+        ConversionPair memory pair = conversionPairs[pairId];
+
+        require(pair.isActive, "Pair not active");
+        require(
+            cryptoAmount >= pair.minConversionAmount &&
+            cryptoAmount <= pair.maxConversionAmount,
+            "Amount out of range"
+        );
+
+        // Get current price from oracle
+        uint256 bondPrice = getBondPrice(pair.priceFeed);
+
+        // Calculate bond tokens to receive
+        uint256 bondAmount = (cryptoAmount * 1e18) / bondPrice;
+
+        // Calculate fee
+        uint256 fee = (bondAmount * pair.conversionFee) / 10000;
+        uint256 bondAmountAfterFee = bondAmount - fee;
+
+        // Transfer crypto from user
+        require(
+            IERC20(cryptoToken).transferFrom(msg.sender, address(this), cryptoAmount),
+            "Transfer failed"
+        );
+
+        // Transfer bond tokens to user (assumes this contract has liquidity or minting rights)
+        require(
+            BondToken(bondToken).transfer(msg.sender, bondAmountAfterFee),
+            "Bond transfer failed"
+        );
+
+        // Record order
+        uint256 orderId = _createOrder(
+            msg.sender,
+            cryptoToken,
+            bondToken,
+            cryptoAmount,
+            bondAmountAfterFee,
+            bondPrice,
+            fee
+        );
+
+        // Update fee collection
+        collectedFees[bondToken] += fee;
+
+        emit ConversionExecuted(
+            orderId,
+            msg.sender,
+            cryptoToken,
+            bondToken,
+            cryptoAmount,
+            bondAmountAfterFee
+        );
+
+        return orderId;
+    }
+
+    /**
+     * @dev Convert bond tokens to crypto
+     */
+    function convertBondToCrypto(
+        address bondToken,
+        address cryptoToken,
+        uint256 bondAmount
+    ) external nonReentrant returns (uint256) {
+        bytes32 pairId = getPairId(cryptoToken, bondToken);
+        ConversionPair memory pair = conversionPairs[pairId];
+
+        require(pair.isActive, "Pair not active");
+
+        // Get current price from oracle
+        uint256 bondPrice = getBondPrice(pair.priceFeed);
+
+        // Calculate crypto to receive
+        uint256 cryptoAmount = (bondAmount * bondPrice) / 1e18;
+
+        // Calculate fee
+        uint256 fee = (cryptoAmount * pair.conversionFee) / 10000;
+        uint256 cryptoAmountAfterFee = cryptoAmount - fee;
+
+        require(
+            cryptoAmountAfterFee >= pair.minConversionAmount &&
+            cryptoAmountAfterFee <= pair.maxConversionAmount,
+            "Amount out of range"
+        );
+
+        // Transfer bond tokens from user
+        require(
+            BondToken(bondToken).transferFrom(msg.sender, address(this), bondAmount),
+            "Bond transfer failed"
+        );
+
+        // Transfer crypto to user
+        require(
+            IERC20(cryptoToken).transfer(msg.sender, cryptoAmountAfterFee),
+            "Crypto transfer failed"
+        );
+
+        // Record order
+        uint256 orderId = _createOrder(
+            msg.sender,
+            bondToken,
+            cryptoToken,
+            bondAmount,
+            cryptoAmountAfterFee,
+            bondPrice,
+            fee
+        );
+
+        // Update fee collection
+        collectedFees[cryptoToken] += fee;
+
+        emit ConversionExecuted(
+            orderId,
+            msg.sender,
+            bondToken,
+            cryptoToken,
+            bondAmount,
+            cryptoAmountAfterFee
+        );
+
+        return orderId;
+    }
+
+    /**
+     * @dev Get bond price from Chainlink oracle
+     */
+    function getBondPrice(AggregatorV3Interface priceFeed)
+        public
+        view
+        returns (uint256)
+    {
+        (
+            /* uint80 roundID */,
+            int256 price,
+            /* uint256 startedAt */,
+            uint256 timeStamp,
+            /* uint80 answeredInRound */
+        ) = priceFeed.latestRoundData();
+
+        require(timeStamp > 0, "Invalid price data");
+        require(block.timestamp - timeStamp < 1 hours, "Stale price data");
+        require(price > 0, "Invalid price");
+
+        // Assume price feed returns price with 8 decimals, normalize to 18
+        return uint256(price) * 1e10;
+    }
+
+    /**
+     * @dev Quote conversion rate
+     */
+    function quoteConversion(
+        address fromToken,
+        address toToken,
+        uint256 fromAmount
+    ) external view returns (uint256 toAmount, uint256 fee) {
+        bytes32 pairId = getPairId(fromToken, toToken);
+        ConversionPair memory pair = conversionPairs[pairId];
+
+        require(pair.isActive, "Pair not active");
+
+        uint256 bondPrice = getBondPrice(pair.priceFeed);
+
+        // Determine direction
+        if (fromToken == pair.cryptoToken) {
+            // Crypto to Bond
+            uint256 bondAmount = (fromAmount * 1e18) / bondPrice;
+            fee = (bondAmount * pair.conversionFee) / 10000;
+            toAmount = bondAmount - fee;
+        } else {
+            // Bond to Crypto
+            uint256 cryptoAmount = (fromAmount * bondPrice) / 1e18;
+            fee = (cryptoAmount * pair.conversionFee) / 10000;
+            toAmount = cryptoAmount - fee;
+        }
+    }
+
+    /**
+     * @dev Internal function to create order record
+     */
+    function _createOrder(
+        address user,
+        address fromToken,
+        address toToken,
+        uint256 fromAmount,
+        uint256 toAmount,
+        uint256 price,
+        uint256 fee
+    ) internal returns (uint256) {
+        uint256 orderId = nextOrderId++;
+
+        orders[orderId] = ConversionOrder({
+            orderId: orderId,
+            user: user,
+            fromToken: fromToken,
+            toToken: toToken,
+            fromAmount: fromAmount,
+            toAmount: toAmount,
+            executionPrice: price,
+            fee: fee,
+            timestamp: block.timestamp,
+            status: OrderStatus.EXECUTED
+        });
+
+        userOrders[user].push(orderId);
+
+        return orderId;
+    }
+
+    /**
+     * @dev Get pair ID hash
+     */
+    function getPairId(address token1, address token2) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(token1, token2));
+    }
+
+    /**
+     * @dev Collect fees
+     */
+    function collectFees(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 amount = collectedFees[token];
+        require(amount > 0, "No fees to collect");
+
+        collectedFees[token] = 0;
+
+        require(
+            IERC20(token).transfer(feeCollector, amount),
+            "Fee transfer failed"
+        );
+
+        emit FeesCollected(token, amount);
+    }
+}
+```
+
+### 2.5 CouponDistributor Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+/**
+ * @title CouponDistributor
+ * @dev Manages coupon payments for bond tokens
+ */
+contract CouponDistributor is ReentrancyGuard, AccessControl {
+
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    struct CouponPayment {
+        uint256 paymentId;
+        address bondToken;
+        uint256 totalAmount;         // Total coupon amount
+        uint256 paymentDate;
+        uint256 recordDate;          // Snapshot date for holders
+        uint256 amountPerToken;      // Amount per bond token
+        address paymentToken;        // USDC, USDT, etc.
+        bool isDistributed;
+        address[] holders;           // List of eligible holders
+    }
+
+    // State
+    uint256 public nextPaymentId;
+    mapping(uint256 => CouponPayment) public couponPayments;
+    mapping(uint256 => mapping(address => bool)) public hasClaimed;
+    mapping(uint256 => mapping(address => uint256)) public claimableAmount;
+    mapping(address => uint256[]) public bondTokenPayments;
+    mapping(address => mapping(address => uint256)) public claimableBalance; // user => token => amount
+
+    // Events
+    event CouponScheduled(
+        uint256 indexed paymentId,
+        address indexed bondToken,
+        uint256 totalAmount,
+        uint256 paymentDate
+    );
+    event CouponClaimed(
+        uint256 indexed paymentId,
+        address indexed holder,
+        uint256 amount
+    );
+    event CouponDistributed(uint256 indexed paymentId);
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+    }
+
+    /**
+     * @dev Schedule coupon payment
+     */
+    function scheduleCouponPayment(
+        address bondToken,
+        uint256 totalAmount,
+        uint256 paymentDate,
+        uint256 recordDate,
+        address paymentToken
+    ) external onlyRole(OPERATOR_ROLE) returns (uint256) {
+        require(paymentDate > block.timestamp, "Invalid payment date");
+        require(recordDate <= paymentDate, "Invalid record date");
+
+        uint256 paymentId = nextPaymentId++;
+
+        // Calculate amount per token
+        uint256 totalSupply = BondToken(bondToken).totalSupply();
+        uint256 amountPerToken = (totalAmount * 1e18) / totalSupply;
+
+        couponPayments[paymentId] = CouponPayment({
+            paymentId: paymentId,
+            bondToken: bondToken,
+            totalAmount: totalAmount,
+            paymentDate: paymentDate,
+            recordDate: recordDate,
+            paymentToken: paymentToken,
+            isDistributed: false,
+            amountPerToken: amountPerToken,
+            holders: new address[](0)
+        });
+
+        bondTokenPayments[bondToken].push(paymentId);
+
+        emit CouponScheduled(paymentId, bondToken, totalAmount, paymentDate);
+
+        return paymentId;
+    }
+
+    /**
+     * @dev Distribute coupon to all holders (snapshot-based)
+     */
+    function distributeCoupon(uint256 paymentId, address[] calldata holders)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        CouponPayment storage payment = couponPayments[paymentId];
+
+        require(!payment.isDistributed, "Already distributed");
+        require(block.timestamp >= payment.paymentDate, "Not yet payable");
+
+        // Transfer payment tokens to this contract
+        require(
+            IERC20(payment.paymentToken).transferFrom(
+                msg.sender,
+                address(this),
+                payment.totalAmount
+            ),
+            "Payment transfer failed"
+        );
+
+        // Calculate claimable amounts for each holder
+        for (uint256 i = 0; i < holders.length; i++) {
+            address holder = holders[i];
+            uint256 balance = BondToken(payment.bondToken).balanceOf(holder);
+
+            if (balance > 0) {
+                uint256 claimAmount = (balance * payment.amountPerToken) / 1e18;
+                claimableAmount[paymentId][holder] = claimAmount;
+                claimableBalance[holder][payment.paymentToken] += claimAmount;
+            }
+        }
+
+        payment.isDistributed = true;
+        payment.holders = holders;
+
+        emit CouponDistributed(paymentId);
+    }
+
+    /**
+     * @dev Claim coupon payment
+     */
+    function claimCoupon(uint256 paymentId) external nonReentrant {
+        CouponPayment storage payment = couponPayments[paymentId];
+
+        require(payment.isDistributed, "Not yet distributed");
+        require(!hasClaimed[paymentId][msg.sender], "Already claimed");
+
+        uint256 claimAmount = claimableAmount[paymentId][msg.sender];
+        require(claimAmount > 0, "No claimable amount");
+
+        hasClaimed[paymentId][msg.sender] = true;
+        claimableBalance[msg.sender][payment.paymentToken] -= claimAmount;
+
+        require(
+            IERC20(payment.paymentToken).transfer(msg.sender, claimAmount),
+            "Claim transfer failed"
+        );
+
+        emit CouponClaimed(paymentId, msg.sender, claimAmount);
+    }
+
+    /**
+     * @dev Batch claim multiple coupons
+     */
+    function batchClaimCoupons(uint256[] calldata paymentIds) external nonReentrant {
+        for (uint256 i = 0; i < paymentIds.length; i++) {
+            uint256 paymentId = paymentIds[i];
+            CouponPayment storage payment = couponPayments[paymentId];
+
+            if (payment.isDistributed &&
+                !hasClaimed[paymentId][msg.sender] &&
+                claimableAmount[paymentId][msg.sender] > 0) {
+
+                uint256 claimAmount = claimableAmount[paymentId][msg.sender];
+                hasClaimed[paymentId][msg.sender] = true;
+                claimableBalance[msg.sender][payment.paymentToken] -= claimAmount;
+
+                require(
+                    IERC20(payment.paymentToken).transfer(msg.sender, claimAmount),
+                    "Claim transfer failed"
+                );
+
+                emit CouponClaimed(paymentId, msg.sender, claimAmount);
+            }
+        }
+    }
+
+    /**
+     * @dev Get claimable amount for user and payment
+     */
+    function getClaimableAmount(uint256 paymentId, address user)
+        external
+        view
+        returns (uint256)
+    {
+        return claimableAmount[paymentId][user];
+    }
+
+    /**
+     * @dev Check if user has claimed payment
+     */
+    function hasClaimedPayment(uint256 paymentId, address user)
+        external
+        view
+        returns (bool)
+    {
+        return hasClaimed[paymentId][user];
+    }
+}
+```
+
+### 2.6 BondRegistry Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+
+/**
+ * @title BondRegistry
+ * @dev Central registry for all bond tokens in the system
+ */
+contract BondRegistry is AccessControl {
+
+    bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
+
+    struct RegisteredBond {
+        address bondToken;
+        string isin;
+        string name;
+        string symbol;
+        address issuer;
+        address custodian;
+        uint256 registrationDate;
+        bool isActive;
+        string metadata; // IPFS hash
+    }
+
+    // State
+    mapping(address => RegisteredBond) public bonds;
+    mapping(string => address) public isinToBond; // ISIN => bond token address
+    address[] public allBonds;
+
+    // Events
+    event BondRegistered(address indexed bondToken, string isin, address indexed issuer);
+    event BondDeactivated(address indexed bondToken);
+    event BondUpdated(address indexed bondToken);
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(REGISTRAR_ROLE, msg.sender);
+    }
+
+    /**
+     * @dev Register new bond token
+     */
+    function registerBond(
+        address bondToken,
+        string memory isin,
+        string memory name,
+        string memory symbol,
+        address issuer,
+        address custodian,
+        string memory metadata
+    ) external onlyRole(REGISTRAR_ROLE) {
+        require(bonds[bondToken].bondToken == address(0), "Already registered");
+        require(isinToBond[isin] == address(0), "ISIN already exists");
+
+        bonds[bondToken] = RegisteredBond({
+            bondToken: bondToken,
+            isin: isin,
+            name: name,
+            symbol: symbol,
+            issuer: issuer,
+            custodian: custodian,
+            registrationDate: block.timestamp,
+            isActive: true,
+            metadata: metadata
+        });
+
+        isinToBond[isin] = bondToken;
+        allBonds.push(bondToken);
+
+        emit BondRegistered(bondToken, isin, issuer);
+    }
+
+    /**
+     * @dev Deactivate bond
+     */
+    function deactivateBond(address bondToken) external onlyRole(REGISTRAR_ROLE) {
+        require(bonds[bondToken].isActive, "Not active");
+        bonds[bondToken].isActive = false;
+        emit BondDeactivated(bondToken);
+    }
+
+    /**
+     * @dev Get bond by ISIN
+     */
+    function getBondByISIN(string memory isin) external view returns (address) {
+        return isinToBond[isin];
+    }
+
+    /**
+     * @dev Get all active bonds
+     */
+    function getActiveBonds() external view returns (address[] memory) {
+        uint256 activeCount = 0;
+        for (uint256 i = 0; i < allBonds.length; i++) {
+            if (bonds[allBonds[i]].isActive) {
+                activeCount++;
+            }
+        }
+
+        address[] memory activeBonds = new address[](activeCount);
+        uint256 index = 0;
+        for (uint256 i = 0; i < allBonds.length; i++) {
+            if (bonds[allBonds[i]].isActive) {
+                activeBonds[index] = allBonds[i];
+                index++;
+            }
+        }
+
+        return activeBonds;
+    }
+
+    /**
+     * @dev Get total registered bonds count
+     */
+    function getTotalBonds() external view returns (uint256) {
+        return allBonds.length;
+    }
+}
+```
+
+### 2.7 GovernanceModule Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+/**
+ * @title GovernanceModule
+ * @dev Multi-sig governance for critical operations
+ */
+contract GovernanceModule {
+
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        bytes32 operationType;     // Hash of operation type
+        bytes callData;            // Encoded function call
+        address target;            // Contract to call
+        uint256 value;             // ETH value
+        uint256 createdAt;
+        uint256 executionTime;     // Timelock expiry
+        uint256 approvals;
+        bool executed;
+        bool cancelled;
+    }
+
+    // Configuration
+    address[] public governors;
+    mapping(address => bool) public isGovernor;
+    uint256 public requiredApprovals;
+    uint256 public timelockPeriod = 2 days;
+
+    // State
+    uint256 public nextProposalId;
+    mapping(uint256 => Proposal) public proposals;
+    mapping(uint256 => mapping(address => bool)) public hasApproved;
+
+    // Events
+    event ProposalCreated(
+        uint256 indexed proposalId,
+        address indexed proposer,
+        address target,
+        bytes32 operationType
+    );
+    event ProposalApproved(uint256 indexed proposalId, address indexed governor);
+    event ProposalExecuted(uint256 indexed proposalId);
+    event ProposalCancelled(uint256 indexed proposalId);
+
+    modifier onlyGovernor() {
+        require(isGovernor[msg.sender], "Not a governor");
+        _;
+    }
+
+    constructor(
+        address[] memory governors_,
+        uint256 requiredApprovals_
+    ) {
+        require(governors_.length >= requiredApprovals_, "Invalid threshold");
+
+        governors = governors_;
+        requiredApprovals = requiredApprovals_;
+
+        for (uint256 i = 0; i < governors_.length; i++) {
+            isGovernor[governors_[i]] = true;
+        }
+    }
+
+    /**
+     * @dev Create governance proposal
+     */
+    function createProposal(
+        address target,
+        bytes32 operationType,
+        bytes memory callData,
+        uint256 value
+    ) external onlyGovernor returns (uint256) {
+        uint256 proposalId = nextProposalId++;
+
+        proposals[proposalId] = Proposal({
+            id: proposalId,
+            proposer: msg.sender,
+            target: target,
+            operationType: operationType,
+            callData: callData,
+            value: value,
+            createdAt: block.timestamp,
+            executionTime: block.timestamp + timelockPeriod,
+            approvals: 1,
+            executed: false,
+            cancelled: false
+        });
+
+        hasApproved[proposalId][msg.sender] = true;
+
+        emit ProposalCreated(proposalId, msg.sender, target, operationType);
+        emit ProposalApproved(proposalId, msg.sender);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Approve proposal
+     */
+    function approveProposal(uint256 proposalId) external onlyGovernor {
+        Proposal storage proposal = proposals[proposalId];
+
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Cancelled");
+        require(!hasApproved[proposalId][msg.sender], "Already approved");
+
+        hasApproved[proposalId][msg.sender] = true;
+        proposal.approvals++;
+
+        emit ProposalApproved(proposalId, msg.sender);
+    }
+
+    /**
+     * @dev Execute approved proposal after timelock
+     */
+    function executeProposal(uint256 proposalId) external onlyGovernor {
+        Proposal storage proposal = proposals[proposalId];
+
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Cancelled");
+        require(proposal.approvals >= requiredApprovals, "Insufficient approvals");
+        require(block.timestamp >= proposal.executionTime, "Timelock active");
+
+        proposal.executed = true;
+
+        // Execute call
+        (bool success, ) = proposal.target.call{value: proposal.value}(
+            proposal.callData
+        );
+        require(success, "Execution failed");
+
+        emit ProposalExecuted(proposalId);
+    }
+
+    /**
+     * @dev Cancel proposal
+     */
+    function cancelProposal(uint256 proposalId) external onlyGovernor {
+        Proposal storage proposal = proposals[proposalId];
+
+        require(!proposal.executed, "Already executed");
+        require(!proposal.cancelled, "Already cancelled");
+
+        proposal.cancelled = true;
+
+        emit ProposalCancelled(proposalId);
+    }
+}
+```
+
+---
+
+## 3. Custody & Bridge Layer
+
+### 3.1 Architecture Overview
+
+```
+Traditional Bond Custody System
+         │
+         │ API Integration
+         ▼
+┌─────────────────────────────────┐
+│   Custodian Interface Service   │
+│  ┌──────────────────────────┐   │
+│  │  - Deposit Verification  │   │
+│  │  - Withdrawal Processing │   │
+│  │  - Collateral Tracking   │   │
+│  │  - Audit Trail          │   │
+│  └──────────────────────────┘   │
+└─────────────────────────────────┘
+         │
+         │ Authenticated API
+         ▼
+┌─────────────────────────────────┐
+│   Bridge Orchestrator Service   │
+│  ┌──────────────────────────┐   │
+│  │  - Request Queue         │   │
+│  │  - Status Tracking       │   │
+│  │  - Proof Verification    │   │
+│  │  - Event Monitoring      │   │
+│  └──────────────────────────┘   │
+└─────────────────────────────────┘
+         │
+         │ Web3 Provider
+         ▼
+┌─────────────────────────────────┐
+│   CustodyBridge Smart Contract  │
+└─────────────────────────────────┘
+```
+
+### 3.2 Custodian Integration Specification
+
+**Requirements for Custodian Partners:**
+
+1. **API Capabilities:**
+   - Receive deposit notifications
+   - Confirm custody of bonds
+   - Process withdrawal requests
+   - Provide real-time balance verification
+   - Submit audit proofs
+
+2. **Security Requirements:**
+   - API authentication via OAuth 2.0 or API keys
+   - TLS 1.3 for all communications
+   - IP whitelisting
+   - Rate limiting
+   - Request signing with HMAC-SHA256
+
+3. **Data Format:**
+```json
+{
+  "depositNotification": {
+    "requestId": "string (UUID)",
+    "bondIdentifier": "string (ISIN/CUSIP)",
+    "quantity": "number",
+    "depositor": {
+      "name": "string",
+      "accountNumber": "string",
+      "kycReference": "string"
+    },
+    "expectedSettlementDate": "ISO 8601 timestamp",
+    "proofDocuments": ["IPFS hash array"]
+  },
+
+  "depositConfirmation": {
+    "requestId": "string (UUID)",
+    "custodyReference": "string",
+    "confirmationDate": "ISO 8601 timestamp",
+    "bondDetails": {
+      "isin": "string",
+      "cusip": "string",
+      "quantity": "number",
+      "certificateNumbers": ["string array"]
+    },
+    "custodianSignature": "bytes (digital signature)"
+  },
+
+  "withdrawalRequest": {
+    "requestId": "string (UUID)",
+    "bondIdentifier": "string",
+    "quantity": "number",
+    "recipient": {
+      "name": "string",
+      "accountNumber": "string",
+      "deliveryInstructions": "string"
+    }
+  },
+
+  "balanceVerification": {
+    "bondIdentifier": "string",
+    "totalHoldings": "number",
+    "availableForWithdrawal": "number",
+    "pledgedCollateral": "number",
+    "timestamp": "ISO 8601 timestamp",
+    "auditHash": "bytes32"
+  }
+}
+```
+
+### 3.3 Bridge Service Implementation
+
+**Technology Stack:**
+- Node.js + TypeScript
+- PostgreSQL (request tracking)
+- Redis (caching & queuing)
+- Bull (job queue)
+- Ethers.js v6 (blockchain interaction)
+
+**Key Components:**
+
+```typescript
+// bridge-service/src/types/custody.ts
+
+export enum RequestType {
+  DEPOSIT = 'DEPOSIT',
+  WITHDRAWAL = 'WITHDRAWAL'
+}
+
+export enum RequestStatus {
+  PENDING = 'PENDING',
+  VERIFIED = 'VERIFIED',
+  COMPLETED = 'COMPLETED',
+  REJECTED = 'REJECTED',
+  CANCELLED = 'CANCELLED'
+}
+
+export interface CustodyRequest {
+  requestId: string;
+  requestType: RequestType;
+  bondIdentifier: string;
+  quantity: number;
+  requesterAddress: string;
+  custodianId: string;
+  status: RequestStatus;
+  createdAt: Date;
+  updatedAt: Date;
+  custodyReference?: string;
+  proofDocuments?: string[];
+  metadata: Record<string, any>;
+}
+
+export interface CustodianConfig {
+  custodianId: string;
+  name: string;
+  apiEndpoint: string;
+  apiKey: string;
+  publicKey: string; // For signature verification
+  supportedBondTypes: string[];
+  minProcessingTime: number; // milliseconds
+  maxProcessingTime: number;
+}
+```
+
+---
+
+## 4. Oracle Integration
+
+### 4.1 Oracle Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Oracle Data Sources                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  Bloomberg   │  │   Reuters    │  │  Bond Market │  │
+│  │  Terminal    │  │   Eikon      │  │  Data APIs   │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              Chainlink External Adapter                  │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  - Data Aggregation                              │   │
+│  │  - Price Feed Normalization                      │   │
+│  │  - Yield Curve Calculation                       │   │
+│  │  - Credit Rating Updates                         │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              Chainlink Oracle Network                    │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  - Multiple Node Operators                       │   │
+│  │  - Data Aggregation                              │   │
+│  │  - Deviation Threshold: 0.5%                     │   │
+│  │  - Heartbeat: 1 hour                             │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│           On-Chain Price Feed Contracts                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  Bond Price  │  │  Yield Curve │  │ Credit Rating│  │
+│  │  Aggregator  │  │  Aggregator  │  │  Aggregator  │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              BTTB Smart Contracts                        │
+│         (BondToken, ConversionEngine, etc.)              │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Required Oracle Feeds
+
+| Data Type | Update Frequency | Deviation Threshold | Source Priority |
+|-----------|------------------|---------------------|-----------------|
+| Bond Prices | 1 hour | 0.5% | Bloomberg → Reuters → Backup |
+| Treasury Yield Curve | 1 hour | 5 bps | Fed Reserve → Bloomberg |
+| Corporate Bond Yields | 4 hours | 10 bps | Bloomberg → Reuters |
+| Credit Ratings | Event-driven | N/A | S&P → Moody's → Fitch |
+| Crypto Prices (USDC/USDT) | 30 seconds | 0.1% | Chainlink Standard Feeds |
+
+### 4.3 BondPriceOracle Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "@chainlink/contracts/src/v0.8/shared/access/ConfirmedOwner.sol";
+
+/**
+ * @title BondPriceOracle
+ * @dev Chainlink oracle for bond pricing data
+ */
+contract BondPriceOracle is ChainlinkClient, ConfirmedOwner {
+    using Chainlink for Chainlink.Request;
+
+    struct BondPrice {
+        uint256 price;           // Price in 18 decimals
+        uint256 yield;           // Yield in basis points
+        uint256 timestamp;
+        uint8 rating;            // Numeric rating score
+        bool isValid;
+    }
+
+    // State
+    mapping(string => BondPrice) public bondPrices; // ISIN => Price data
+    mapping(bytes32 => string) public requestIdToISIN;
+
+    // Chainlink configuration
+    uint256 private fee;
+    bytes32 private jobId;
+
+    // Events
+    event BondPriceRequested(string indexed isin, bytes32 indexed requestId);
+    event BondPriceUpdated(string indexed isin, uint256 price, uint256 yieldValue);
+
+    constructor(
+        address linkToken,
+        bytes32 jobId_,
+        uint256 fee_
+    ) ConfirmedOwner(msg.sender) {
+        _setChainlinkToken(linkToken);
+        jobId = jobId_;
+        fee = fee_;
+    }
+
+    /**
+     * @dev Request bond price update from oracle
+     */
+    function requestBondPrice(string memory isin, address oracle) public returns (bytes32) {
+        Chainlink.Request memory req = _buildChainlinkRequest(
+            jobId,
+            address(this),
+            this.fulfillBondPrice.selector
+        );
+
+        req._add("isin", isin);
+        req._add("dataType", "price");
+
+        bytes32 requestId = _sendChainlinkRequestTo(oracle, req, fee);
+        requestIdToISIN[requestId] = isin;
+
+        emit BondPriceRequested(isin, requestId);
+
+        return requestId;
+    }
+
+    /**
+     * @dev Callback function for Chainlink oracle
+     */
+    function fulfillBondPrice(
+        bytes32 requestId,
+        uint256 price,
+        uint256 yieldValue,
+        uint8 rating
+    ) public recordChainlinkFulfillment(requestId) {
+        string memory isin = requestIdToISIN[requestId];
+
+        bondPrices[isin] = BondPrice({
+            price: price,
+            yield: yieldValue,
+            timestamp: block.timestamp,
+            rating: rating,
+            isValid: true
+        });
+
+        emit BondPriceUpdated(isin, price, yieldValue);
+    }
+
+    /**
+     * @dev Get bond price (AggregatorV3Interface compatible)
+     */
+    function latestRoundData(string memory isin)
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        )
+    {
+        BondPrice memory bondPrice = bondPrices[isin];
+        require(bondPrice.isValid, "No data available");
+
+        return (
+            0, // roundId not used
+            int256(bondPrice.price),
+            bondPrice.timestamp,
+            bondPrice.timestamp,
+            0 // answeredInRound not used
+        );
+    }
+
+    /**
+     * @dev Get complete bond data
+     */
+    function getBondData(string memory isin)
+        external
+        view
+        returns (BondPrice memory)
+    {
+        require(bondPrices[isin].isValid, "No data available");
+        return bondPrices[isin];
+    }
+
+    /**
+     * @dev Check if price is stale (older than 24 hours)
+     */
+    function isPriceStale(string memory isin) public view returns (bool) {
+        if (!bondPrices[isin].isValid) return true;
+        return block.timestamp - bondPrices[isin].timestamp > 24 hours;
+    }
+
+    /**
+     * @dev Withdraw LINK tokens
+     */
+    function withdrawLink() external onlyOwner {
+        LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
+        require(
+            link.transfer(msg.sender, link.balanceOf(address(this))),
+            "Unable to transfer"
+        );
+    }
+}
+```
+
+---
+
+## 5. Cross-Chain Messaging
+
+### 5.1 LayerZero Integration
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import {OApp, Origin, MessagingFee} from "@layerzerolabs/oapp-evm/contracts/oapp/OApp.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+
+/**
+ * @title CrossChainBondBridge
+ * @dev Enables cross-chain bond token transfers via LayerZero V2
+ */
+contract CrossChainBondBridge is OApp {
+
+    // Packet types
+    uint16 public constant PT_SEND = 0;
+
+    struct CrossChainTransfer {
+        address from;
+        address to;
+        uint256 amount;
+        address bondToken;
+    }
+
+    // Mappings
+    mapping(address => mapping(uint32 => address)) public trustedRemoteLookup; // bondToken => eid => remote address
+    mapping(bytes32 => bool) public processedMessages;
+
+    // Events
+    event SendToChain(
+        uint32 indexed dstEid,
+        address indexed from,
+        bytes indexed toAddress,
+        uint256 amount
+    );
+    event ReceiveFromChain(
+        uint32 indexed srcEid,
+        address indexed to,
+        uint256 amount
+    );
+
+    constructor(address endpoint, address owner) OApp(endpoint, owner) Ownable(owner) {}
+
+    /**
+     * @dev Send bond tokens to another chain
+     */
+    function sendBondCrossChain(
+        address bondToken,
+        uint32 dstEid,
+        address toAddress,
+        uint256 amount,
+        bytes calldata options
+    ) external payable returns (MessagingFee memory fee) {
+        require(amount > 0, "Invalid amount");
+        require(
+            trustedRemoteLookup[bondToken][dstEid] != address(0),
+            "Destination not supported"
+        );
+
+        // Burn tokens on source chain
+        BondToken(bondToken).burn(msg.sender, amount);
+
+        // Encode payload
+        bytes memory payload = abi.encode(
+            PT_SEND,
+            msg.sender,
+            toAddress,
+            amount,
+            bondToken
+        );
+
+        // Send via LayerZero
+        fee = _lzSend(
+            dstEid,
+            payload,
+            options,
+            MessagingFee(msg.value, 0),
+            payable(msg.sender)
+        );
+
+        emit SendToChain(dstEid, msg.sender, abi.encodePacked(toAddress), amount);
+    }
+
+    /**
+     * @dev Internal function to handle incoming cross-chain messages
+     */
+    function _lzReceive(
+        Origin calldata origin,
+        bytes32 guid,
+        bytes calldata payload,
+        address /*executor*/,
+        bytes calldata /*extraData*/
+    ) internal override {
+        // Decode payload
+        (
+            uint16 packetType,
+            address from,
+            address to,
+            uint256 amount,
+            address bondToken
+        ) = abi.decode(payload, (uint16, address, address, uint256, address));
+
+        // Check if already processed (replay protection)
+        bytes32 messageHash = keccak256(
+            abi.encodePacked(origin.srcEid, origin.sender, guid)
+        );
+        require(!processedMessages[messageHash], "Already processed");
+        processedMessages[messageHash] = true;
+
+        // Mint tokens on destination chain
+        if (packetType == PT_SEND) {
+            BondToken(bondToken).mint(to, amount);
+            emit ReceiveFromChain(origin.srcEid, to, amount);
+        }
+    }
+
+    /**
+     * @dev Estimate cross-chain transfer fee
+     */
+    function quote(
+        uint32 dstEid,
+        address toAddress,
+        uint256 amount,
+        bytes calldata options,
+        bool payInLzToken
+    ) external view returns (MessagingFee memory fee) {
+        bytes memory payload = abi.encode(
+            PT_SEND,
+            msg.sender,
+            toAddress,
+            amount,
+            address(0) // placeholder
+        );
+
+        return _quote(dstEid, payload, options, payInLzToken);
+    }
+
+    /**
+     * @dev Set trusted remote bond token address for destination chain
+     */
+    function setTrustedRemote(
+        address bondToken,
+        uint32 remoteEid,
+        address remoteBondToken
+    ) external onlyOwner {
+        trustedRemoteLookup[bondToken][remoteEid] = remoteBondToken;
+    }
+}
+```
+
+---
+
+## 6. Security Architecture
+
+### 6.1 Security Layers
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    Application Layer Security               │
+│  • Input Validation                                         │
+│  • Rate Limiting                                            │
+│  • DDoS Protection (Cloudflare)                            │
+│  • API Authentication (OAuth 2.0 / JWT)                    │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────────┐
+│                  Smart Contract Security                    │
+│  • Access Control (Role-based)                             │
+│  • Reentrancy Guards                                       │
+│  • Pausable Functionality                                  │
+│  • Upgrade Mechanisms (Proxy Pattern)                      │
+│  • Emergency Shutdown                                       │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────────┐
+│                     Operational Security                    │
+│  • Multi-signature Wallets (Gnosis Safe)                   │
+│  • Timelocks for Critical Operations                       │
+│  • Oracle Price Deviation Checks                           │
+│  • Collateralization Monitoring                            │
+└────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────────┐
+│                  Infrastructure Security                    │
+│  • Key Management (AWS KMS / HashiCorp Vault)              │
+│  • Encrypted Communications (TLS 1.3)                      │
+│  • Database Encryption at Rest                             │
+│  • Network Segmentation                                     │
+│  • Regular Security Audits                                  │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. API Specifications
+
+### 7.1 REST API Endpoints
+
+**Base URL:** `https://api.bancafi.io/v1`
+
+**Authentication:** Bearer token (JWT)
+
+#### Bond Management
+
+```
+GET    /bonds                          # List all bonds
+GET    /bonds/:bondToken                # Get bond details
+GET    /bonds/:bondToken/metadata       # Get bond metadata
+GET    /bonds/:bondToken/holders        # Get bond token holders
+GET    /bonds/:bondToken/price          # Get current price
+GET    /bonds/:bondToken/yield          # Get current yield
+POST   /bonds/register                  # Register new bond (admin)
+```
+
+#### Custody & Bridge
+
+```
+POST   /custody/deposit                 # Create deposit request
+POST   /custody/withdraw                # Create withdrawal request
+GET    /custody/requests/:requestId     # Get request status
+GET    /custody/requests/user/:address  # Get user's requests
+GET    /custody/collateral/:bondToken   # Get collateralization status
+```
+
+#### Conversion
+
+```
+POST   /convert/quote                   # Get conversion quote
+POST   /convert/crypto-to-bond          # Convert crypto to bond
+POST   /convert/bond-to-crypto          # Convert bond to crypto
+GET    /convert/orders/:orderId         # Get order details
+GET    /convert/orders/user/:address    # Get user's orders
+GET    /convert/pairs                   # Get available conversion pairs
+```
+
+#### Coupon Payments
+
+```
+GET    /coupons/:bondToken              # Get coupon schedule
+GET    /coupons/:bondToken/upcoming     # Get upcoming payments
+GET    /coupons/claimable/:address      # Get claimable coupons
+POST   /coupons/claim                   # Claim coupon payment
+GET    /coupons/payment/:paymentId      # Get payment details
+```
+
+---
+
+## 8. Data Models
+
+### 8.1 Database Schema (PostgreSQL)
+
+```sql
+-- Users table
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_address VARCHAR(42) UNIQUE NOT NULL,
+    email VARCHAR(255),
+    kyc_status VARCHAR(20) DEFAULT 'PENDING',
+    kyc_provider_id VARCHAR(100),
+    kyc_verified_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    metadata JSONB
+);
+
+CREATE INDEX idx_users_wallet ON users(wallet_address);
+CREATE INDEX idx_users_kyc_status ON users(kyc_status);
+
+-- Bonds table
+CREATE TABLE bonds (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    bond_token_address VARCHAR(42) UNIQUE NOT NULL,
+    isin VARCHAR(12) UNIQUE,
+    cusip VARCHAR(9),
+    name VARCHAR(255) NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    bond_type VARCHAR(20) NOT NULL,
+    issuer_name VARCHAR(255),
+    issuer_address VARCHAR(42),
+    custodian_id VARCHAR(100),
+    face_value NUMERIC(20, 2),
+    coupon_rate NUMERIC(5, 2),
+    issue_date TIMESTAMP,
+    maturity_date TIMESTAMP,
+    frequency INTEGER,
+    rating VARCHAR(10),
+    jurisdiction VARCHAR(50),
+    document_hash VARCHAR(100),
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW(),
+    metadata JSONB
+);
+
+CREATE INDEX idx_bonds_token_address ON bonds(bond_token_address);
+CREATE INDEX idx_bonds_isin ON bonds(isin);
+```
+
+---
+
+## 9. Deployment Architecture
+
+**Infrastructure:** AWS / Kubernetes
+
+**CI/CD:** GitHub Actions
+
+**Monitoring:** Prometheus + Grafana
+
+**Logging:** ELK Stack
+
+---
+
+## 10. Monitoring & Observability
+
+**Key Metrics:**
+- API response times
+- Transaction success rates
+- Collateralization ratios
+- Oracle update frequency
+- Gas consumption
+
+**Alerting:**
+- PagerDuty for critical issues
+- Slack for warnings
+- Email for routine notifications
+
+---
+
+## Summary
+
+This technical architecture provides a complete blueprint for building BTTB with Solidity 0.8.25, including:
+
+✅ ERC-3643 compliant bond tokens
+✅ Custody bridge with multi-party verification
+✅ Chainlink oracle integration
+✅ LayerZero V2 cross-chain messaging
+✅ Multi-sig governance
+✅ Comprehensive security layers
+✅ Production-ready infrastructure
+
+Would you like me to expand on any specific section or provide additional implementation details?

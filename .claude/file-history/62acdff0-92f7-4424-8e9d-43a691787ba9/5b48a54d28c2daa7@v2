@@ -1,0 +1,283 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("🏢 BANCAFI INSTITUTIONAL ONBOARDING DEMO\n");
+  console.log("=".repeat(70));
+
+  // Contract address from deployment
+  const institutionalAddress = "0x99bbA657f2BbC93c02D617f8bA121cB8Fc104Acf";
+
+  const [deployer, bank, hedgeFund, familyOffice, pensionFund, verifier] = await ethers.getSigners();
+
+  console.log("👥 PARTICIPANTS:");
+  console.log("  Admin/Verifier:", deployer.address);
+  console.log("  Bank:", bank.address);
+  console.log("  Hedge Fund:", hedgeFund.address);
+  console.log("  Family Office:", familyOffice.address);
+  console.log("  Pension Fund:", pensionFund.address);
+  console.log("=".repeat(70) + "\n");
+
+  // Get contract instance
+  const institutional = await ethers.getContractAt("BancafiInstitutional", institutionalAddress);
+
+  console.log("PART 1: INSTITUTIONAL REGISTRATION\n");
+  console.log("=".repeat(70) + "\n");
+
+  // Register Bank
+  console.log("📋 STEP 1: Bank Registration");
+  await institutional.connect(bank).registerInstitution(
+    "Global Investment Bank",
+    "GIB-2024-001",
+    "United States",
+    0, // Bank
+    "ipfs://QmBankCompliance123",
+    true // Accredited investor
+  );
+  console.log("✅ Bank Registered!");
+  console.log("   Legal Name: Global Investment Bank");
+  console.log("   Registration #: GIB-2024-001");
+  console.log("   Type: Bank");
+  console.log("   Accredited: Yes\n");
+
+  // Register Hedge Fund
+  console.log("📋 STEP 2: Hedge Fund Registration");
+  await institutional.connect(hedgeFund).registerInstitution(
+    "Quantum Capital Hedge Fund",
+    "QC-HF-2024-042",
+    "Cayman Islands",
+    2, // HedgeFund
+    "ipfs://QmHedgeFundDocs456",
+    true
+  );
+  console.log("✅ Hedge Fund Registered!");
+  console.log("   Legal Name: Quantum Capital Hedge Fund");
+  console.log("   Registration #: QC-HF-2024-042");
+  console.log("   Type: Hedge Fund");
+  console.log("   Jurisdiction: Cayman Islands\n");
+
+  // Register Family Office
+  console.log("📋 STEP 3: Family Office Registration");
+  await institutional.connect(familyOffice).registerInstitution(
+    "Wellington Family Office",
+    "WFO-UK-2024-789",
+    "United Kingdom",
+    5, // FamilyOffice
+    "ipfs://QmFamilyOfficeDocs789",
+    true
+  );
+  console.log("✅ Family Office Registered!");
+  console.log("   Legal Name: Wellington Family Office");
+  console.log("   Type: Family Office\n");
+
+  // Register Pension Fund
+  console.log("📋 STEP 4: Pension Fund Registration");
+  await institutional.connect(pensionFund).registerInstitution(
+    "National Teachers Pension Fund",
+    "NTPF-CA-2024-555",
+    "Canada",
+    3, // PensionFund
+    "ipfs://QmPensionFundDocs555",
+    true
+  );
+  console.log("✅ Pension Fund Registered!");
+  console.log("   Legal Name: National Teachers Pension Fund");
+  console.log("   Type: Pension Fund\n");
+
+  console.log("\n\nPART 2: KYB DOCUMENT UPLOAD & VERIFICATION\n");
+  console.log("=".repeat(70) + "\n");
+
+  // Upload KYB documents for bank
+  console.log("📋 STEP 5: Bank Uploads KYB Documents");
+  const oneYear = Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60);
+
+  await institutional.connect(bank).uploadKYBDocument(
+    "Articles of Incorporation",
+    "ipfs://QmBankAOI123",
+    oneYear
+  );
+  console.log("✅ Document uploaded: Articles of Incorporation");
+
+  await institutional.connect(bank).uploadKYBDocument(
+    "Banking License",
+    "ipfs://QmBankLicense456",
+    oneYear
+  );
+  console.log("✅ Document uploaded: Banking License");
+
+  await institutional.connect(bank).uploadKYBDocument(
+    "Financial Statements 2024",
+    "ipfs://QmBankFinancials789",
+    oneYear
+  );
+  console.log("✅ Document uploaded: Financial Statements\n");
+
+  // Verify KYB documents
+  console.log("📋 STEP 6: Compliance Officer Verifies Documents");
+  await institutional.verifyKYBDocument(bank.address, "Articles of Incorporation");
+  console.log("✅ Verified: Articles of Incorporation");
+
+  await institutional.verifyKYBDocument(bank.address, "Banking License");
+  console.log("✅ Verified: Banking License");
+
+  await institutional.verifyKYBDocument(bank.address, "Financial Statements 2024");
+  console.log("✅ Verified: Financial Statements\n");
+
+  console.log("\n\nPART 3: INSTITUTION VERIFICATION & TIER ASSIGNMENT\n");
+  console.log("=".repeat(70) + "\n");
+
+  // Verify institutions with different tiers
+  console.log("📋 STEP 7: Approve and Assign Tiers");
+
+  // Bank - Premium Tier ($5M limit)
+  await institutional.verifyInstitution(
+    bank.address,
+    2, // Approved
+    1, // Premium tier
+    ethers.parseEther("5000000")
+  );
+  console.log("✅ Bank Approved - Premium Tier");
+  console.log("   Investment Limit: $5,000,000\n");
+
+  // Hedge Fund - Elite Tier ($50M limit)
+  await institutional.verifyInstitution(
+    hedgeFund.address,
+    2, // Approved
+    2, // Elite tier
+    ethers.parseEther("50000000")
+  );
+  console.log("✅ Hedge Fund Approved - Elite Tier");
+  console.log("   Investment Limit: $50,000,000\n");
+
+  // Family Office - Premium Tier ($8M limit)
+  await institutional.verifyInstitution(
+    familyOffice.address,
+    2, // Approved
+    1, // Premium tier
+    ethers.parseEther("8000000")
+  );
+  console.log("✅ Family Office Approved - Premium Tier");
+  console.log("   Investment Limit: $8,000,000\n");
+
+  // Pension Fund - Institutional Tier ($200M limit)
+  await institutional.verifyInstitution(
+    pensionFund.address,
+    2, // Approved
+    3, // Institutional tier
+    ethers.parseEther("200000000")
+  );
+  console.log("✅ Pension Fund Approved - Institutional Tier");
+  console.log("   Investment Limit: $200,000,000\n");
+
+  console.log("\n\nPART 4: AUTHORIZED SIGNERS & MULTISIG\n");
+  console.log("=".repeat(70) + "\n");
+
+  // Add authorized signers for hedge fund
+  console.log("📋 STEP 8: Hedge Fund Adds Authorized Signers");
+  const [signer1, signer2, signer3] = await ethers.getSigners();
+
+  await institutional.connect(hedgeFund).addAuthorizedSigner(signer1.address);
+  console.log("✅ Added signer 1:", signer1.address.substring(0, 10) + "...");
+
+  await institutional.connect(hedgeFund).addAuthorizedSigner(signer2.address);
+  console.log("✅ Added signer 2:", signer2.address.substring(0, 10) + "...");
+
+  await institutional.connect(hedgeFund).addAuthorizedSigner(signer3.address);
+  console.log("✅ Added signer 3:", signer3.address.substring(0, 10) + "...\n");
+
+  // Enable multisig
+  console.log("📋 STEP 9: Hedge Fund Enables Multisig (2-of-3)");
+  await institutional.connect(hedgeFund).enableMultisig(2);
+  console.log("✅ Multisig Enabled!");
+  console.log("   Required Signatures: 2 of 3\n");
+
+  console.log("\n\nPART 5: INVESTMENT TRACKING & TIER UPGRADES\n");
+  console.log("=".repeat(70) + "\n");
+
+  // Record investments
+  console.log("📋 STEP 10: Record Bank Investments");
+
+  // First investment - $2M
+  await institutional.recordInvestment(bank.address, ethers.parseEther("2000000"));
+  let bankData = await institutional.getInstitution(bank.address);
+  console.log("✅ Investment 1: $2,000,000");
+  console.log("   Total Invested:", ethers.formatEther(bankData.totalInvested));
+  console.log("   Tier:", ["Standard", "Premium", "Elite", "Institutional"][bankData.tier], "\n");
+
+  // Second investment - $4M (total $6M - should upgrade to Premium if not already)
+  await institutional.recordInvestment(bank.address, ethers.parseEther("4000000"));
+  bankData = await institutional.getInstitution(bank.address);
+  console.log("✅ Investment 2: $4,000,000");
+  console.log("   Total Invested:", ethers.formatEther(bankData.totalInvested));
+  console.log("   Tier:", ["Standard", "Premium", "Elite", "Institutional"][bankData.tier], "\n");
+
+  // Large pension fund investment - $150M
+  console.log("📋 STEP 11: Record Pension Fund Investment");
+  await institutional.recordInvestment(pensionFund.address, ethers.parseEther("150000000"));
+  let pensionData = await institutional.getInstitution(pensionFund.address);
+  console.log("✅ Investment: $150,000,000");
+  console.log("   Total Invested:", ethers.formatEther(pensionData.totalInvested));
+  console.log("   Tier:", ["Standard", "Premium", "Elite", "Institutional"][pensionData.tier]);
+  console.log("   Auto-upgraded to Institutional Tier\n");
+
+  console.log("\n\nPART 6: INSTITUTION STATISTICS & RESTRICTIONS\n");
+  console.log("=".repeat(70) + "\n");
+
+  // Display statistics
+  console.log("📊 SYSTEM STATISTICS:");
+  const totalInstitutions = await institutional.totalInstitutions();
+  const approvedInstitutions = await institutional.approvedInstitutions();
+  console.log("   Total Registered:", totalInstitutions.toString());
+  console.log("   Approved:", approvedInstitutions.toString());
+  console.log("   Pending:", (totalInstitutions - approvedInstitutions).toString(), "\n");
+
+  // Show restrictions for each tier
+  console.log("📊 HEDGE FUND DETAILS:");
+  const hfData = await institutional.getInstitution(hedgeFund.address);
+  const hfRestrictions = await institutional.getRestrictions(hedgeFund.address);
+  console.log("   Status:", ["Pending", "UnderReview", "Approved", "Rejected", "Suspended", "Revoked"][hfData.status]);
+  console.log("   Tier:", ["Standard", "Premium", "Elite", "Institutional"][hfData.tier]);
+  console.log("   Investment Limit:", ethers.formatEther(hfData.investmentLimit));
+  console.log("   Daily Limit:", ethers.formatEther(hfRestrictions.dailyLimit));
+  console.log("   Monthly Limit:", ethers.formatEther(hfRestrictions.monthlyLimit));
+  console.log("   Can Fractionalize:", hfRestrictions.canFractionalize);
+  console.log("   Can Receive Bailout:", hfRestrictions.canReceiveBailout);
+  console.log("   Can Propose:", hfRestrictions.canPropose);
+  console.log("   Multisig Required:", hfData.multisigRequired);
+  console.log("   Min Signatures:", hfData.minSignatures.toString(), "\n");
+
+  // Check authorization
+  console.log("📊 AUTHORIZATION CHECKS:");
+  const isApproved = await institutional.isApprovedInstitution(bank.address);
+  console.log("   Bank Approved:", isApproved);
+
+  const isSigner = await institutional.isAuthorizedSigner(hedgeFund.address, signer1.address);
+  console.log("   Signer 1 Authorized for Hedge Fund:", isSigner);
+
+  console.log("\n\n" + "=".repeat(70));
+  console.log("✅ INSTITUTIONAL ONBOARDING DEMO COMPLETE!");
+  console.log("=".repeat(70));
+
+  console.log("\n🎯 Features Demonstrated:");
+  console.log("  ✅ Multi-type institution registration (Bank, Hedge Fund, Family Office, Pension Fund)");
+  console.log("  ✅ KYB document upload and verification");
+  console.log("  ✅ Institution verification and approval");
+  console.log("  ✅ Tier-based investment limits");
+  console.log("  ✅ Authorized signer management");
+  console.log("  ✅ Multisig requirement configuration");
+  console.log("  ✅ Investment tracking and recording");
+  console.log("  ✅ Automatic tier upgrades based on investment volume");
+  console.log("  ✅ Tier-specific restrictions and permissions");
+
+  console.log("\n💡 Registered Institutions:");
+  console.log("  1. Global Investment Bank (Premium Tier) - $6M invested");
+  console.log("  2. Quantum Capital Hedge Fund (Elite Tier) - Multisig enabled");
+  console.log("  3. Wellington Family Office (Premium Tier)");
+  console.log("  4. National Teachers Pension Fund (Institutional Tier) - $150M invested");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

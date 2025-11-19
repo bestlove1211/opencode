@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IBancafiAssetToken {
+    function fractionalOwnership(uint256 tokenId, address owner) external view returns (uint256);
+    function assetMetadata(uint256 tokenId) external view returns (
+        uint8 assetType,
+        uint8 status,
+        uint256 valuation,
+        string memory location,
+        string memory legalDocumentHash,
+        address verifier,
+        uint256 createdAt,
+        uint256 lastUpdatedAt,
+        bool isFractionalized,
+        uint256 totalFractions
+    );
+}
+
+/**
+ * @title BancafiRentalIncome
+ * @notice Automated rental income distribution for fractionalized real estate
+ * @dev Distributes rental payments proportionally to fractional owners
+ */
+contract BancafiRentalIncome is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant INCOME_MANAGER_ROLE = keccak256("INCOME_MANAGER_ROLE");
+
+    struct RentalPeriod {
+        uint256 tokenId;
+        uint256 periodId;
+        uint256 totalIncome;
+        uint256 startDate;
+        uint256 endDate;
+        uint256 distributedAmount;
+        bool isDistributed;
+        address[] recipients;
+        mapping(address => uint256) distributions;
+        mapping(address => bool) claimed;
+    }
+
+    struct PropertyStats {
+        uint256 tokenId;
+        uint256 totalRentalIncome;
+        uint256 totalDistributed;
+        uint256 periodsCount;
+        uint256 lastDistributionDate;
+    }
+
+    IBancafiAssetToken public assetToken;
+
+    mapping(uint256 => uint256) public propertyPeriodCount; // tokenId => period count
+    mapping(uint256 => mapping(uint256 => RentalPeriod)) private rentalPeriods; // tokenId => periodId => RentalPeriod
+    mapping(uint256 => PropertyStats) public propertyStats;
+    mapping(address => uint256) public pendingWithdrawals;
+
+    event RentalIncomeReceived(
+        uint256 indexed tokenId,
+        uint256 indexed periodId,
+        uint256 amount,
+        uint256 startDate,
+        uint256 endDate,
+        uint256 timestamp
+    );
+
+    event IncomeDistributed(
+        uint256 indexed tokenId,
+        uint256 indexed periodId,
+        uint256 totalAmount,
+        uint256 recipientCount,
+        uint256 timestamp
+    );
+
+    event IncomeClaimed(
+        uint256 indexed tokenId,
+        uint256 indexed periodId,
+        address indexed recipient,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event WithdrawalProcessed(
+        address indexed recipient,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address assetTokenAddress_) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(INCOME_MANAGER_ROLE, msg.sender);
+
+        assetToken = IBancafiAssetToken(assetTokenAddress_);
+    }
+
+    /**
+     * @notice Receive rental income for a property
+     * @param tokenId_ Asset token ID
+     * @param startDate_ Period start date
+     * @param endDate_ Period end date
+     */
+    function receiveRentalIncome(
+        uint256 tokenId_,
+        uint256 startDate_,
+        uint256 endDate_
+    ) external payable whenNotPaused nonReentrant onlyRole(INCOME_MANAGER_ROLE) {
+        require(msg.value > 0, "Amount must be > 0");
+        require(endDate_ > startDate_, "Invalid dates");
+
+        propertyPeriodCount[tokenId_]++;
+        uint256 periodId = propertyPeriodCount[tokenId_];
+
+        RentalPeriod storage period = rentalPeriods[tokenId_][periodId];
+        period.tokenId = tokenId_;
+        period.periodId = periodId;
+        period.totalIncome = msg.value;
+        period.startDate = startDate_;
+        period.endDate = endDate_;
+        period.distributedAmount = 0;
+        period.isDistributed = false;
+
+        propertyStats[tokenId_].totalRentalIncome += msg.value;
+        propertyStats[tokenId_].periodsCount++;
+
+        emit RentalIncomeReceived(tokenId_, periodId, msg.value, startDate_, endDate_, block.timestamp);
+    }
+
+    /**
+     * @notice Distribute rental income to fractional owners
+     * @param tokenId_ Asset token ID
+     * @param periodId_ Period ID
+     * @param recipients_ Array of recipient addresses
+     */
+    function distributeIncome(
+        uint256 tokenId_,
+        uint256 periodId_,
+        address[] memory recipients_
+    ) external whenNotPaused nonReentrant onlyRole(INCOME_MANAGER_ROLE) {
+        RentalPeriod storage period = rentalPeriods[tokenId_][periodId_];
+        require(!period.isDistributed, "Already distributed");
+        require(period.totalIncome > 0, "No income");
+
+        (, , , , , , , , bool isFractionalized, uint256 totalFractions) = assetToken.assetMetadata(tokenId_);
+        require(isFractionalized, "Not fractionalized");
+
+        period.recipients = recipients_;
+        uint256 distributedTotal = 0;
+
+        for (uint256 i = 0; i < recipients_.length; i++) {
+            address recipient = recipients_[i];
+            uint256 fractions = assetToken.fractionalOwnership(tokenId_, recipient);
+
+            if (fractions > 0) {
+                uint256 share = (period.totalIncome * fractions) / totalFractions;
+                period.distributions[recipient] = share;
+                pendingWithdrawals[recipient] += share;
+                distributedTotal += share;
+            }
+        }
+
+        period.distributedAmount = distributedTotal;
+        period.isDistributed = true;
+
+        propertyStats[tokenId_].totalDistributed += distributedTotal;
+        propertyStats[tokenId_].lastDistributionDate = block.timestamp;
+
+        emit IncomeDistributed(tokenId_, periodId_, distributedTotal, recipients_.length, block.timestamp);
+    }
+
+    /**
+     * @notice Claim rental income for a specific period
+     * @param tokenId_ Asset token ID
+     * @param periodId_ Period ID
+     */
+    function claimIncome(
+        uint256 tokenId_,
+        uint256 periodId_
+    ) external whenNotPaused nonReentrant {
+        RentalPeriod storage period = rentalPeriods[tokenId_][periodId_];
+        require(period.isDistributed, "Not distributed");
+        require(!period.claimed[msg.sender], "Already claimed");
+
+        uint256 amount = period.distributions[msg.sender];
+        require(amount > 0, "No income");
+
+        period.claimed[msg.sender] = true;
+        pendingWithdrawals[msg.sender] -= amount;
+
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+
+        emit IncomeClaimed(tokenId_, periodId_, msg.sender, amount, block.timestamp);
+    }
+
+    /**
+     * @notice Withdraw all pending income
+     */
+    function withdrawAll() external whenNotPaused nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "No pending withdrawals");
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+
+        emit WithdrawalProcessed(msg.sender, amount, block.timestamp);
+    }
+
+    /**
+     * @notice Get rental period details
+     */
+    function getRentalPeriod(uint256 tokenId_, uint256 periodId_)
+        external
+        view
+        returns (
+            uint256 totalIncome,
+            uint256 startDate,
+            uint256 endDate,
+            uint256 distributedAmount,
+            bool isDistributed,
+            uint256 recipientCount
+        )
+    {
+        RentalPeriod storage period = rentalPeriods[tokenId_][periodId_];
+        return (
+            period.totalIncome,
+            period.startDate,
+            period.endDate,
+            period.distributedAmount,
+            period.isDistributed,
+            period.recipients.length
+        );
+    }
+
+    /**
+     * @notice Get user's distribution for a period
+     */
+    function getUserDistribution(
+        uint256 tokenId_,
+        uint256 periodId_,
+        address user_
+    ) external view returns (uint256 amount, bool claimed) {
+        RentalPeriod storage period = rentalPeriods[tokenId_][periodId_];
+        return (period.distributions[user_], period.claimed[user_]);
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+
+    receive() external payable {}
+}

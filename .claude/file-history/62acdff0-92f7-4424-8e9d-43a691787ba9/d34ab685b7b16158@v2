@@ -1,0 +1,134 @@
+const express = require('express');
+const router = express.Router();
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+// GET /api/bailouts/:requestId
+router.get('/:requestId', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const request = await blockchain.contracts.bailout.bailoutRequests(requestId);
+
+    res.json({
+      requestId: parseInt(requestId),
+      borrower: request.borrower,
+      amount: ethers.formatEther(request.amount),
+      reason: request.reason,
+      solvencyProof: request.solvencyProof,
+      collateralTokenId: Number(request.collateralTokenId),
+      status: Number(request.status),
+      statusName: getStatusName(Number(request.status)),
+      interestRate: Number(request.interestRate),
+      repaymentMonths: Number(request.repaymentMonths),
+      requestedAt: Number(request.requestedAt),
+      approvedAt: Number(request.approvedAt),
+      disbursedAt: Number(request.disbursedAt)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/bailouts/request
+router.post('/request', async (req, res) => {
+  try {
+    const { amount, reason, solvencyProof, collateralTokenId, repaymentMonths, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('bailout', privateKey);
+
+    const tx = await contract.requestBailout(
+      ethers.parseEther(amount),
+      reason,
+      solvencyProof,
+      collateralTokenId,
+      repaymentMonths
+    );
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/bailouts/:requestId/approve
+router.post('/:requestId/approve', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { interestRate, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('bailout', privateKey);
+
+    const tx = await contract.approveBailout(requestId, interestRate);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/bailouts/:requestId/repay
+router.post('/:requestId/repay', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { amount, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('bailout', privateKey);
+
+    const tx = await contract.repayBailout(requestId, {
+      value: ethers.parseEther(amount)
+    });
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/bailouts/treasury/balance
+router.get('/treasury/balance', async (req, res) => {
+  try {
+    const balance = await blockchain.contracts.bailout.treasuryBalance();
+
+    res.json({
+      balance: ethers.formatEther(balance)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function getStatusName(status) {
+  const statuses = ['Pending', 'Approved', 'Disbursed', 'Repaid', 'Defaulted'];
+  return statuses[status] || 'Unknown';
+}
+
+module.exports = router;

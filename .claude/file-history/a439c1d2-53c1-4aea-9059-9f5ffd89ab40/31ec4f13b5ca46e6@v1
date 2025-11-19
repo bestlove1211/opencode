@@ -1,0 +1,668 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+/**
+ * @title BancafiCompliance
+ * @notice KYC/KYB compliance, blacklisting, and slashing system for Bancafi Credit
+ * @dev Central compliance hub for all platform participants
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiCompliance is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    // ============ Roles ============
+
+    bytes32 public constant COMPLIANCE_OFFICER_ROLE = keccak256("COMPLIANCE_OFFICER_ROLE");
+    bytes32 public constant KYC_VERIFIER_ROLE = keccak256("KYC_VERIFIER_ROLE");
+    bytes32 public constant SLASHING_ADMIN_ROLE = keccak256("SLASHING_ADMIN_ROLE");
+
+    // ============ Enums ============
+
+    enum VerificationLevel {
+        None,           // Not verified
+        Basic,          // Basic KYC (individual)
+        Enhanced,       // Enhanced KYC (high-value individual)
+        Business,       // KYB (business entity)
+        Institutional   // Full institutional verification
+    }
+
+    enum BlacklistReason {
+        None,
+        Fraud,
+        MoneyLaundering,
+        SanctionedEntity,
+        RepeatedDefaults,
+        SuspiciousActivity,
+        RegulatoryOrder,
+        Other
+    }
+
+    enum SlashingReason {
+        Default,
+        Fraud,
+        MarketManipulation,
+        OracleAttack,
+        ContractViolation,
+        Other
+    }
+
+    // ============ Structs ============
+
+    struct UserCompliance {
+        address user;
+        VerificationLevel verificationLevel;
+        bool isVerified;
+        bool isBlacklisted;
+        uint256 verifiedAt;
+        uint256 expiresAt;
+        string kycHash; // IPFS hash of KYC documents
+        string country;
+        bool isSanctioned;
+    }
+
+    struct BlacklistEntry {
+        address user;
+        BlacklistReason reason;
+        uint256 listedAt;
+        uint256 expiresAt; // 0 = permanent
+        string details;
+        address listedBy;
+        bool isPermanent;
+    }
+
+    struct SlashingEvent {
+        uint256 id;
+        address user;
+        uint256 amount;
+        SlashingReason reason;
+        uint256 timestamp;
+        address executedBy;
+        string details;
+        bool isExecuted;
+    }
+
+    struct ComplianceStats {
+        uint256 totalVerified;
+        uint256 totalBlacklisted;
+        uint256 totalSlashed;
+        uint256 totalSlashedAmount;
+    }
+
+    // ============ State Variables ============
+
+    mapping(address => UserCompliance) public userCompliance;
+    mapping(address => BlacklistEntry) public blacklist;
+    mapping(address => SlashingEvent[]) public userSlashings;
+    mapping(string => bool) public sanctionedCountries;
+    mapping(address => uint256) public slashedBalances;
+
+    uint256 public nextSlashingId;
+    uint256 public totalSlashedAmount;
+
+    // Verification requirements
+    uint256 public kycExpiryDuration; // KYC validity period
+    VerificationLevel public minVerificationLevel; // Minimum level for platform access
+
+    // Statistics
+    uint256 public totalVerified;
+    uint256 public totalBlacklisted;
+    uint256 public totalSlashed;
+
+    // Sanctioned countries (ISO codes)
+    string[] public sanctionedCountryList;
+
+    // ============ Events ============
+
+    event UserVerified(
+        address indexed user,
+        VerificationLevel level,
+        uint256 timestamp,
+        uint256 expiresAt
+    );
+
+    event VerificationRevoked(
+        address indexed user,
+        string reason,
+        uint256 timestamp
+    );
+
+    event VerificationExpired(
+        address indexed user,
+        uint256 timestamp
+    );
+
+    event UserBlacklisted(
+        address indexed user,
+        BlacklistReason reason,
+        bool isPermanent,
+        uint256 expiresAt,
+        address indexed listedBy
+    );
+
+    event UserRemovedFromBlacklist(
+        address indexed user,
+        address indexed removedBy,
+        uint256 timestamp
+    );
+
+    event UserSlashed(
+        uint256 indexed slashingId,
+        address indexed user,
+        uint256 amount,
+        SlashingReason reason,
+        address indexed executedBy
+    );
+
+    event SlashedFundsWithdrawn(
+        address indexed recipient,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event SanctionedCountryAdded(string countryCode);
+    event SanctionedCountryRemoved(string countryCode);
+
+    event KYCExpiryUpdated(uint256 oldDuration, uint256 newDuration);
+    event MinVerificationLevelUpdated(VerificationLevel oldLevel, VerificationLevel newLevel);
+
+    // ============ Modifiers ============
+
+    modifier onlyVerified() {
+        require(isUserVerified(msg.sender), "User not verified");
+        _;
+    }
+
+    modifier notBlacklisted(address user) {
+        require(!isBlacklisted(user), "User is blacklisted");
+        _;
+    }
+
+    modifier meetsMinLevel(address user) {
+        require(
+            uint8(userCompliance[user].verificationLevel) >= uint8(minVerificationLevel),
+            "Verification level insufficient"
+        );
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        uint256 _kycExpiryDuration,
+        VerificationLevel _minVerificationLevel
+    ) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(COMPLIANCE_OFFICER_ROLE, msg.sender);
+        _grantRole(KYC_VERIFIER_ROLE, msg.sender);
+        _grantRole(SLASHING_ADMIN_ROLE, msg.sender);
+
+        kycExpiryDuration = _kycExpiryDuration;
+        minVerificationLevel = _minVerificationLevel;
+        nextSlashingId = 1;
+    }
+
+    // ============ KYC/KYB Functions ============
+
+    /**
+     * @notice Verify user with KYC/KYB
+     * @param user User address
+     * @param level Verification level
+     * @param kycHash IPFS hash of KYC documents
+     * @param country User's country (ISO code)
+     */
+    function verifyUser(
+        address user,
+        VerificationLevel level,
+        string calldata kycHash,
+        string calldata country
+    ) external onlyRole(KYC_VERIFIER_ROLE) notBlacklisted(user) {
+        require(user != address(0), "Invalid user address");
+        require(level != VerificationLevel.None, "Invalid verification level");
+        require(!sanctionedCountries[country], "Country is sanctioned");
+
+        uint256 expiresAt = block.timestamp + kycExpiryDuration;
+
+        userCompliance[user] = UserCompliance({
+            user: user,
+            verificationLevel: level,
+            isVerified: true,
+            isBlacklisted: false,
+            verifiedAt: block.timestamp,
+            expiresAt: expiresAt,
+            kycHash: kycHash,
+            country: country,
+            isSanctioned: false
+        });
+
+        totalVerified++;
+
+        emit UserVerified(user, level, block.timestamp, expiresAt);
+    }
+
+    /**
+     * @notice Batch verify multiple users
+     * @param users Array of user addresses
+     * @param level Verification level for all users
+     * @param kycHashes Array of KYC hashes
+     * @param countries Array of country codes
+     */
+    function batchVerifyUsers(
+        address[] calldata users,
+        VerificationLevel level,
+        string[] calldata kycHashes,
+        string[] calldata countries
+    ) external onlyRole(KYC_VERIFIER_ROLE) {
+        require(
+            users.length == kycHashes.length && users.length == countries.length,
+            "Array length mismatch"
+        );
+
+        for (uint256 i = 0; i < users.length; i++) {
+            if (!isBlacklisted(users[i]) && !sanctionedCountries[countries[i]]) {
+                this.verifyUser(users[i], level, kycHashes[i], countries[i]);
+            }
+        }
+    }
+
+    /**
+     * @notice Revoke user verification
+     * @param user User address
+     * @param reason Revocation reason
+     */
+    function revokeVerification(
+        address user,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        require(userCompliance[user].isVerified, "User not verified");
+
+        userCompliance[user].isVerified = false;
+        userCompliance[user].verificationLevel = VerificationLevel.None;
+
+        if (totalVerified > 0) {
+            totalVerified--;
+        }
+
+        emit VerificationRevoked(user, reason, block.timestamp);
+    }
+
+    /**
+     * @notice Renew user verification
+     * @param user User address
+     * @param kycHash Updated KYC hash
+     */
+    function renewVerification(
+        address user,
+        string calldata kycHash
+    ) external onlyRole(KYC_VERIFIER_ROLE) {
+        UserCompliance storage compliance = userCompliance[user];
+        require(compliance.isVerified, "User not initially verified");
+        require(!isBlacklisted(user), "User is blacklisted");
+
+        compliance.verifiedAt = block.timestamp;
+        compliance.expiresAt = block.timestamp + kycExpiryDuration;
+        compliance.kycHash = kycHash;
+
+        emit UserVerified(user, compliance.verificationLevel, block.timestamp, compliance.expiresAt);
+    }
+
+    /**
+     * @notice Upgrade user verification level
+     * @param user User address
+     * @param newLevel New verification level
+     * @param kycHash Updated KYC hash
+     */
+    function upgradeVerificationLevel(
+        address user,
+        VerificationLevel newLevel,
+        string calldata kycHash
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        UserCompliance storage compliance = userCompliance[user];
+        require(compliance.isVerified, "User not verified");
+        require(uint8(newLevel) > uint8(compliance.verificationLevel), "Not an upgrade");
+
+        VerificationLevel oldLevel = compliance.verificationLevel;
+        compliance.verificationLevel = newLevel;
+        compliance.kycHash = kycHash;
+        compliance.verifiedAt = block.timestamp;
+        compliance.expiresAt = block.timestamp + kycExpiryDuration;
+
+        emit UserVerified(user, newLevel, block.timestamp, compliance.expiresAt);
+    }
+
+    // ============ Blacklist Functions ============
+
+    /**
+     * @notice Add user to blacklist
+     * @param user User address
+     * @param reason Blacklist reason
+     * @param duration Duration in seconds (0 = permanent)
+     * @param details Additional details
+     */
+    function addToBlacklist(
+        address user,
+        BlacklistReason reason,
+        uint256 duration,
+        string calldata details
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        require(user != address(0), "Invalid user address");
+        require(!isBlacklisted(user), "Already blacklisted");
+
+        bool isPermanent = duration == 0;
+        uint256 expiresAt = isPermanent ? 0 : block.timestamp + duration;
+
+        blacklist[user] = BlacklistEntry({
+            user: user,
+            reason: reason,
+            listedAt: block.timestamp,
+            expiresAt: expiresAt,
+            details: details,
+            listedBy: msg.sender,
+            isPermanent: isPermanent
+        });
+
+        if (userCompliance[user].isVerified) {
+            userCompliance[user].isBlacklisted = true;
+        }
+
+        totalBlacklisted++;
+
+        emit UserBlacklisted(user, reason, isPermanent, expiresAt, msg.sender);
+    }
+
+    /**
+     * @notice Remove user from blacklist
+     * @param user User address
+     */
+    function removeFromBlacklist(
+        address user
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        require(isBlacklisted(user), "User not blacklisted");
+
+        delete blacklist[user];
+
+        if (userCompliance[user].isVerified) {
+            userCompliance[user].isBlacklisted = false;
+        }
+
+        if (totalBlacklisted > 0) {
+            totalBlacklisted--;
+        }
+
+        emit UserRemovedFromBlacklist(user, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Batch blacklist multiple users
+     * @param users Array of user addresses
+     * @param reason Blacklist reason
+     * @param duration Duration for all users
+     * @param details Details
+     */
+    function batchBlacklist(
+        address[] calldata users,
+        BlacklistReason reason,
+        uint256 duration,
+        string calldata details
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        for (uint256 i = 0; i < users.length; i++) {
+            if (!isBlacklisted(users[i])) {
+                this.addToBlacklist(users[i], reason, duration, details);
+            }
+        }
+    }
+
+    // ============ Slashing Functions ============
+
+    /**
+     * @notice Slash user's collateral/stake for violations
+     * @param user User address
+     * @param amount Amount to slash
+     * @param reason Slashing reason
+     * @param details Additional details
+     * @return slashingId Slashing event ID
+     */
+    function slashUser(
+        address user,
+        uint256 amount,
+        SlashingReason reason,
+        string calldata details
+    ) external onlyRole(SLASHING_ADMIN_ROLE) returns (uint256) {
+        require(user != address(0), "Invalid user address");
+        require(amount > 0, "Amount must be positive");
+
+        uint256 slashingId = nextSlashingId++;
+
+        SlashingEvent memory slashing = SlashingEvent({
+            id: slashingId,
+            user: user,
+            amount: amount,
+            reason: reason,
+            timestamp: block.timestamp,
+            executedBy: msg.sender,
+            details: details,
+            isExecuted: true
+        });
+
+        userSlashings[user].push(slashing);
+
+        slashedBalances[user] += amount;
+        totalSlashedAmount += amount;
+        totalSlashed++;
+
+        emit UserSlashed(slashingId, user, amount, reason, msg.sender);
+
+        // Auto-blacklist for fraud
+        if (reason == SlashingReason.Fraud || reason == SlashingReason.MarketManipulation) {
+            if (!isBlacklisted(user)) {
+                this.addToBlacklist(user, BlacklistReason.Fraud, 0, "Auto-blacklisted due to slashing");
+            }
+        }
+
+        return slashingId;
+    }
+
+    /**
+     * @notice Withdraw slashed funds (admin)
+     * @param recipient Recipient address
+     * @param amount Amount to withdraw
+     */
+    function withdrawSlashedFunds(
+        address recipient,
+        uint256 amount
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(recipient != address(0), "Invalid recipient");
+        require(amount <= totalSlashedAmount, "Amount exceeds slashed funds");
+
+        totalSlashedAmount -= amount;
+
+        payable(recipient).transfer(amount);
+
+        emit SlashedFundsWithdrawn(recipient, amount, block.timestamp);
+    }
+
+    // ============ Sanction Management ============
+
+    /**
+     * @notice Add country to sanction list
+     * @param countryCode ISO country code
+     */
+    function addSanctionedCountry(string calldata countryCode) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        require(!sanctionedCountries[countryCode], "Country already sanctioned");
+
+        sanctionedCountries[countryCode] = true;
+        sanctionedCountryList.push(countryCode);
+
+        emit SanctionedCountryAdded(countryCode);
+    }
+
+    /**
+     * @notice Remove country from sanction list
+     * @param countryCode ISO country code
+     */
+    function removeSanctionedCountry(string calldata countryCode) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        require(sanctionedCountries[countryCode], "Country not sanctioned");
+
+        sanctionedCountries[countryCode] = false;
+
+        emit SanctionedCountryRemoved(countryCode);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Check if user is verified and not expired
+     * @param user User address
+     * @return Whether user has valid verification
+     */
+    function isUserVerified(address user) public view returns (bool) {
+        UserCompliance memory compliance = userCompliance[user];
+
+        if (!compliance.isVerified) return false;
+        if (compliance.isBlacklisted) return false;
+        if (block.timestamp > compliance.expiresAt) return false;
+
+        return true;
+    }
+
+    /**
+     * @notice Check if user is blacklisted
+     * @param user User address
+     * @return Whether user is blacklisted
+     */
+    function isBlacklisted(address user) public view returns (bool) {
+        BlacklistEntry memory entry = blacklist[user];
+
+        if (entry.listedAt == 0) return false;
+        if (entry.isPermanent) return true;
+        if (block.timestamp < entry.expiresAt) return true;
+
+        return false;
+    }
+
+    /**
+     * @notice Get user compliance info
+     * @param user User address
+     * @return UserCompliance struct
+     */
+    function getUserCompliance(address user) external view returns (UserCompliance memory) {
+        return userCompliance[user];
+    }
+
+    /**
+     * @notice Get user slashing history
+     * @param user User address
+     * @return Array of slashing events
+     */
+    function getUserSlashings(address user) external view returns (SlashingEvent[] memory) {
+        return userSlashings[user];
+    }
+
+    /**
+     * @notice Get blacklist entry
+     * @param user User address
+     * @return BlacklistEntry struct
+     */
+    function getBlacklistEntry(address user) external view returns (BlacklistEntry memory) {
+        return blacklist[user];
+    }
+
+    /**
+     * @notice Get sanctioned countries list
+     * @return Array of country codes
+     */
+    function getSanctionedCountries() external view returns (string[] memory) {
+        return sanctionedCountryList;
+    }
+
+    /**
+     * @notice Get compliance statistics
+     * @return ComplianceStats struct
+     */
+    function getComplianceStats() external view returns (ComplianceStats memory) {
+        return ComplianceStats({
+            totalVerified: totalVerified,
+            totalBlacklisted: totalBlacklisted,
+            totalSlashed: totalSlashed,
+            totalSlashedAmount: totalSlashedAmount
+        });
+    }
+
+    /**
+     * @notice Check if user meets minimum verification level
+     * @param user User address
+     * @return Whether user meets minimum level
+     */
+    function meetsMinimumLevel(address user) external view returns (bool) {
+        return uint8(userCompliance[user].verificationLevel) >= uint8(minVerificationLevel);
+    }
+
+    /**
+     * @notice Check if verification is expired
+     * @param user User address
+     * @return Whether verification is expired
+     */
+    function isVerificationExpired(address user) external view returns (bool) {
+        return block.timestamp > userCompliance[user].expiresAt;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update KYC expiry duration
+     * @param newDuration New duration in seconds
+     */
+    function updateKYCExpiry(uint256 newDuration) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newDuration > 0, "Invalid duration");
+
+        uint256 oldDuration = kycExpiryDuration;
+        kycExpiryDuration = newDuration;
+
+        emit KYCExpiryUpdated(oldDuration, newDuration);
+    }
+
+    /**
+     * @notice Update minimum verification level
+     * @param newLevel New minimum level
+     */
+    function updateMinVerificationLevel(
+        VerificationLevel newLevel
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        VerificationLevel oldLevel = minVerificationLevel;
+        minVerificationLevel = newLevel;
+
+        emit MinVerificationLevelUpdated(oldLevel, newLevel);
+    }
+
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+
+    receive() external payable {
+        // Accept slashed funds
+    }
+
+    uint256[50] private __gap;
+}

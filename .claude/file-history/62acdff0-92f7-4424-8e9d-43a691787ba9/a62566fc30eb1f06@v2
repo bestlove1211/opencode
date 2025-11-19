@@ -1,0 +1,89 @@
+const express = require('express');
+const router = express.Router();
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+// GET /api/dao/proposals/:proposalId
+router.get('/proposals/:proposalId', async (req, res) => {
+  try {
+    const { proposalId } = req.params;
+    const state = await blockchain.contracts.dao.state(proposalId);
+    const proposalData = await blockchain.contracts.dao.proposals(proposalId);
+
+    res.json({
+      proposalId,
+      state: Number(state),
+      stateName: getStateName(Number(state)),
+      proposer: proposalData.proposer,
+      title: proposalData.title,
+      createdAt: Number(proposalData.createdAt),
+      isBailoutProposal: proposalData.isBailoutProposal
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/dao/proposals
+router.post('/proposals', async (req, res) => {
+  try {
+    const { targets, values, calldatas, description, title, isBailoutProposal, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('dao', privateKey);
+
+    const tx = await contract.proposeWithMetadata(
+      targets,
+      values,
+      calldatas,
+      description,
+      title,
+      isBailoutProposal
+    );
+
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/dao/proposals/:proposalId/vote
+router.post('/proposals/:proposalId/vote', async (req, res) => {
+  try {
+    const { proposalId } = req.params;
+    const { support, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('dao', privateKey);
+
+    const tx = await contract.castVoteWithTimestamp(proposalId, support);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function getStateName(state) {
+  const states = ['Pending', 'Active', 'Canceled', 'Defeated', 'Succeeded', 'Queued', 'Expired', 'Executed'];
+  return states[state] || 'Unknown';
+}
+
+module.exports = router;

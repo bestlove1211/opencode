@@ -1,0 +1,510 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+import "../libraries/DataTypes.sol";
+import "../libraries/Errors.sol";
+import "../libraries/Events.sol";
+import "../libraries/DebtCalculations.sol";
+
+/**
+ * @title ReputationManager
+ * @notice Manages on-chain reputation scores for debtors and traders
+ * @dev Upgradeable contract for tracking payment history and reputation
+ */
+contract ReputationManager is
+    Initializable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    // ============ Constants ============
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    uint256 public constant MAX_REPUTATION_SCORE = 1000;
+    uint256 public constant MIN_REPUTATION_SCORE = 0;
+    uint256 public constant DEFAULT_REPUTATION_SCORE = 500;
+
+    // ============ State Variables ============
+
+    // User reputation data
+    mapping(address => DataTypes.ReputationData) private _reputationData;
+
+    // Slashing records
+    mapping(address => DataTypes.SlashingRecord[]) private _slashingHistory;
+
+    // Rehabilitation programs
+    mapping(address => uint256) private _rehabilitationEndDate;
+    mapping(address => bool) private _inRehabilitation;
+
+    // Reputation weights for different actions
+    uint256 public onTimePaymentWeight;
+    uint256 public latePaymentPenalty;
+    uint256 public defaultPenalty;
+    uint256 public successfulTradeBonu;
+    uint256 public disputePenalty;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the contract
+     * @param admin_ Admin address
+     */
+    function initialize(address admin_) public initializer {
+        if (admin_ == address(0)) revert Errors.ZeroAddress();
+
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(ADMIN_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, admin_);
+
+        // Set default weights (in basis points)
+        onTimePaymentWeight = 50;      // +5 points per on-time payment
+        latePaymentPenalty = 20;       // -2 points per late payment
+        defaultPenalty = 200;          // -20 points per default
+        successfulTradeBonu = 10;      // +1 point per successful trade
+        disputePenalty = 100;          // -10 points per dispute
+    }
+
+    // ============ Reputation Management Functions ============
+
+    /**
+     * @notice Initialize reputation for new user
+     * @param user User address
+     */
+    function initializeReputation(address user) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        if (data.lastUpdated == 0) {
+            data.score = DEFAULT_REPUTATION_SCORE;
+            data.lastUpdated = block.timestamp;
+
+            emit Events.ReputationScoreUpdated(user, 0, DEFAULT_REPUTATION_SCORE);
+        }
+    }
+
+    /**
+     * @notice Record an on-time payment
+     * @param user User address
+     * @param tokenId Debt token ID
+     */
+    function recordOnTimePayment(
+        address user,
+        uint256 tokenId
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.onTimePayments++;
+        data.totalDebts++;
+
+        // Increase score for on-time payment
+        uint256 increase = onTimePaymentWeight;
+        data.score = _capScore(data.score + increase);
+        data.lastUpdated = block.timestamp;
+
+        emit Events.ReputationScoreUpdated(user, oldScore, data.score);
+
+        // Check for milestones
+        _checkMilestones(user, data.score);
+    }
+
+    /**
+     * @notice Record a late payment
+     * @param user User address
+     * @param tokenId Debt token ID
+     * @param daysLate Number of days late
+     */
+    function recordLatePayment(
+        address user,
+        uint256 tokenId,
+        uint256 daysLate
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.latePayments++;
+        data.totalDebts++;
+
+        // Penalty increases with days late
+        uint256 penalty = latePaymentPenalty * (1 + (daysLate / 7)); // Increased penalty per week late
+        data.score = data.score > penalty ? data.score - penalty : MIN_REPUTATION_SCORE;
+        data.lastUpdated = block.timestamp;
+
+        emit Events.ReputationScoreUpdated(user, oldScore, data.score);
+    }
+
+    /**
+     * @notice Record a default
+     * @param user User address
+     * @param tokenId Debt token ID
+     */
+    function recordDefault(
+        address user,
+        uint256 tokenId
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.defaults++;
+        data.totalDebts++;
+
+        // Heavy penalty for defaults
+        data.score = data.score > defaultPenalty ? data.score - defaultPenalty : MIN_REPUTATION_SCORE;
+        data.lastUpdated = block.timestamp;
+
+        emit Events.ReputationScoreUpdated(user, oldScore, data.score);
+    }
+
+    /**
+     * @notice Record a successful trade
+     * @param user User address
+     * @param tradeVolume Trade volume
+     */
+    function recordSuccessfulTrade(
+        address user,
+        uint256 tradeVolume
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.successfulTrades++;
+        data.totalVolumeTraded += tradeVolume;
+
+        // Small bonus for successful trades
+        data.score = _capScore(data.score + successfulTradeBonu);
+        data.lastUpdated = block.timestamp;
+
+        emit Events.ReputationScoreUpdated(user, oldScore, data.score);
+
+        _checkMilestones(user, data.score);
+    }
+
+    /**
+     * @notice Record a dispute
+     * @param user User address
+     */
+    function recordDispute(address user) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.disputes++;
+
+        // Penalty for disputes
+        data.score = data.score > disputePenalty ? data.score - disputePenalty : MIN_REPUTATION_SCORE;
+        data.lastUpdated = block.timestamp;
+
+        emit Events.ReputationScoreUpdated(user, oldScore, data.score);
+    }
+
+    // ============ Slashing Functions ============
+
+    /**
+     * @notice Slash user's reputation
+     * @param user User address
+     * @param tokenId Related token ID
+     * @param penaltyPercentage Penalty in basis points
+     * @param reason Slashing reason
+     */
+    function slashReputation(
+        address user,
+        uint256 tokenId,
+        uint256 penaltyPercentage,
+        string calldata reason
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        uint256 newScore = DebtCalculations.calculateReputationPenalty(
+            oldScore,
+            penaltyPercentage
+        );
+
+        data.score = newScore;
+        data.lastUpdated = block.timestamp;
+
+        // Record slashing
+        DataTypes.SlashingRecord memory record = DataTypes.SlashingRecord({
+            user: user,
+            tokenId: tokenId,
+            amount: 0, // Reputation slash doesn't involve amount
+            timestamp: block.timestamp,
+            reason: reason,
+            reputationPenalty: oldScore - newScore
+        });
+
+        _slashingHistory[user].push(record);
+
+        emit Events.ReputationSlashed(user, tokenId, oldScore, newScore, reason);
+    }
+
+    // ============ Rehabilitation Functions ============
+
+    /**
+     * @notice Start rehabilitation program for user
+     * @param user User address
+     * @param durationDays Duration in days
+     */
+    function startRehabilitation(
+        address user,
+        uint256 durationDays
+    ) external onlyRole(ADMIN_ROLE) returns (uint256 planId) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (_inRehabilitation[user]) revert Errors.InvalidParameter();
+
+        _inRehabilitation[user] = true;
+        _rehabilitationEndDate[user] = block.timestamp + (durationDays * 1 days);
+
+        planId = uint256(keccak256(abi.encodePacked(user, block.timestamp)));
+
+        emit Events.RehabilitationStarted(user, planId, durationDays * 1 days);
+    }
+
+    /**
+     * @notice Complete rehabilitation program
+     * @param user User address
+     * @param scoreBonus Bonus points for completion
+     */
+    function completeRehabilitation(
+        address user,
+        uint256 scoreBonus
+    ) external onlyRole(ADMIN_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (!_inRehabilitation[user]) revert Errors.InvalidParameter();
+        if (block.timestamp < _rehabilitationEndDate[user]) revert Errors.InvalidParameter();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.score = _capScore(data.score + scoreBonus);
+        data.lastUpdated = block.timestamp;
+
+        _inRehabilitation[user] = false;
+        _rehabilitationEndDate[user] = 0;
+
+        uint256 planId = uint256(keccak256(abi.encodePacked(user, _rehabilitationEndDate[user])));
+
+        emit Events.RehabilitationCompleted(user, planId);
+        emit Events.ReputationScoreUpdated(user, oldScore, data.score);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get user's reputation data
+     * @param user User address
+     * @return data Reputation data
+     */
+    function getReputationData(address user)
+        external
+        view
+        returns (DataTypes.ReputationData memory data)
+    {
+        return _reputationData[user];
+    }
+
+    /**
+     * @notice Get user's reputation score
+     * @param user User address
+     * @return score Reputation score (0-1000)
+     */
+    function getReputationScore(address user)
+        external
+        view
+        returns (uint256 score)
+    {
+        return _reputationData[user].score;
+    }
+
+    /**
+     * @notice Get slashing history for user
+     * @param user User address
+     * @return history Array of slashing records
+     */
+    function getSlashingHistory(address user)
+        external
+        view
+        returns (DataTypes.SlashingRecord[] memory history)
+    {
+        return _slashingHistory[user];
+    }
+
+    /**
+     * @notice Check if user is in rehabilitation
+     * @param user User address
+     * @return inRehab Whether user is in rehabilitation
+     * @return endDate End date of rehabilitation
+     */
+    function getRehabilitationStatus(address user)
+        external
+        view
+        returns (bool inRehab, uint256 endDate)
+    {
+        return (_inRehabilitation[user], _rehabilitationEndDate[user]);
+    }
+
+    /**
+     * @notice Check if reputation score meets minimum requirement
+     * @param user User address
+     * @param minScore Minimum required score
+     * @return bool True if meets requirement
+     */
+    function meetsReputationRequirement(address user, uint256 minScore)
+        external
+        view
+        returns (bool)
+    {
+        return _reputationData[user].score >= minScore;
+    }
+
+    /**
+     * @notice Get reputation tier for user
+     * @param user User address
+     * @return tier Reputation tier (Excellent, Good, Fair, Poor, Bad)
+     */
+    function getReputationTier(address user)
+        external
+        view
+        returns (string memory tier)
+    {
+        uint256 score = _reputationData[user].score;
+
+        if (score >= 800) return "Excellent";
+        if (score >= 600) return "Good";
+        if (score >= 400) return "Fair";
+        if (score >= 200) return "Poor";
+        return "Bad";
+    }
+
+    /**
+     * @notice Calculate reputation-based discount or premium
+     * @param user User address
+     * @param baseAmount Base amount
+     * @return adjustedAmount Amount after reputation adjustment
+     */
+    function calculateReputationAdjustment(address user, uint256 baseAmount)
+        external
+        view
+        returns (uint256 adjustedAmount)
+    {
+        uint256 score = _reputationData[user].score;
+
+        // Users with score > 700 get discount, < 300 get premium
+        if (score >= 700) {
+            // Up to 5% discount for excellent reputation
+            uint256 discount = ((score - 700) * 500) / 300; // Max 5% at score 1000
+            adjustedAmount = baseAmount - ((baseAmount * discount) / 10000);
+        } else if (score < 300) {
+            // Up to 10% premium for poor reputation
+            uint256 premium = ((300 - score) * 1000) / 300; // Max 10% at score 0
+            adjustedAmount = baseAmount + ((baseAmount * premium) / 10000);
+        } else {
+            adjustedAmount = baseAmount;
+        }
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update reputation weights
+     * @param onTimeWeight Weight for on-time payments
+     * @param latePenalty Penalty for late payments
+     * @param defaultPen Penalty for defaults
+     * @param tradeBonus Bonus for successful trades
+     * @param disputePen Penalty for disputes
+     */
+    function updateReputationWeights(
+        uint256 onTimeWeight,
+        uint256 latePenalty,
+        uint256 defaultPen,
+        uint256 tradeBonus,
+        uint256 disputePen
+    ) external onlyRole(ADMIN_ROLE) {
+        onTimePaymentWeight = onTimeWeight;
+        latePaymentPenalty = latePenalty;
+        defaultPenalty = defaultPen;
+        successfulTradeBonu = tradeBonus;
+        disputePenalty = disputePen;
+    }
+
+    /**
+     * @notice Manually adjust reputation score (emergency use)
+     * @param user User address
+     * @param newScore New score
+     * @param reason Reason for adjustment
+     */
+    function manuallyAdjustScore(
+        address user,
+        uint256 newScore,
+        string calldata reason
+    ) external onlyRole(ADMIN_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (newScore > MAX_REPUTATION_SCORE) revert Errors.InvalidReputationScore();
+
+        DataTypes.ReputationData storage data = _reputationData[user];
+
+        uint256 oldScore = data.score;
+        data.score = newScore;
+        data.lastUpdated = block.timestamp;
+
+        emit Events.ReputationScoreUpdated(user, oldScore, newScore);
+        emit Events.SystemNotification("MANUAL_REPUTATION_ADJUSTMENT", reason, block.timestamp);
+    }
+
+    // ============ Internal Functions ============
+
+    /**
+     * @dev Cap score to valid range
+     */
+    function _capScore(uint256 score) internal pure returns (uint256) {
+        if (score > MAX_REPUTATION_SCORE) return MAX_REPUTATION_SCORE;
+        return score;
+    }
+
+    /**
+     * @dev Check and emit milestone events
+     */
+    function _checkMilestones(address user, uint256 score) internal {
+        if (score == 1000) {
+            emit Events.ReputationMilestoneReached(user, "PERFECT_SCORE", score);
+        } else if (score >= 900 && score < 910) {
+            emit Events.ReputationMilestoneReached(user, "EXCELLENT", score);
+        } else if (score >= 700 && score < 710) {
+            emit Events.ReputationMilestoneReached(user, "GOOD", score);
+        } else if (score >= 500 && score < 510) {
+            emit Events.ReputationMilestoneReached(user, "AVERAGE", score);
+        }
+    }
+
+    /**
+     * @dev Authorize upgrade
+     */
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

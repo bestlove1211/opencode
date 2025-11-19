@@ -1,0 +1,626 @@
+# Multi-Asset Collateral System
+
+## Overview
+
+The Multi-Asset Collateral Manager allows borrowers to provide a diversified basket of collateral assets for their loans, rather than being limited to a single asset type. This provides greater flexibility, better risk management, and higher loan-to-value ratios.
+
+## Key Features
+
+### 1. **Collateral Baskets**
+- Each loan can have one collateral basket
+- Up to 10 different assets per basket
+- Automatic value tracking in USD
+- Real-time health monitoring
+
+### 2. **Diversification Benefits**
+- Reduce concentration risk
+- Optimize collateral efficiency
+- Automatic diversification scoring
+- Weighted risk calculations
+
+### 3. **Flexible Collateralization**
+- Mix stablecoins, crypto, and tokenized assets
+- Dynamic asset allocation limits
+- Real-time price oracle integration
+- Weighted liquidation thresholds
+
+### 4. **Advanced Risk Management**
+- Weighted minimum collateral ratios
+- Asset-specific liquidation bonuses
+- Automatic health checks
+- Liquidation protection
+
+## Architecture
+
+### Collateral Basket Structure
+
+```solidity
+struct CollateralBasket {
+    uint256 id;
+    address owner;
+    uint256 loanId;
+    CollateralAsset[] assets;  // Up to 10 assets
+    uint256 totalValueUSD;
+    uint256 createdAt;
+    bool isActive;
+    bool isLiquidated;
+}
+
+struct CollateralAsset {
+    address asset;
+    uint256 amount;
+    uint256 lockedAt;
+    uint256 valueAtLock;  // Historical tracking
+}
+```
+
+### Asset Configuration
+
+```solidity
+struct AssetConfig {
+    bool isSupported;
+    uint256 liquidationThreshold;  // 8000 = 80%
+    uint256 minCollateralRatio;    // 15000 = 150%
+    uint256 liquidationBonus;       // 500 = 5%
+    uint256 maxAllocation;          // 7000 = 70% max of basket
+    uint8 decimals;
+}
+```
+
+## Usage Examples
+
+### 1. Creating a Basket
+
+```solidity
+// Create basket for loan #123
+uint256 basketId = collateralManager.createBasket(123);
+```
+
+### 2. Adding Single Collateral
+
+```solidity
+// Approve tokens first
+IERC20(USDC).approve(address(collateralManager), 10000e6);
+
+// Add USDC to basket
+collateralManager.addCollateral(
+    basketId,
+    USDC,
+    10000e6  // $10,000 USDC
+);
+```
+
+### 3. Batch Adding Multiple Assets
+
+```solidity
+// Prepare arrays
+address[] memory assets = new address[](3);
+assets[0] = WETH;
+assets[1] = WBTC;
+assets[2] = USDC;
+
+uint256[] memory amounts = new uint256[](3);
+amounts[0] = 5e18;      // 5 ETH
+amounts[1] = 0.1e8;     // 0.1 BTC
+amounts[2] = 10000e6;   // $10,000 USDC
+
+// Approve all tokens
+IERC20(WETH).approve(address(collateralManager), 5e18);
+IERC20(WBTC).approve(address(collateralManager), 0.1e8);
+IERC20(USDC).approve(address(collateralManager), 10000e6);
+
+// Add all at once
+collateralManager.batchAddCollateral(basketId, assets, amounts);
+```
+
+### 4. Checking Basket Health
+
+```solidity
+// Get current basket value
+uint256 basketValue = collateralManager.getBasketValue(basketId);
+
+// Check if healthy for $50k loan
+uint256 loanValueUSD = 50000e18;
+bool isHealthy = collateralManager.isBasketHealthy(basketId, loanValueUSD);
+
+// Get liquidation threshold
+uint256 threshold = collateralManager.getBasketLiquidationThreshold(basketId);
+```
+
+### 5. Viewing Basket Details
+
+```solidity
+// Get all assets in basket
+CollateralAsset[] memory assets = collateralManager.getBasketAssets(basketId);
+
+for (uint i = 0; i < assets.length; i++) {
+    console.log("Asset:", assets[i].asset);
+    console.log("Amount:", assets[i].amount);
+    console.log("Value at lock:", assets[i].valueAtLock);
+}
+
+// Get diversification score
+uint256 diversification = collateralManager.getBasketDiversification(basketId);
+console.log("Diversification score:", diversification); // 0-10000
+```
+
+### 6. Releasing Collateral (After Loan Repaid)
+
+```solidity
+// Only MANAGER_ROLE can release
+collateralManager.releaseBasket(basketId);
+// All assets returned to owner
+```
+
+### 7. Liquidation (If Loan Defaults)
+
+```solidity
+// Only LIQUIDATOR_ROLE can liquidate
+uint256 liquidationId = collateralManager.liquidateBasket(
+    basketId,
+    liquidatorAddress
+);
+
+// Get liquidation details
+LiquidationInfo memory info = collateralManager.getLiquidationInfo(liquidationId);
+```
+
+## Example: Creating a Diversified Collateral Portfolio
+
+### Scenario: $100,000 Loan
+
+**Goal:** Borrow $100,000 USDC with 150% collateralization = $150,000 collateral needed
+
+**Strategy:** Diversify across multiple assets
+
+```solidity
+// 1. Create basket
+uint256 basketId = collateralManager.createBasket(loanId);
+
+// 2. Prepare diversified collateral
+address[] memory assets = new address[](4);
+uint256[] memory amounts = new uint256[](4);
+
+// 40% ETH = $60,000
+assets[0] = WETH;
+amounts[0] = 30e18;  // 30 ETH @ $2000/ETH
+
+// 30% WBTC = $45,000
+assets[1] = WBTC;
+amounts[1] = 1.5e8;  // 1.5 BTC @ $30,000/BTC
+
+// 20% stETH = $30,000
+assets[2] = stETH;
+amounts[2] = 15e18;  // 15 stETH @ $2000
+
+// 10% USDC = $15,000
+assets[3] = USDC;
+amounts[3] = 15000e6;
+
+// 3. Approve all
+for (uint i = 0; i < assets.length; i++) {
+    IERC20(assets[i]).approve(address(collateralManager), amounts[i]);
+}
+
+// 4. Add all collateral
+collateralManager.batchAddCollateral(basketId, assets, amounts);
+
+// 5. Verify basket
+uint256 totalValue = collateralManager.getBasketValue(basketId);
+require(totalValue >= 150000e18, "Insufficient collateral");
+
+uint256 diversificationScore = collateralManager.getBasketDiversification(basketId);
+// Higher score = better diversification
+```
+
+## Weighted Risk Calculations
+
+The system calculates weighted average of asset parameters based on their allocation in the basket.
+
+### Weighted Minimum Collateral Ratio
+
+```
+weightedRatio = Σ (assetValue_i / totalValue) × minCollateralRatio_i
+```
+
+**Example:**
+- 50% ETH (MCR: 150%) = 0.5 × 150% = 75%
+- 30% WBTC (MCR: 140%) = 0.3 × 140% = 42%
+- 20% USDC (MCR: 110%) = 0.2 × 110% = 22%
+- **Weighted MCR = 139%**
+
+### Weighted Liquidation Threshold
+
+```
+weightedThreshold = Σ (assetValue_i / totalValue) × liquidationThreshold_i
+```
+
+**Example:**
+- 50% ETH (LT: 80%) = 0.5 × 80% = 40%
+- 30% WBTC (LT: 75%) = 0.3 × 75% = 22.5%
+- 20% USDC (LT: 90%) = 0.2 × 90% = 18%
+- **Weighted LT = 80.5%**
+
+## Diversification Scoring
+
+The system uses the **Herfindahl-Hirschman Index (HHI)** to measure concentration:
+
+```
+HHI = Σ (assetAllocation_i)²
+Diversification Score = 10000 - HHI
+```
+
+### Examples:
+
+**Single Asset:**
+- HHI = 100² = 10000
+- Score = 10000 - 10000 = **0** (no diversification)
+
+**Two Equal Assets:**
+- HHI = 50² + 50² = 5000
+- Score = 10000 - 5000 = **5000** (moderate)
+
+**Four Equal Assets:**
+- HHI = 25² + 25² + 25² + 25² = 2500
+- Score = 10000 - 2500 = **7500** (high diversification)
+
+**Optimal Distribution (4 assets: 40%, 30%, 20%, 10%):**
+- HHI = 40² + 30² + 20² + 10² = 3000
+- Score = 10000 - 3000 = **7000** (good diversification)
+
+## Asset Configuration
+
+### Example Configuration for Common Assets
+
+```solidity
+// ETH
+collateralManager.configureAsset(
+    WETH,
+    true,           // isSupported
+    8000,           // 80% liquidation threshold
+    15000,          // 150% min collateral ratio
+    500,            // 5% liquidation bonus
+    7000,           // Max 70% of basket
+    18              // 18 decimals
+);
+
+// WBTC
+collateralManager.configureAsset(
+    WBTC,
+    true,
+    7500,           // 75% liquidation threshold (more volatile)
+    16000,          // 160% min collateral ratio
+    500,
+    7000,
+    8               // 8 decimals
+);
+
+// USDC (Stablecoin)
+collateralManager.configureAsset(
+    USDC,
+    true,
+    9000,           // 90% liquidation threshold (stable)
+    11000,          // 110% min collateral ratio
+    200,            // 2% liquidation bonus (lower risk)
+    5000,           // Max 50% of basket (concentration limit)
+    6               // 6 decimals
+);
+
+// stETH (Liquid Staking)
+collateralManager.configureAsset(
+    stETH,
+    true,
+    7500,           // 75% threshold
+    15500,          // 155% min ratio
+    600,            // 6% bonus (smart contract risk)
+    7000,
+    18
+);
+```
+
+## Integration with Lending Contracts
+
+### Example: BancafiLending Integration
+
+```solidity
+import "./MultiAssetCollateralManager.sol";
+
+contract BancafiLending {
+    MultiAssetCollateralManager public collateralManager;
+
+    function acceptBorrowRequest(uint256 requestId, uint256 loanId) external {
+        // Get basket for this loan
+        uint256 basketId = collateralManager.getLoanBasket(loanId);
+
+        // Check collateral is sufficient
+        uint256 loanValueUSD = _getLoanValueUSD(loanId);
+        require(
+            collateralManager.isBasketHealthy(basketId, loanValueUSD),
+            "Insufficient collateral"
+        );
+
+        // Get diversification score
+        uint256 diversification = collateralManager.getBasketDiversification(basketId);
+
+        // Better diversification = better terms
+        if (diversification >= 7000) {
+            // Offer 0.5% interest rate discount
+            interestRate = interestRate - 50; // -50 bps
+        }
+
+        // Continue loan processing...
+    }
+
+    function checkLoanHealth(uint256 loanId) external view returns (bool) {
+        uint256 basketId = collateralManager.getLoanBasket(loanId);
+        uint256 loanValueUSD = _getLoanValueUSD(loanId);
+
+        return collateralManager.isBasketHealthy(basketId, loanValueUSD);
+    }
+
+    function liquidateLoan(uint256 loanId) external {
+        // Check if under-collateralized
+        require(!checkLoanHealth(loanId), "Loan is healthy");
+
+        uint256 basketId = collateralManager.getLoanBasket(loanId);
+
+        // Liquidate entire basket
+        uint256 liquidationId = collateralManager.liquidateBasket(
+            basketId,
+            msg.sender  // Liquidator receives assets
+        );
+
+        emit LoanLiquidated(loanId, liquidationId);
+    }
+}
+```
+
+## Benefits of Multi-Asset Collateral
+
+### For Borrowers
+
+1. **Higher Loan-to-Value Ratios**
+   - Diversified baskets are less risky
+   - Can borrow more per dollar of collateral
+   - Example: 75% LTV vs 67% LTV for single asset
+
+2. **Reduced Liquidation Risk**
+   - Assets don't move in perfect correlation
+   - One asset dropping doesn't trigger immediate liquidation
+   - Better protection during market volatility
+
+3. **Flexibility**
+   - Use existing portfolio without selling
+   - Don't need to concentrate in single asset
+   - Add collateral as you acquire it
+
+4. **Capital Efficiency**
+   - Deploy full portfolio productively
+   - Avoid keeping reserves unused
+   - Optimize yield across holdings
+
+### For Lenders
+
+1. **Lower Risk**
+   - Diversification reduces default impact
+   - Multiple assets to liquidate if needed
+   - Better recovery rates
+
+2. **Better Pricing**
+   - Risk-adjusted interest rates
+   - Diversification discounts
+   - Attract quality borrowers
+
+3. **Market Resilience**
+   - Less correlation risk
+   - Survives single-asset crashes
+   - Stable TVL across market conditions
+
+## Risk Management
+
+### Asset Allocation Limits
+
+```solidity
+// Prevent over-concentration
+maxAllocation = 7000; // Max 70% in one asset
+
+// Example: $100k basket
+// Max ETH: $70k
+// Max WBTC: $70k
+// Must have at least 2-3 assets to reach 100%
+```
+
+### Liquidation Cascade Protection
+
+The weighted approach prevents unfair liquidations:
+
+```
+Basket: 50% USDC (stable) + 50% ETH (volatile)
+Weighted LT = 0.5 × 90% + 0.5 × 80% = 85%
+
+If only ETH drops 20%, basket only drops 10%
+85% - 10% = 75% LTV (still healthy if threshold is 80%)
+```
+
+### Monitoring & Alerts
+
+```javascript
+// Off-chain monitoring
+const basketId = await loanContract.getLoanBasket(loanId);
+const value = await collateralManager.getBasketValue(basketId);
+const threshold = await collateralManager.getBasketLiquidationThreshold(basketId);
+
+const currentLTV = (loanValue / value) * 10000;
+
+if (currentLTV > threshold * 0.95) {
+    // Alert: Within 5% of liquidation
+    sendAlert(borrower, "Add collateral or reduce loan");
+}
+```
+
+## Best Practices
+
+### For Borrowers
+
+1. **Diversify Wisely**
+   - ✅ Use 3-5 assets minimum
+   - ✅ Mix stable and volatile assets
+   - ✅ Include liquid staking tokens
+   - ❌ Don't over-concentrate in correlated assets
+
+2. **Monitor Health**
+   - Check basket value daily
+   - Set up alerts for 90% LTV
+   - Have backup collateral ready
+   - Rebalance if needed
+
+3. **Optimize Allocation**
+   - More stable assets = lower rates
+   - Higher diversification = better terms
+   - Balance risk and cost
+
+### For Integrators
+
+1. **Configure Assets Carefully**
+   ```solidity
+   // Higher volatility = stricter parameters
+   // WBTC: 160% MCR, 75% LT
+   // USDC: 110% MCR, 90% LT
+   ```
+
+2. **Use Weighted Calculations**
+   ```solidity
+   // Always use weighted averages
+   uint256 weightedMCR = _calculateWeightedMinRatio(basket);
+   uint256 weightedLT = _calculateWeightedLiquidationThreshold(basket);
+   ```
+
+3. **Implement Health Checks**
+   ```solidity
+   modifier healthyLoan(uint256 loanId) {
+       uint256 basketId = getLoanBasket(loanId);
+       require(
+           collateralManager.isBasketHealthy(basketId, getLoanValue(loanId)),
+           "Loan unhealthy"
+       );
+       _;
+   }
+   ```
+
+## Events & Monitoring
+
+### Key Events
+
+```solidity
+event BasketCreated(uint256 indexed basketId, address indexed owner, uint256 indexed loanId, uint256 totalValueUSD);
+event AssetAddedToBasket(uint256 indexed basketId, address indexed asset, uint256 amount, uint256 valueUSD);
+event BasketValueUpdated(uint256 indexed basketId, uint256 oldValue, uint256 newValue);
+event BasketLiquidated(uint256 indexed basketId, uint256 indexed liquidationId, address indexed liquidator, uint256 totalValueLiquidated);
+```
+
+### Off-Chain Monitoring
+
+```javascript
+// Listen for basket updates
+collateralManager.on("BasketValueUpdated", (basketId, oldValue, newValue) => {
+    const change = ((newValue - oldValue) / oldValue) * 100;
+
+    if (change < -10) {
+        console.warn(`⚠️  Basket ${basketId} value dropped ${change}%`);
+        // Check if approaching liquidation
+        checkLiquidationRisk(basketId);
+    }
+});
+
+// Monitor liquidations
+collateralManager.on("BasketLiquidated", (basketId, liquidationId, liquidator, value) => {
+    console.log(`🔨 Basket ${basketId} liquidated for $${value}`);
+    // Analyze liquidation
+    // Update risk models
+});
+```
+
+## Testing
+
+### Example Test Cases
+
+```javascript
+describe("MultiAssetCollateralManager", () => {
+    it("Should create basket and add multiple assets", async () => {
+        const basketId = await collateralManager.createBasket(loanId);
+
+        await collateralManager.batchAddCollateral(
+            basketId,
+            [WETH, WBTC, USDC],
+            [10e18, 0.5e8, 10000e6]
+        );
+
+        const value = await collateralManager.getBasketValue(basketId);
+        expect(value).to.be.gt(0);
+    });
+
+    it("Should calculate diversification correctly", async () => {
+        // Two equal assets = 5000 score
+        const score = await collateralManager.getBasketDiversification(basketId);
+        expect(score).to.equal(5000);
+    });
+
+    it("Should enforce max allocation limit", async () => {
+        await expect(
+            collateralManager.addCollateral(basketId, WETH, tooMuchETH)
+        ).to.be.revertedWith("Exceeds max allocation");
+    });
+
+    it("Should liquidate unhealthy basket", async () => {
+        // Price drops, basket becomes unhealthy
+        await priceOracle.updatePrice(WETH, lowerPrice);
+
+        const isHealthy = await collateralManager.isBasketHealthy(basketId, loanValue);
+        expect(isHealthy).to.be.false;
+
+        // Liquidate
+        await collateralManager.liquidateBasket(basketId, liquidator.address);
+    });
+});
+```
+
+## Roadmap
+
+### Current Features ✅
+- Multi-asset basket creation
+- Batch collateral addition
+- Weighted risk calculations
+- Diversification scoring
+- Automatic liquidation
+- Real-time health monitoring
+
+### Future Enhancements 🔮
+- [ ] Dynamic rebalancing
+- [ ] Cross-chain collateral
+- [ ] NFT collateral support
+- [ ] Automatic hedging strategies
+- [ ] Collateral yield generation
+- [ ] Advanced correlation analysis
+- [ ] Collateral swapping within basket
+- [ ] Partial liquidation (asset-by-asset)
+
+## Security Considerations
+
+1. **Flash Loan Protection**: Built-in protection against flash loan attacks
+2. **Reentrancy Guards**: All state-changing functions protected
+3. **Access Control**: Role-based permissions for critical operations
+4. **Pausable**: Emergency pause functionality
+5. **Oracle Validation**: Price feed integrity checks
+6. **Allocation Limits**: Prevent over-concentration
+
+## Conclusion
+
+The Multi-Asset Collateral Manager provides institutional-grade flexibility for DeFi lending while maintaining robust risk management. By supporting diversified collateral baskets, it enables:
+
+- Higher capital efficiency
+- Lower liquidation risk
+- Better borrower experience
+- More sophisticated risk management
+- Competitive advantage for the platform
+
+This system is designed for production use with comprehensive safety features, monitoring capabilities, and integration flexibility.

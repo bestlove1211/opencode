@@ -1,0 +1,44 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("Debug Fractions", function () {
+  it("Should show fractional ownership after fractionalization", async function () {
+    const [owner] = await ethers.getSigners();
+
+    // Deploy Asset Token
+    const AssetToken = await ethers.getContractFactory("BancafiAssetToken");
+    const assetToken = await upgrades.deployProxy(
+      AssetToken,
+      ["Test Assets", "TA"],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Grant roles
+    const MINTER_ROLE = await assetToken.MINTER_ROLE();
+    const VERIFIER_ROLE = await assetToken.VERIFIER_ROLE();
+    await assetToken.grantRole(MINTER_ROLE, owner.address);
+    await assetToken.grantRole(VERIFIER_ROLE, owner.address);
+
+    // Tokenize
+    await assetToken.tokenizeAsset(
+      owner.address,
+      0,
+      ethers.parseEther("1000000"),
+      "Test Location",
+      "ipfs://test"
+    );
+
+    console.log("NFT Owner:", await assetToken.ownerOf(1));
+
+    // Verify
+    await assetToken.verifyAsset(1);
+
+    // Fractionalize
+    await assetToken.fractionalizeAsset(1, 10000);
+
+    const fractions = await assetToken.fractionalOwnership(1, owner.address);
+    console.log("Owner fractional ownership:", fractions.toString());
+
+    expect(fractions).to.equal(10000);
+  });
+});

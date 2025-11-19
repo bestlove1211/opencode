@@ -1,0 +1,391 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+/**
+ * Security Test Suite: C-2 Oracle Emergency Mode
+ *
+ * Tests for the oracle emergency mode security fix that prevents price manipulation
+ * by enforcing circuit breaker bounds even in emergency mode.
+ *
+ * Vulnerability: Emergency mode bypassed circuit breaker validation, allowing
+ * owner to set arbitrary prices and manipulate liquidations.
+ *
+ * Fix: Emergency prices must respect circuit breaker bounds and cannot deviate
+ * more than 50% from last known price.
+ */
+describe("Security Tests: C-2 Oracle Emergency Mode", function () {
+  let priceOracle;
+  let mockChainlinkFeed;
+  let owner, attacker;
+  let mockAsset;
+
+  const MIN_PRICE = ethers.parseEther("500");   // $500
+  const MAX_PRICE = ethers.parseEther("10000"); // $10,000
+  const NORMAL_PRICE = ethers.parseEther("2000"); // $2,000
+  const HEARTBEAT = 3600; // 1 hour
+
+  beforeEach(async function () {
+    [owner, attacker] = await ethers.getSigners();
+
+    // Deploy mock Chainlink aggregator
+    const MockChainlinkAggregator = await ethers.getContractFactory("MockChainlinkAggregator");
+    mockChainlinkFeed = await MockChainlinkAggregator.deploy(18, "ETH/USD");
+    await mockChainlinkFeed.waitForDeployment();
+
+    // Set initial price
+    await mockChainlinkFeed.setPrice(NORMAL_PRICE);
+
+    // Deploy BancafiPriceOracle
+    const BancafiPriceOracle = await ethers.getContractFactory("BancafiPriceOracle");
+    priceOracle = await upgrades.deployProxy(
+      BancafiPriceOracle,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await priceOracle.waitForDeployment();
+
+    // Deploy mock asset
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    mockAsset = await MockERC20.deploy("Mock ETH", "METH", 18);
+    await mockAsset.waitForDeployment();
+
+    // Add Chainlink feed with circuit breaker
+    await priceOracle.addChainlinkFeed(
+      await mockAsset.getAddress(),
+      await mockChainlinkFeed.getAddress(),
+      HEARTBEAT,
+      MIN_PRICE,
+      MAX_PRICE
+    );
+
+    // Set fallback price
+    await priceOracle.setFallbackPrice(
+      await mockAsset.getAddress(),
+      NORMAL_PRICE
+    );
+  });
+
+  describe("C-2.1: Circuit Breaker Enforcement in Emergency Mode", function () {
+    it("Should reject emergency price below circuit breaker minimum", async function () {
+      const tooLowPrice = ethers.parseEther("400"); // Below $500 minimum
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          tooLowPrice
+        )
+      ).to.be.revertedWith("Emergency price outside circuit breaker bounds");
+    });
+
+    it("Should reject emergency price above circuit breaker maximum", async function () {
+      const tooHighPrice = ethers.parseEther("11000"); // Above $10,000 maximum
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          tooHighPrice
+        )
+      ).to.be.revertedWith("Emergency price outside circuit breaker bounds");
+    });
+
+    it("Should accept emergency price within circuit breaker bounds", async function () {
+      const validPrice = ethers.parseEther("3000"); // Within $500-$10,000 range
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          validPrice
+        )
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("C-2.2: Maximum Deviation from Last Known Price", function () {
+    it("Should reject emergency price deviating >50% above last price", async function () {
+      // Last known price is $2000
+      // 50% above = $3000
+      // Setting $3100 should fail
+      const tooHighDeviation = ethers.parseEther("3100");
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          tooHighDeviation
+        )
+      ).to.be.revertedWith("Emergency price deviates too much from last known price");
+    });
+
+    it("Should reject emergency price deviating >50% below last price", async function () {
+      // Last known price is $2000
+      // 50% below = $1000
+      // Setting $900 should fail
+      const tooLowDeviation = ethers.parseEther("900");
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          tooLowDeviation
+        )
+      ).to.be.revertedWith("Emergency price deviates too much from last known price");
+    });
+
+    it("Should accept emergency price within 50% deviation", async function () {
+      // Last known price is $2000
+      // Valid range: $1000 - $3000
+      const validPrice1 = ethers.parseEther("1500"); // 25% below
+      const validPrice2 = ethers.parseEther("2500"); // 25% above
+      const validPrice3 = ethers.parseEther("1000"); // Exactly 50% below
+      const validPrice4 = ethers.parseEther("3000"); // Exactly 50% above
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          validPrice1
+        )
+      ).to.not.be.reverted;
+
+      // Update to test other values
+      await priceOracle.setFallbackPrice(
+        await mockAsset.getAddress(),
+        NORMAL_PRICE
+      );
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          validPrice2
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("Should calculate deviation correctly at boundaries", async function () {
+      // Test exact 50% boundaries
+      const lowerBound = NORMAL_PRICE / 2n; // $1000 (50% below $2000)
+      const upperBound = NORMAL_PRICE + NORMAL_PRICE / 2n; // $3000 (50% above $2000)
+
+      // These should pass (exactly at boundary)
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          lowerBound
+        )
+      ).to.not.be.reverted;
+
+      // Reset
+      await priceOracle.setFallbackPrice(
+        await mockAsset.getAddress(),
+        NORMAL_PRICE
+      );
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          upperBound
+        )
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("C-2.3: Emergency Mode Attack Prevention", function () {
+    it("Should prevent owner from manipulating price for liquidation profit", async function () {
+      // Attacker scenario: Owner tries to set very low emergency price
+      // to liquidate positions at unfair prices
+      const manipulatedPrice = ethers.parseEther("100"); // $100 (massively below fair price)
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          manipulatedPrice
+        )
+      ).to.be.reverted; // Should fail both circuit breaker AND deviation checks
+    });
+
+    it("Should prevent owner from setting artificially high emergency price", async function () {
+      // Attacker scenario: Owner tries to set very high emergency price
+      // to prevent liquidations or manipulate collateral ratios
+      const manipulatedPrice = ethers.parseEther("20000"); // $20,000 (way above limits)
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          manipulatedPrice
+        )
+      ).to.be.reverted; // Should fail circuit breaker check
+    });
+
+    it("Should limit price manipulation even within circuit breaker bounds", async function () {
+      // Even if price is within circuit breaker ($500-$10,000),
+      // it must not deviate >50% from last known price
+
+      // Last price: $2000
+      // Circuit breaker allows up to $10,000
+      // But 50% deviation only allows up to $3000
+
+      const withinCircuitBreakerButExceedsDeviation = ethers.parseEther("5000");
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          withinCircuitBreakerButExceedsDeviation
+        )
+      ).to.be.revertedWith("Emergency price deviates too much from last known price");
+    });
+  });
+
+  describe("C-2.4: Emergency Price Event Logging", function () {
+    it("Should emit EmergencyPriceSet event with correct parameters", async function () {
+      const emergencyPrice = ethers.parseEther("2500");
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          emergencyPrice
+        )
+      ).to.emit(priceOracle, "EmergencyPriceSet")
+        .withArgs(
+          await mockAsset.getAddress(),
+          emergencyPrice
+        );
+    });
+
+    it("Should track emergency mode status", async function () {
+      const emergencyPrice = ethers.parseEther("2500");
+
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        emergencyPrice
+      );
+
+      // Verify emergency mode is active
+      const assetConfig = await priceOracle.assetFeeds(await mockAsset.getAddress());
+      expect(assetConfig.isEmergency).to.be.true;
+    });
+  });
+
+  describe("C-2.5: Fallback Price Integrity", function () {
+    it("Should maintain fallback price separately from emergency price", async function () {
+      const fallbackPrice = NORMAL_PRICE;
+      const emergencyPrice = ethers.parseEther("2500");
+
+      // Set emergency price
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        emergencyPrice
+      );
+
+      // Fallback price should remain unchanged
+      const assetConfig = await priceOracle.assetFeeds(await mockAsset.getAddress());
+      expect(assetConfig.fallbackPrice).to.equal(fallbackPrice);
+    });
+
+    it("Should use emergency price when in emergency mode", async function () {
+      const emergencyPrice = ethers.parseEther("2500");
+
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        emergencyPrice
+      );
+
+      const currentPrice = await priceOracle.getLatestPrice(await mockAsset.getAddress());
+      expect(currentPrice).to.equal(emergencyPrice);
+    });
+
+    it("Should revert to Chainlink price when exiting emergency mode", async function () {
+      const emergencyPrice = ethers.parseEther("2500");
+
+      // Enter emergency mode
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        emergencyPrice
+      );
+
+      // Exit emergency mode
+      await priceOracle.exitEmergencyMode(await mockAsset.getAddress());
+
+      // Should use Chainlink price again
+      const currentPrice = await priceOracle.getLatestPrice(await mockAsset.getAddress());
+      expect(currentPrice).to.equal(NORMAL_PRICE); // Chainlink price
+    });
+  });
+
+  describe("C-2.6: Access Control", function () {
+    it("Should only allow owner to set emergency price", async function () {
+      const emergencyPrice = ethers.parseEther("2500");
+
+      await expect(
+        priceOracle.connect(attacker).setEmergencyPrice(
+          await mockAsset.getAddress(),
+          emergencyPrice
+        )
+      ).to.be.reverted; // OwnableUpgradeable: caller is not the owner
+    });
+
+    it("Should only allow owner to exit emergency mode", async function () {
+      const emergencyPrice = ethers.parseEther("2500");
+
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        emergencyPrice
+      );
+
+      await expect(
+        priceOracle.connect(attacker).exitEmergencyMode(await mockAsset.getAddress())
+      ).to.be.reverted;
+    });
+  });
+
+  describe("C-2.7: Edge Cases", function () {
+    it("Should reject zero emergency price", async function () {
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          0
+        )
+      ).to.be.reverted; // Below circuit breaker minimum
+    });
+
+    it("Should handle very small price deviations correctly", async function () {
+      // Price very close to last known price
+      const nearPrice = NORMAL_PRICE + ethers.parseEther("1"); // $2001 (0.05% above)
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          await mockAsset.getAddress(),
+          nearPrice
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("Should reject emergency price for non-existent asset", async function () {
+      const fakeAsset = ethers.Wallet.createRandom().address;
+      const emergencyPrice = ethers.parseEther("2500");
+
+      await expect(
+        priceOracle.setEmergencyPrice(
+          fakeAsset,
+          emergencyPrice
+        )
+      ).to.be.revertedWith("Asset not supported");
+    });
+
+    it("Should handle emergency price updates correctly", async function () {
+      const firstEmergencyPrice = ethers.parseEther("2500");
+      const secondEmergencyPrice = ethers.parseEther("2200");
+
+      // Set first emergency price
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        firstEmergencyPrice
+      );
+
+      // Update emergency price (based on new fallback price after first emergency)
+      await priceOracle.setEmergencyPrice(
+        await mockAsset.getAddress(),
+        secondEmergencyPrice
+      );
+
+      const currentPrice = await priceOracle.getLatestPrice(await mockAsset.getAddress());
+      expect(currentPrice).to.equal(secondEmergencyPrice);
+    });
+  });
+});

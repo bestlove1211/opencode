@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./DataTypes.sol";
+import "./Errors.sol";
+
+/**
+ * @title DebtCalculations
+ * @notice Library for mathematical operations related to debt calculations
+ * @dev All interest rates are in basis points (1 bp = 0.01%)
+ */
+library DebtCalculations {
+    uint256 private constant BASIS_POINTS = 10000;
+    uint256 private constant SECONDS_PER_DAY = 86400;
+    uint256 private constant DAYS_PER_YEAR = 365;
+
+    /**
+     * @notice Calculate simple interest
+     * @param principal The principal amount
+     * @param rate Annual interest rate in basis points
+     * @param timeInDays Time period in days
+     * @return interest The calculated interest amount
+     */
+    function calculateSimpleInterest(
+        uint256 principal,
+        uint256 rate,
+        uint256 timeInDays
+    ) internal pure returns (uint256 interest) {
+        if (principal == 0) revert Errors.ZeroAmount();
+
+        // Interest = Principal * Rate * Time / (BASIS_POINTS * DAYS_PER_YEAR)
+        interest = (principal * rate * timeInDays) / (BASIS_POINTS * DAYS_PER_YEAR);
+    }
+
+    /**
+     * @notice Calculate compound interest
+     * @param principal The principal amount
+     * @param rate Annual interest rate in basis points
+     * @param timeInDays Time period in days
+     * @param compoundFrequency Number of times interest is compounded per year
+     * @return totalAmount The total amount after compound interest
+     */
+    function calculateCompoundInterest(
+        uint256 principal,
+        uint256 rate,
+        uint256 timeInDays,
+        uint256 compoundFrequency
+    ) internal pure returns (uint256 totalAmount) {
+        if (principal == 0) revert Errors.ZeroAmount();
+        if (compoundFrequency == 0) revert Errors.InvalidParameter();
+
+        uint256 ratePerPeriod = rate / compoundFrequency;
+        uint256 numberOfPeriods = (timeInDays * compoundFrequency) / DAYS_PER_YEAR;
+
+        // A = P(1 + r/n)^(nt)
+        // Using approximation for gas efficiency
+        totalAmount = principal;
+        for (uint256 i = 0; i < numberOfPeriods; i++) {
+            totalAmount = (totalAmount * (BASIS_POINTS + ratePerPeriod)) / BASIS_POINTS;
+        }
+    }
+
+    /**
+     * @notice Calculate amortized payment amount
+     * @param principal The principal amount
+     * @param rate Annual interest rate in basis points
+     * @param numberOfPayments Total number of payments
+     * @return paymentAmount The fixed payment amount per period
+     */
+    function calculateAmortization(
+        uint256 principal,
+        uint256 rate,
+        uint256 numberOfPayments
+    ) internal pure returns (uint256 paymentAmount) {
+        if (principal == 0) revert Errors.ZeroAmount();
+        if (numberOfPayments == 0) revert Errors.InvalidParameter();
+
+        if (rate == 0) {
+            // No interest, simple division
+            return principal / numberOfPayments;
+        }
+
+        // Convert annual rate to per-payment rate
+        uint256 ratePerPayment = rate / numberOfPayments;
+
+        // Payment = P * r * (1 + r)^n / ((1 + r)^n - 1)
+        // Simplified calculation for gas efficiency
+        uint256 factor = BASIS_POINTS + ratePerPayment;
+        uint256 numerator = principal * ratePerPayment * _power(factor, numberOfPayments, BASIS_POINTS);
+        uint256 denominator = _power(factor, numberOfPayments, BASIS_POINTS) - BASIS_POINTS;
+
+        paymentAmount = numerator / denominator;
+    }
+
+    /**
+     * @notice Calculate present value of future payment
+     * @param futureValue The future value amount
+     * @param rate Discount rate in basis points
+     * @param timeInDays Time until payment in days
+     * @return presentValue The present value
+     */
+    function calculatePresentValue(
+        uint256 futureValue,
+        uint256 rate,
+        uint256 timeInDays
+    ) internal pure returns (uint256 presentValue) {
+        if (futureValue == 0) revert Errors.ZeroAmount();
+
+        // PV = FV / (1 + r * t)
+        uint256 discountFactor = BASIS_POINTS + ((rate * timeInDays) / DAYS_PER_YEAR);
+        presentValue = (futureValue * BASIS_POINTS) / discountFactor;
+    }
+
+    /**
+     * @notice Calculate yield to maturity approximation
+     * @param currentPrice Current price of the debt token
+     * @param faceValue Face value at maturity
+     * @param timeToMaturityDays Days until maturity
+     * @return ytm Yield to maturity in basis points
+     */
+    function calculateYieldToMaturity(
+        uint256 currentPrice,
+        uint256 faceValue,
+        uint256 timeToMaturityDays
+    ) internal pure returns (uint256 ytm) {
+        if (currentPrice == 0 || faceValue == 0) revert Errors.ZeroAmount();
+        if (timeToMaturityDays == 0) revert Errors.InvalidParameter();
+
+        // YTM = ((Face Value - Current Price) / Current Price) * (365 / Days to Maturity) * 10000
+        if (faceValue > currentPrice) {
+            uint256 gain = faceValue - currentPrice;
+            ytm = (gain * BASIS_POINTS * DAYS_PER_YEAR) / (currentPrice * timeToMaturityDays);
+        } else {
+            ytm = 0;
+        }
+    }
+
+    /**
+     * @notice Calculate late fee
+     * @param paymentAmount The payment amount
+     * @param lateFeeRate Late fee percentage in basis points
+     * @param daysLate Number of days late
+     * @return lateFee The calculated late fee
+     */
+    function calculateLateFee(
+        uint256 paymentAmount,
+        uint256 lateFeeRate,
+        uint256 daysLate
+    ) internal pure returns (uint256 lateFee) {
+        if (paymentAmount == 0) return 0;
+
+        // Late fee can be flat or per day - using per day calculation
+        lateFee = (paymentAmount * lateFeeRate * daysLate) / (BASIS_POINTS * DAYS_PER_YEAR);
+    }
+
+    /**
+     * @notice Calculate default penalty
+     * @param outstandingAmount Outstanding debt amount
+     * @param penaltyRate Penalty rate in basis points
+     * @param missedPayments Number of missed payments
+     * @return penalty The calculated penalty
+     */
+    function calculateDefaultPenalty(
+        uint256 outstandingAmount,
+        uint256 penaltyRate,
+        uint256 missedPayments
+    ) internal pure returns (uint256 penalty) {
+        if (outstandingAmount == 0) return 0;
+
+        // Penalty increases with number of missed payments
+        uint256 multiplier = 100 + (missedPayments * 10); // 10% increase per missed payment
+        penalty = (outstandingAmount * penaltyRate * multiplier) / (BASIS_POINTS * 100);
+    }
+
+    /**
+     * @notice Calculate remaining balance after payment
+     * @param currentBalance Current outstanding balance
+     * @param paymentAmount Payment amount
+     * @param interestRate Annual interest rate in basis points
+     * @param daysSinceLastPayment Days since last payment
+     * @return remainingBalance The remaining balance
+     * @return interestPaid Interest portion of payment
+     * @return principalPaid Principal portion of payment
+     */
+    function calculateRemainingBalance(
+        uint256 currentBalance,
+        uint256 paymentAmount,
+        uint256 interestRate,
+        uint256 daysSinceLastPayment
+    ) internal pure returns (
+        uint256 remainingBalance,
+        uint256 interestPaid,
+        uint256 principalPaid
+    ) {
+        if (currentBalance == 0) revert Errors.ZeroAmount();
+        if (paymentAmount == 0) revert Errors.ZeroAmount();
+
+        // Calculate accrued interest
+        interestPaid = calculateSimpleInterest(currentBalance, interestRate, daysSinceLastPayment);
+
+        // Apply payment: first to interest, then to principal
+        if (paymentAmount <= interestPaid) {
+            interestPaid = paymentAmount;
+            principalPaid = 0;
+            remainingBalance = currentBalance;
+        } else {
+            principalPaid = paymentAmount - interestPaid;
+            if (principalPaid >= currentBalance) {
+                principalPaid = currentBalance;
+                remainingBalance = 0;
+            } else {
+                remainingBalance = currentBalance - principalPaid;
+            }
+        }
+    }
+
+    /**
+     * @notice Calculate collateral liquidation value
+     * @param collateralValue Current collateral value
+     * @param liquidationDiscount Discount percentage in basis points
+     * @return liquidationValue Net liquidation value
+     */
+    function calculateCollateralLiquidation(
+        uint256 collateralValue,
+        uint256 liquidationDiscount
+    ) internal pure returns (uint256 liquidationValue) {
+        if (collateralValue == 0) revert Errors.ZeroAmount();
+
+        // Apply liquidation discount
+        uint256 discount = (collateralValue * liquidationDiscount) / BASIS_POINTS;
+        liquidationValue = collateralValue - discount;
+    }
+
+    /**
+     * @notice Calculate reputation score penalty
+     * @param currentScore Current reputation score (0-1000)
+     * @param penaltyPercentage Penalty in basis points
+     * @return newScore New reputation score after penalty
+     */
+    function calculateReputationPenalty(
+        uint256 currentScore,
+        uint256 penaltyPercentage
+    ) internal pure returns (uint256 newScore) {
+        if (currentScore > 1000) revert Errors.InvalidReputationScore();
+
+        uint256 penalty = (currentScore * penaltyPercentage) / BASIS_POINTS;
+        newScore = currentScore > penalty ? currentScore - penalty : 0;
+    }
+
+    /**
+     * @notice Calculate days between two timestamps
+     * @param startTime Start timestamp
+     * @param endTime End timestamp
+     * @return daysBetween Number of days
+     */
+    function calculateDaysBetween(
+        uint256 startTime,
+        uint256 endTime
+    ) internal pure returns (uint256 daysBetween) {
+        if (endTime <= startTime) return 0;
+        daysBetween = (endTime - startTime) / SECONDS_PER_DAY;
+    }
+
+    /**
+     * @notice Check if payment is late
+     * @param dueDate Payment due date timestamp
+     * @param currentTime Current timestamp
+     * @param gracePeriodDays Grace period in days
+     * @return isLate Whether payment is late
+     * @return daysLate Number of days late (0 if not late)
+     */
+    function checkIfLate(
+        uint256 dueDate,
+        uint256 currentTime,
+        uint256 gracePeriodDays
+    ) internal pure returns (bool isLate, uint256 daysLate) {
+        uint256 gracePeriodEnd = dueDate + (gracePeriodDays * SECONDS_PER_DAY);
+
+        if (currentTime > gracePeriodEnd) {
+            isLate = true;
+            daysLate = (currentTime - gracePeriodEnd) / SECONDS_PER_DAY;
+        } else {
+            isLate = false;
+            daysLate = 0;
+        }
+    }
+
+    /**
+     * @notice Calculate next payment date based on frequency
+     * @param lastPaymentDate Last payment timestamp
+     * @param frequency Payment frequency
+     * @return nextPaymentDate Next payment due date
+     */
+    function calculateNextPaymentDate(
+        uint256 lastPaymentDate,
+        DataTypes.PaymentFrequency frequency
+    ) internal pure returns (uint256 nextPaymentDate) {
+        uint256 daysToAdd;
+
+        if (frequency == DataTypes.PaymentFrequency.DAILY) {
+            daysToAdd = 1;
+        } else if (frequency == DataTypes.PaymentFrequency.WEEKLY) {
+            daysToAdd = 7;
+        } else if (frequency == DataTypes.PaymentFrequency.BIWEEKLY) {
+            daysToAdd = 14;
+        } else if (frequency == DataTypes.PaymentFrequency.MONTHLY) {
+            daysToAdd = 30;
+        } else if (frequency == DataTypes.PaymentFrequency.QUARTERLY) {
+            daysToAdd = 91;
+        } else if (frequency == DataTypes.PaymentFrequency.SEMIANNUALLY) {
+            daysToAdd = 182;
+        } else if (frequency == DataTypes.PaymentFrequency.ANNUALLY) {
+            daysToAdd = 365;
+        } else {
+            revert Errors.InvalidParameter();
+        }
+
+        nextPaymentDate = lastPaymentDate + (daysToAdd * SECONDS_PER_DAY);
+    }
+
+    /**
+     * @notice Power function for internal calculations
+     * @param base Base value
+     * @param exponent Exponent
+     * @param scale Scale factor
+     * @return result Base raised to exponent
+     */
+    function _power(
+        uint256 base,
+        uint256 exponent,
+        uint256 scale
+    ) private pure returns (uint256 result) {
+        result = scale;
+        for (uint256 i = 0; i < exponent; i++) {
+            result = (result * base) / scale;
+        }
+    }
+}

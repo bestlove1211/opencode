@@ -1,0 +1,777 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IDebtCollection.sol";
+
+/**
+ * @title DebtCollection
+ * @notice Automated debt collection system for defaulted loans in Bancafi Credit
+ * @dev Handles defaulted debt tracking, repayment schedules, and debt trading via BBM
+ * @custom:security-contact security@bancafi.com
+ */
+contract DebtCollection is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    IDebtCollection
+{
+    using SafeERC20 for IERC20;
+
+    // ============ Enums ============
+
+    enum CollectionStatus {
+        Active,           // Debt is being actively collected
+        PartiallyPaid,    // Some payments have been made
+        FullyPaid,        // Debt fully settled
+        Sold,             // Debt sold to another party via BBM
+        WrittenOff,       // Debt written off as uncollectable
+        Disputed,         // Borrower disputes the debt
+        UnderNegotiation  // Payment plan being negotiated
+    }
+
+    enum DefaultSeverity {
+        Minor,      // 1-30 days overdue
+        Moderate,   // 31-90 days overdue
+        Severe,     // 91-180 days overdue
+        Critical    // 180+ days overdue
+    }
+
+    // ============ Structs ============
+
+    struct DebtRecord {
+        uint256 id;
+        uint256 loanId;
+        address borrower;
+        address creditor;
+        address asset;
+        uint256 originalAmount;
+        uint256 remainingAmount;
+        uint256 collectedAmount;
+        uint256 penaltyAmount;
+        uint256 initiatedAt;
+        uint256 lastPaymentAt;
+        uint256 defaultedAt;
+        CollectionStatus status;
+        DefaultSeverity severity;
+        bool isActive;
+    }
+
+    struct PaymentPlan {
+        uint256 collectionId;
+        uint256 installmentAmount;
+        uint256 installmentPeriod;
+        uint256 numberOfInstallments;
+        uint256 installmentsPaid;
+        uint256 nextDueDate;
+        uint256 createdAt;
+        bool isActive;
+        bool autoApproved;
+    }
+
+    struct CollectionAction {
+        uint256 collectionId;
+        string actionType;
+        uint256 timestamp;
+        address initiator;
+        string notes;
+    }
+
+    // ============ State Variables ============
+
+    uint256 public nextCollectionId;
+    uint256 public collectionFee; // in basis points
+    uint256 public penaltyRate; // Daily penalty rate in basis points
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MAX_COLLECTION_FEE = 1000; // 10%
+    uint256 public constant MAX_PENALTY_RATE = 50; // 0.5% per day max
+
+    // Grace period before penalties apply (in seconds)
+    uint256 public gracePeriod;
+
+    mapping(uint256 => DebtRecord) public debtRecords;
+    mapping(uint256 => PaymentPlan) public paymentPlans;
+    mapping(uint256 => bool) public loansInCollection;
+    mapping(address => uint256[]) public borrowerDebts;
+    mapping(address => uint256[]) public creditorDebts;
+    mapping(address => bool) public authorizedCallers;
+    mapping(uint256 => CollectionAction[]) public collectionHistory;
+
+    // Statistics
+    uint256 public totalDebtsInCollection;
+    uint256 public totalDebtAmount;
+    uint256 public totalCollectedAmount;
+    uint256 public totalPenaltiesCollected;
+    uint256 public totalDebtsWrittenOff;
+    uint256 public totalDebtsSettled;
+
+    // ============ Events ============
+
+    event CollectionActionRecorded(
+        uint256 indexed collectionId,
+        string actionType,
+        address indexed initiator,
+        uint256 timestamp
+    );
+
+    event PaymentPlanCreated(
+        uint256 indexed collectionId,
+        uint256 installmentAmount,
+        uint256 numberOfInstallments,
+        bool autoApproved
+    );
+
+    event PaymentPlanUpdated(
+        uint256 indexed collectionId,
+        uint256 installmentsPaid,
+        uint256 nextDueDate
+    );
+
+    event InstallmentPaid(
+        uint256 indexed collectionId,
+        address indexed borrower,
+        uint256 amount,
+        uint256 installmentNumber
+    );
+
+    event DebtDisputed(
+        uint256 indexed collectionId,
+        address indexed borrower,
+        string reason,
+        uint256 timestamp
+    );
+
+    event DisputeResolved(
+        uint256 indexed collectionId,
+        bool inFavorOfBorrower,
+        string resolution
+    );
+
+    event DebtWrittenOff(
+        uint256 indexed collectionId,
+        uint256 amount,
+        string reason
+    );
+
+    event PenaltyApplied(
+        uint256 indexed collectionId,
+        uint256 penaltyAmount,
+        uint256 daysOverdue
+    );
+
+    event SeverityUpdated(
+        uint256 indexed collectionId,
+        DefaultSeverity oldSeverity,
+        DefaultSeverity newSeverity
+    );
+
+    event GracePeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
+    event PenaltyRateUpdated(uint256 oldRate, uint256 newRate);
+    event AuthorizedCallerUpdated(address indexed caller, bool authorized);
+
+    // ============ Modifiers ============
+
+    modifier onlyAuthorized() {
+        require(
+            authorizedCallers[msg.sender] || msg.sender == owner(),
+            "Not authorized"
+        );
+        _;
+    }
+
+    modifier validCollection(uint256 collectionId) {
+        require(collectionId > 0 && collectionId < nextCollectionId, "Invalid collection ID");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        uint256 _collectionFee,
+        uint256 _penaltyRate,
+        uint256 _gracePeriod
+    ) public initializer {
+        require(_collectionFee <= MAX_COLLECTION_FEE, "Collection fee too high");
+        require(_penaltyRate <= MAX_PENALTY_RATE, "Penalty rate too high");
+
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        nextCollectionId = 1;
+        collectionFee = _collectionFee;
+        penaltyRate = _penaltyRate;
+        gracePeriod = _gracePeriod;
+    }
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Initiate debt collection for a defaulted loan
+     * @param loanId Original loan ID
+     * @param borrower Borrower address
+     * @param amount Outstanding debt amount
+     * @return collectionId Unique collection identifier
+     */
+    function initiateCollection(
+        uint256 loanId,
+        address borrower,
+        uint256 amount
+    ) external override onlyAuthorized whenNotPaused returns (uint256) {
+        require(borrower != address(0), "Invalid borrower address");
+        require(amount > 0, "Amount must be positive");
+        require(!loansInCollection[loanId], "Loan already in collection");
+
+        uint256 collectionId = nextCollectionId++;
+
+        debtRecords[collectionId] = DebtRecord({
+            id: collectionId,
+            loanId: loanId,
+            borrower: borrower,
+            creditor: msg.sender,
+            asset: address(0),
+            originalAmount: amount,
+            remainingAmount: amount,
+            collectedAmount: 0,
+            penaltyAmount: 0,
+            initiatedAt: block.timestamp,
+            lastPaymentAt: 0,
+            defaultedAt: block.timestamp,
+            status: CollectionStatus.Active,
+            severity: DefaultSeverity.Minor,
+            isActive: true
+        });
+
+        loansInCollection[loanId] = true;
+        borrowerDebts[borrower].push(collectionId);
+        creditorDebts[msg.sender].push(collectionId);
+
+        totalDebtsInCollection++;
+        totalDebtAmount += amount;
+
+        _recordAction(collectionId, "INITIATED", "Debt collection initiated");
+
+        emit CollectionInitiated(loanId, borrower, amount, collectionId);
+
+        return collectionId;
+    }
+
+    /**
+     * @notice Repay outstanding debt
+     * @param collectionId Collection ID
+     * @param amount Amount to repay
+     */
+    function repayDebt(
+        uint256 collectionId,
+        uint256 amount
+    ) external override nonReentrant whenNotPaused validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(debt.isActive, "Debt not active");
+        require(msg.sender == debt.borrower, "Only borrower can repay");
+        require(amount > 0, "Amount must be positive");
+
+        // Calculate total owed including penalties
+        uint256 totalOwed = debt.remainingAmount + debt.penaltyAmount;
+        require(amount <= totalOwed, "Amount exceeds debt");
+
+        // Apply payment to penalties first, then principal
+        uint256 remainingPayment = amount;
+
+        if (debt.penaltyAmount > 0) {
+            if (remainingPayment >= debt.penaltyAmount) {
+                remainingPayment -= debt.penaltyAmount;
+                totalPenaltiesCollected += debt.penaltyAmount;
+                debt.penaltyAmount = 0;
+            } else {
+                debt.penaltyAmount -= remainingPayment;
+                totalPenaltiesCollected += remainingPayment;
+                remainingPayment = 0;
+            }
+        }
+
+        if (remainingPayment > 0) {
+            debt.remainingAmount -= remainingPayment;
+            debt.collectedAmount += remainingPayment;
+            totalCollectedAmount += remainingPayment;
+        }
+
+        debt.lastPaymentAt = block.timestamp;
+
+        // Update status
+        if (debt.remainingAmount == 0 && debt.penaltyAmount == 0) {
+            debt.status = CollectionStatus.FullyPaid;
+            debt.isActive = false;
+            totalDebtsInCollection--;
+            _recordAction(collectionId, "FULLY_PAID", "Debt fully repaid");
+        } else {
+            debt.status = CollectionStatus.PartiallyPaid;
+            _recordAction(collectionId, "PARTIAL_PAYMENT", "Partial payment received");
+        }
+
+        emit DebtRepaid(collectionId, msg.sender, amount);
+
+        // Update payment plan if exists
+        if (paymentPlans[collectionId].isActive) {
+            _updatePaymentPlan(collectionId);
+        }
+    }
+
+    /**
+     * @notice Sell debt to another party (BBM integration)
+     * @param collectionId Collection ID
+     * @param buyer Buyer address
+     * @param price Sale price
+     */
+    function sellDebt(
+        uint256 collectionId,
+        address buyer,
+        uint256 price
+    ) external override nonReentrant whenNotPaused validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(debt.isActive, "Debt not active");
+        require(msg.sender == debt.creditor, "Only creditor can sell debt");
+        require(buyer != address(0), "Invalid buyer address");
+        require(price > 0, "Price must be positive");
+
+        address seller = debt.creditor;
+        debt.creditor = buyer;
+
+        creditorDebts[buyer].push(collectionId);
+
+        _recordAction(collectionId, "DEBT_SOLD", "Debt ownership transferred");
+
+        emit DebtSold(collectionId, seller, buyer, price);
+    }
+
+    /**
+     * @notice Get collection details
+     */
+    function getCollectionDetails(uint256 collectionId)
+        external
+        view
+        override
+        validCollection(collectionId)
+        returns (
+            uint256 loanId,
+            address borrower,
+            address creditor,
+            uint256 originalAmount,
+            uint256 remainingAmount,
+            uint8 status
+        )
+    {
+        DebtRecord memory debt = debtRecords[collectionId];
+        return (
+            debt.loanId,
+            debt.borrower,
+            debt.creditor,
+            debt.originalAmount,
+            debt.remainingAmount,
+            uint8(debt.status)
+        );
+    }
+
+    /**
+     * @notice Check if loan is in collection
+     */
+    function isInCollection(uint256 loanId) external view override returns (bool) {
+        return loansInCollection[loanId];
+    }
+
+    // ============ Payment Plan Functions ============
+
+    /**
+     * @notice Create a payment plan for debt repayment
+     * @param collectionId Collection ID
+     * @param installmentAmount Amount per installment
+     * @param installmentPeriod Period between installments (seconds)
+     * @param numberOfInstallments Total number of installments
+     */
+    function createPaymentPlan(
+        uint256 collectionId,
+        uint256 installmentAmount,
+        uint256 installmentPeriod,
+        uint256 numberOfInstallments
+    ) external validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(
+            msg.sender == debt.creditor || msg.sender == debt.borrower,
+            "Only creditor or borrower can create plan"
+        );
+        require(debt.isActive, "Debt not active");
+        require(!paymentPlans[collectionId].isActive, "Payment plan already exists");
+        require(installmentAmount > 0, "Installment must be positive");
+        require(numberOfInstallments > 0, "Must have installments");
+
+        uint256 totalPayment = installmentAmount * numberOfInstallments;
+        uint256 totalOwed = debt.remainingAmount + debt.penaltyAmount;
+        require(totalPayment >= totalOwed, "Payment plan doesn't cover debt");
+
+        bool autoApproved = msg.sender == debt.creditor;
+
+        paymentPlans[collectionId] = PaymentPlan({
+            collectionId: collectionId,
+            installmentAmount: installmentAmount,
+            installmentPeriod: installmentPeriod,
+            numberOfInstallments: numberOfInstallments,
+            installmentsPaid: 0,
+            nextDueDate: block.timestamp + installmentPeriod,
+            createdAt: block.timestamp,
+            isActive: autoApproved,
+            autoApproved: autoApproved
+        });
+
+        if (autoApproved) {
+            debt.status = CollectionStatus.UnderNegotiation;
+            _recordAction(collectionId, "PAYMENT_PLAN_CREATED", "Payment plan established");
+        }
+
+        emit PaymentPlanCreated(collectionId, installmentAmount, numberOfInstallments, autoApproved);
+    }
+
+    /**
+     * @notice Approve a payment plan (creditor only)
+     * @param collectionId Collection ID
+     */
+    function approvePaymentPlan(uint256 collectionId) external validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(msg.sender == debt.creditor, "Only creditor can approve");
+
+        PaymentPlan storage plan = paymentPlans[collectionId];
+        require(!plan.isActive, "Plan already active");
+        require(plan.collectionId == collectionId, "No plan to approve");
+
+        plan.isActive = true;
+        plan.autoApproved = true;
+        debt.status = CollectionStatus.UnderNegotiation;
+
+        _recordAction(collectionId, "PAYMENT_PLAN_APPROVED", "Payment plan approved");
+    }
+
+    /**
+     * @notice Make an installment payment
+     * @param collectionId Collection ID
+     */
+    function makeInstallmentPayment(uint256 collectionId) external nonReentrant {
+        PaymentPlan storage plan = paymentPlans[collectionId];
+        require(plan.isActive, "Payment plan not active");
+
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(msg.sender == debt.borrower, "Only borrower can make payment");
+
+        _processRepayment(debt, plan.installmentAmount);
+
+        emit InstallmentPaid(collectionId, msg.sender, plan.installmentAmount, plan.installmentsPaid);
+    }
+
+    // ============ Dispute Functions ============
+
+    /**
+     * @notice Dispute a debt collection
+     * @param collectionId Collection ID
+     * @param reason Dispute reason
+     */
+    function disputeDebt(
+        uint256 collectionId,
+        string calldata reason
+    ) external validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(msg.sender == debt.borrower, "Only borrower can dispute");
+        require(debt.isActive, "Debt not active");
+        require(debt.status != CollectionStatus.Disputed, "Already disputed");
+
+        debt.status = CollectionStatus.Disputed;
+
+        _recordAction(collectionId, "DISPUTED", reason);
+
+        emit DebtDisputed(collectionId, msg.sender, reason, block.timestamp);
+    }
+
+    /**
+     * @notice Resolve a dispute (admin only)
+     * @param collectionId Collection ID
+     * @param inFavorOfBorrower Resolution outcome
+     * @param resolution Resolution details
+     */
+    function resolveDispute(
+        uint256 collectionId,
+        bool inFavorOfBorrower,
+        string calldata resolution
+    ) external onlyOwner validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(debt.status == CollectionStatus.Disputed, "Not disputed");
+
+        if (inFavorOfBorrower) {
+            debt.status = CollectionStatus.WrittenOff;
+            debt.isActive = false;
+            totalDebtsInCollection--;
+            totalDebtsWrittenOff++;
+        } else {
+            debt.status = CollectionStatus.Active;
+        }
+
+        _recordAction(collectionId, "DISPUTE_RESOLVED", resolution);
+
+        emit DisputeResolved(collectionId, inFavorOfBorrower, resolution);
+    }
+
+    // ============ Penalty Functions ============
+
+    /**
+     * @notice Apply penalties for overdue debt
+     * @param collectionId Collection ID
+     */
+    function applyPenalties(uint256 collectionId) external validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(debt.isActive, "Debt not active");
+
+        uint256 daysSinceDefault = (block.timestamp - debt.defaultedAt) / 1 days;
+
+        if (daysSinceDefault < (gracePeriod / 1 days)) {
+            return; // Still in grace period
+        }
+
+        uint256 daysOverdue = daysSinceDefault - (gracePeriod / 1 days);
+        uint256 penaltyAmount = (debt.originalAmount * penaltyRate * daysOverdue) / BASIS_POINTS;
+
+        debt.penaltyAmount = penaltyAmount;
+
+        // Update severity
+        DefaultSeverity oldSeverity = debt.severity;
+        DefaultSeverity newSeverity = _calculateSeverity(daysSinceDefault);
+
+        if (newSeverity != oldSeverity) {
+            debt.severity = newSeverity;
+            emit SeverityUpdated(collectionId, oldSeverity, newSeverity);
+        }
+
+        emit PenaltyApplied(collectionId, penaltyAmount, daysOverdue);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get detailed debt record
+     */
+    function getDebtRecord(uint256 collectionId) external view returns (DebtRecord memory) {
+        return debtRecords[collectionId];
+    }
+
+    /**
+     * @notice Get borrower's debt collection IDs
+     */
+    function getBorrowerDebts(address borrower) external view returns (uint256[] memory) {
+        return borrowerDebts[borrower];
+    }
+
+    /**
+     * @notice Get creditor's debt collection IDs
+     */
+    function getCreditorDebts(address creditor) external view returns (uint256[] memory) {
+        return creditorDebts[creditor];
+    }
+
+    /**
+     * @notice Get payment plan details
+     */
+    function getPaymentPlan(uint256 collectionId) external view returns (PaymentPlan memory) {
+        return paymentPlans[collectionId];
+    }
+
+    /**
+     * @notice Get collection action history
+     */
+    function getCollectionHistory(uint256 collectionId) external view returns (CollectionAction[] memory) {
+        return collectionHistory[collectionId];
+    }
+
+    /**
+     * @notice Get platform debt statistics
+     */
+    function getDebtStatistics() external view returns (
+        uint256 totalDebts,
+        uint256 totalAmount,
+        uint256 totalCollected,
+        uint256 totalPenalties,
+        uint256 totalWrittenOff
+    ) {
+        return (
+            totalDebtsInCollection,
+            totalDebtAmount,
+            totalCollectedAmount,
+            totalPenaltiesCollected,
+            totalDebtsWrittenOff
+        );
+    }
+
+    /**
+     * @notice Calculate total amount owed including penalties
+     */
+    function getTotalOwed(uint256 collectionId) external view validCollection(collectionId) returns (uint256) {
+        DebtRecord memory debt = debtRecords[collectionId];
+        return debt.remainingAmount + debt.penaltyAmount;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Write off uncollectable debt
+     * @param collectionId Collection ID
+     * @param reason Reason for write-off
+     */
+    function writeOffDebt(
+        uint256 collectionId,
+        string calldata reason
+    ) external onlyOwner validCollection(collectionId) {
+        DebtRecord storage debt = debtRecords[collectionId];
+        require(debt.isActive, "Debt not active");
+
+        debt.status = CollectionStatus.WrittenOff;
+        debt.isActive = false;
+        totalDebtsInCollection--;
+        totalDebtsWrittenOff++;
+
+        _recordAction(collectionId, "WRITTEN_OFF", reason);
+
+        emit DebtWrittenOff(collectionId, debt.remainingAmount, reason);
+        emit CollectionClosed(collectionId, "Written off");
+    }
+
+    /**
+     * @notice Update collection fee
+     */
+    function updateCollectionFee(uint256 newFee) external onlyOwner {
+        require(newFee <= MAX_COLLECTION_FEE, "Fee too high");
+        uint256 oldFee = collectionFee;
+        collectionFee = newFee;
+        emit CollectionFeeUpdated(oldFee, newFee);
+    }
+
+    /**
+     * @notice Update penalty rate
+     */
+    function updatePenaltyRate(uint256 newRate) external onlyOwner {
+        require(newRate <= MAX_PENALTY_RATE, "Rate too high");
+        uint256 oldRate = penaltyRate;
+        penaltyRate = newRate;
+        emit PenaltyRateUpdated(oldRate, newRate);
+    }
+
+    /**
+     * @notice Update grace period
+     */
+    function updateGracePeriod(uint256 newPeriod) external onlyOwner {
+        uint256 oldPeriod = gracePeriod;
+        gracePeriod = newPeriod;
+        emit GracePeriodUpdated(oldPeriod, newPeriod);
+    }
+
+    /**
+     * @notice Set authorized caller status
+     */
+    function setAuthorizedCaller(address caller, bool authorized) external onlyOwner {
+        require(caller != address(0), "Invalid caller address");
+        authorizedCallers[caller] = authorized;
+        emit AuthorizedCallerUpdated(caller, authorized);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ============ Internal Functions ============
+
+    function _updatePaymentPlan(uint256 collectionId) internal {
+        PaymentPlan storage plan = paymentPlans[collectionId];
+        plan.installmentsPaid++;
+
+        if (plan.installmentsPaid >= plan.numberOfInstallments) {
+            plan.isActive = false;
+        } else {
+            plan.nextDueDate = block.timestamp + plan.installmentPeriod;
+        }
+
+        emit PaymentPlanUpdated(collectionId, plan.installmentsPaid, plan.nextDueDate);
+    }
+
+    function _recordAction(
+        uint256 collectionId,
+        string memory actionType,
+        string memory notes
+    ) internal {
+        collectionHistory[collectionId].push(CollectionAction({
+            collectionId: collectionId,
+            actionType: actionType,
+            timestamp: block.timestamp,
+            initiator: msg.sender,
+            notes: notes
+        }));
+
+        emit CollectionActionRecorded(collectionId, actionType, msg.sender, block.timestamp);
+    }
+
+    function _processRepayment(DebtRecord storage debt, uint256 amount) internal {
+        require(amount > 0, "Amount must be positive");
+
+        // Calculate total owed including penalties
+        uint256 totalOwed = debt.remainingAmount + debt.penaltyAmount;
+        require(amount <= totalOwed, "Amount exceeds debt");
+
+        // Apply payment to penalties first, then principal
+        uint256 remainingPayment = amount;
+
+        if (debt.penaltyAmount > 0) {
+            if (remainingPayment >= debt.penaltyAmount) {
+                remainingPayment -= debt.penaltyAmount;
+                totalPenaltiesCollected += debt.penaltyAmount;
+                debt.penaltyAmount = 0;
+            } else {
+                debt.penaltyAmount -= remainingPayment;
+                totalPenaltiesCollected += remainingPayment;
+                remainingPayment = 0;
+            }
+        }
+
+        if (remainingPayment > 0) {
+            debt.remainingAmount -= remainingPayment;
+            totalCollectedAmount += remainingPayment;
+        }
+
+        // Check if debt is fully paid
+        if (debt.remainingAmount == 0 && debt.penaltyAmount == 0) {
+            debt.status = CollectionStatus.FullyPaid;
+            debt.lastPaymentAt = block.timestamp;
+            debt.isActive = false;
+            totalDebtsSettled++;
+        }
+    }
+
+    function _calculateSeverity(uint256 daysOverdue) internal pure returns (DefaultSeverity) {
+        if (daysOverdue <= 30) return DefaultSeverity.Minor;
+        if (daysOverdue <= 90) return DefaultSeverity.Moderate;
+        if (daysOverdue <= 180) return DefaultSeverity.Severe;
+        return DefaultSeverity.Critical;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    uint256[50] private __gap;
+}

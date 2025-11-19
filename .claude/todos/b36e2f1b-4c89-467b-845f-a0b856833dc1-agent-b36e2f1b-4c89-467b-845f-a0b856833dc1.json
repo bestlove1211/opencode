@@ -1,0 +1,17 @@
+[
+  {
+    "content": "Compile all contracts and verify zero errors",
+    "status": "completed",
+    "activeForm": "Compiling all contracts"
+  },
+  {
+    "content": "Verify contract sizes are within limits",
+    "status": "completed",
+    "activeForm": "Verifying contract sizes"
+  },
+  {
+    "content": "Generate compilation report",
+    "status": "in_progress",
+    "activeForm": "Generating compilation report"
+  }
+]

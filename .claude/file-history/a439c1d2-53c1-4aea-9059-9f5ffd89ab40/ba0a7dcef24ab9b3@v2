@@ -1,0 +1,458 @@
+# Bancafi Credit Platform
+
+> Institutional-grade DeFi lending and credit infrastructure on Ethereum
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Solidity](https://img.shields.io/badge/Solidity-0.8.25-blue)](https://soliditylang.org/)
+[![Hardhat](https://img.shields.io/badge/Hardhat-latest-yellow)](https://hardhat.org/)
+
+## Overview
+
+Bancafi Credit is a comprehensive decentralized lending platform that brings institutional-grade features to DeFi. Built with security, compliance, and scalability in mind, it provides a complete infrastructure for peer-to-peer lending, credit lines, debt trading, and institutional onboarding.
+
+### Key Features
+
+✅ **P2P Lending & Borrowing** - Direct lending between users with customizable terms
+✅ **Credit Scoring** - On-chain credit scoring (0-1000 scale) based on payment history
+✅ **Multi-Asset Collateral** - Support for diversified collateral baskets (up to 10 assets)
+✅ **Private Credit Lines** - Revolving credit with 5-7% APY across 5 tiers
+✅ **Debt Trading Marketplace** - Secondary market for defaulted debt (BBM)
+✅ **Portfolio Bundling** - Bundle multiple debts for institutional buyers
+✅ **Insurance Pool** - Shared insurance for lender protection
+✅ **KYC/KYB Compliance** - Full compliance system with blacklisting and slashing
+✅ **Institutional Onboarding** - Dedicated features for institutions and enterprises
+✅ **Flash Loan Protection** - Multi-layer protection against flash loan attacks
+✅ **Wallet Integration** - Support for MetaMask, WalletConnect, Gnosis Safe, and more
+✅ **Chainlink Oracles** - Real-time price feeds for liquidations
+
+## Architecture
+
+### Core Contracts
+
+| Contract | Description | Address |
+|----------|-------------|---------|
+| **BancafiLending** | Main P2P lending marketplace | [View](contracts/BancafiLending.sol) |
+| **CollateralManager** | Single-asset collateral management | [View](contracts/CollateralManager.sol) |
+| **MultiAssetCollateralManager** | Multi-asset basket collateral | [View](contracts/MultiAssetCollateralManager.sol) |
+| **CreditScore** | On-chain credit scoring system | [View](contracts/CreditScore.sol) |
+| **DebtCollection** | Defaulted loan management | [View](contracts/DebtCollection.sol) |
+| **BancafiPrivateCreditLine** | Revolving credit lines (5-7% APY) | [View](contracts/BancafiPrivateCreditLine.sol) |
+
+### Advanced Features
+
+| Contract | Description | Address |
+|----------|-------------|---------|
+| **BancafiBlockMarket** | Secondary debt marketplace | [View](contracts/BancafiBlockMarket.sol) |
+| **BancafiPortfolioManager** | Debt portfolio bundling | [View](contracts/BancafiPortfolioManager.sol) |
+| **InstitutionalOnboarding** | KYB for institutions | [View](contracts/InstitutionalOnboarding.sol) |
+| **BancafiCompliance** | KYC/KYB compliance system | [View](contracts/BancafiCompliance.sol) |
+| **BancafiInsurance** | Lender insurance pool | [View](contracts/BancafiInsurance.sol) |
+| **BancafiPriceOracle** | Chainlink price integration | [View](contracts/BancafiPriceOracle.sol) |
+| **BancafiWalletIntegration** | Multi-wallet support | [View](contracts/BancafiWalletIntegration.sol) |
+
+### Libraries
+
+| Library | Description |
+|---------|-------------|
+| **FlashLoanProtection** | Flash loan attack prevention |
+| **ComplianceIntegration** | Easy compliance checks |
+
+## Quick Start
+
+### Installation
+
+```bash
+# Clone repository
+git clone https://github.com/bancafi/bancafi-credit.git
+cd bancafi-credit
+
+# Install dependencies
+npm install
+
+# Copy environment template
+cp .env.example .env
+
+# Configure .env with your settings
+```
+
+### Compile Contracts
+
+```bash
+npx hardhat compile
+```
+
+### Run Tests
+
+```bash
+npx hardhat test
+```
+
+### Deploy to Testnet
+
+```bash
+# Deploy to Sepolia
+npx hardhat run scripts/deploy-all.ts --network sepolia
+
+# Verify contracts
+npx hardhat run scripts/verify-contracts.ts --network sepolia
+
+# Configure system
+npx hardhat run scripts/configure-system.ts --network sepolia
+```
+
+### Deploy to Mainnet
+
+```bash
+# Deploy
+npx hardhat run scripts/deploy-all.ts --network mainnet
+
+# Verify
+npx hardhat run scripts/verify-contracts.ts --network mainnet
+
+# Configure
+npx hardhat run scripts/configure-system.ts --network mainnet
+```
+
+## Usage Examples
+
+### Basic Lending
+
+```solidity
+// 1. Borrower creates request
+lending.createBorrowRequest(
+    USDC,           // loan asset
+    10000e6,        // $10,000
+    WETH,           // collateral asset
+    5e18,           // 5 ETH
+    1000,           // 10% APR
+    30 days         // duration
+);
+
+// 2. Lender accepts
+lending.acceptBorrowRequest(requestId, 1000); // 10% APR
+
+// 3. Borrower repays
+lending.repayLoan(loanId, repayAmount);
+```
+
+### Multi-Asset Collateral
+
+```solidity
+// Create basket
+uint256 basketId = multiAssetCollateral.createBasket(loanId);
+
+// Add multiple assets
+address[] memory assets = [WETH, WBTC, USDC];
+uint256[] memory amounts = [5e18, 0.1e8, 10000e6];
+
+multiAssetCollateral.batchAddCollateral(basketId, assets, amounts);
+
+// Check health
+bool healthy = multiAssetCollateral.isBasketHealthy(basketId, loanValueUSD);
+```
+
+### Private Credit Line
+
+```solidity
+// Apply for credit line
+creditLine.applyForCreditLine(USDC, 50000e6); // $50k limit
+
+// Draw credit
+creditLine.drawCredit(creditLineId, 10000e6); // Borrow $10k
+
+// Repay
+creditLine.repayCreditLine(creditLineId, 10000e6);
+```
+
+### Debt Trading
+
+```solidity
+// List defaulted debt
+blockMarket.listDebt(
+    collectionId,
+    ethers.utils.parseEther("5000"), // Ask $5k
+    ListingType.FixedPrice,
+    0, // No auction
+    30 days // Duration
+);
+
+// Buy debt
+blockMarket.buyDebt{value: price}(listingId);
+```
+
+## Documentation
+
+### Technical Documentation
+
+- [Deployment Guide](DEPLOYMENT_GUIDE.md) - Complete deployment instructions
+- [Compliance System](COMPLIANCE_SYSTEM.md) - KYC/KYB, blacklisting, and slashing
+- [Multi-Asset Collateral](MULTI_ASSET_COLLATERAL.md) - Diversified collateral guide
+- [Wallet Integration](WALLET_INTEGRATION.md) - Multi-wallet support
+- [Flash Loan Protection](FLASH_LOAN_PROTECTION.md) - Security measures
+- [Chainlink Integration](CHAINLINK_FEEDS.md) - Oracle setup
+
+### API Documentation
+
+See [docs/api/](docs/api/) for complete API reference.
+
+### Smart Contract Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    User Interface Layer                  │
+│  (MetaMask, WalletConnect, Gnosis Safe, Coinbase, etc.) │
+└────────────────────┬────────────────────────────────────┘
+                     │
+┌────────────────────┴────────────────────────────────────┐
+│              BancafiWalletIntegration                    │
+│  (Multi-sig, Batch Transactions, Delegated Access)      │
+└────────────────────┬────────────────────────────────────┘
+                     │
+┌────────────────────┴────────────────────────────────────┐
+│                 Core Lending Layer                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │   Bancafi    │  │   Private    │  │    Debt      │ │
+│  │   Lending    │  │ Credit Line  │  │  Collection  │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+└────────────────────┬────────────────────────────────────┘
+                     │
+┌────────────────────┴────────────────────────────────────┐
+│              Collateral & Risk Layer                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │  Collateral  │  │ Multi-Asset  │  │   Credit     │ │
+│  │   Manager    │  │  Collateral  │  │    Score     │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+└────────────────────┬────────────────────────────────────┘
+                     │
+┌────────────────────┴────────────────────────────────────┐
+│              Marketplace & Services                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │    Block     │  │  Portfolio   │  │   Insurance  │ │
+│  │   Market     │  │   Manager    │  │     Pool     │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+└────────────────────┬────────────────────────────────────┘
+                     │
+┌────────────────────┴────────────────────────────────────┐
+│           Infrastructure & Security Layer                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │    Price     │  │  Compliance  │  │ Institutional│ │
+│  │   Oracle     │  │   System     │  │  Onboarding  │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Security
+
+### Audits
+
+- ⏳ Trail of Bits - Scheduled
+- ⏳ Quantstamp - Scheduled
+- ⏳ OpenZeppelin - Scheduled
+
+### Security Features
+
+- ✅ UUPS Upgradeable Proxies
+- ✅ Flash Loan Protection
+- ✅ Reentrancy Guards
+- ✅ Access Control (RBAC)
+- ✅ Circuit Breakers
+- ✅ Emergency Pause
+- ✅ Rate Limiting
+- ✅ Oracle Validation
+
+### Bug Bounty
+
+We offer bug bounties for security vulnerabilities. Contact security@bancafi.com for details.
+
+## Testing
+
+### Run All Tests
+
+```bash
+npx hardhat test
+```
+
+### Run Specific Test Suite
+
+```bash
+npx hardhat test test/BancafiLending.test.ts
+```
+
+### Coverage Report
+
+```bash
+npx hardhat coverage
+```
+
+### Gas Report
+
+```bash
+REPORT_GAS=true npx hardhat test
+```
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+### Development Setup
+
+```bash
+# Install dependencies
+npm install
+
+# Run linter
+npm run lint
+
+# Format code
+npm run format
+
+# Run tests
+npm test
+```
+
+### Pull Request Process
+
+1. Fork the repository
+2. Create feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to branch (`git push origin feature/amazing-feature`)
+5. Open Pull Request
+
+## Roadmap
+
+### Phase 1: Core Platform (✅ Complete)
+- [x] P2P Lending
+- [x] Collateral Management
+- [x] Credit Scoring
+- [x] Basic Compliance
+
+### Phase 2: Advanced Features (✅ Complete)
+- [x] Multi-Asset Collateral
+- [x] Private Credit Lines
+- [x] Debt Collection
+- [x] Marketplace (BBM)
+- [x] Portfolio Bundling
+- [x] Insurance Pool
+- [x] Full Compliance System
+- [x] Wallet Integration
+
+### Phase 3: Institutional Features (⏳ In Progress)
+- [x] Institutional Onboarding
+- [ ] Advanced Analytics Dashboard
+- [ ] Institutional API
+- [ ] White-label Solutions
+- [ ] Cross-chain Support
+
+### Phase 4: Ecosystem Growth (🔮 Planned)
+- [ ] Governance Token
+- [ ] DAO Governance
+- [ ] Liquidity Mining
+- [ ] Strategic Partnerships
+- [ ] Mobile Apps
+
+## Performance
+
+### Gas Costs (Optimized)
+
+| Operation | Gas Used | USD Cost* |
+|-----------|----------|-----------|
+| Create Borrow Request | ~150,000 | $9 |
+| Accept Loan | ~200,000 | $12 |
+| Repay Loan | ~120,000 | $7.20 |
+| Create Basket | ~100,000 | $6 |
+| Add Collateral | ~80,000 | $4.80 |
+| Liquidate | ~250,000 | $15 |
+
+*At 30 gwei, ETH @ $2000
+
+### Transaction Throughput
+
+- Loans per second: ~50 (L1), ~500 (L2)
+- Settlement time: 12 seconds (L1), 2 seconds (L2)
+- Block confirmations: 2 (L1), 1 (L2)
+
+## Deployment
+
+### Mainnet Addresses
+
+Contract addresses will be published after mainnet launch.
+
+### Testnet Addresses (Sepolia)
+
+See [deployments/sepolia-latest.json](deployments/sepolia-latest.json)
+
+### Supported Networks
+
+- ✅ Ethereum Mainnet
+- ✅ Sepolia Testnet
+- 🔮 Arbitrum (Planned)
+- 🔮 Optimism (Planned)
+- 🔮 Polygon (Planned)
+- 🔮 Base (Planned)
+
+## FAQ
+
+### For Borrowers
+
+**Q: What collateral can I use?**
+A: We support ETH, WBTC, major stablecoins, and liquid staking tokens. You can provide up to 10 different assets in a single basket.
+
+**Q: How is my credit score calculated?**
+A: Credit score (0-1000) is based on payment history, on-time repayments, loan count, and time on platform.
+
+**Q: What if I'm close to liquidation?**
+A: You'll receive alerts when your loan-to-value ratio reaches 90% of liquidation threshold. You can add more collateral or partially repay to improve health.
+
+### For Lenders
+
+**Q: How are my funds protected?**
+A: Loans are over-collateralized (typically 150%). You can also purchase insurance coverage for additional protection.
+
+**Q: What returns can I expect?**
+A: Returns vary by risk. Typical APRs range from 5-20% depending on collateral quality and borrower credit score.
+
+**Q: Can I sell my loan position?**
+A: Not directly, but if a borrower defaults, the debt can be sold on our secondary marketplace (BBM).
+
+### For Institutions
+
+**Q: What are the KYB requirements?**
+A: Institutions need to provide: business registration, tax ID, beneficial ownership info, financial statements, and regulatory licenses.
+
+**Q: Do you support multi-sig wallets?**
+A: Yes! We have native support for Gnosis Safe and custom multi-sig configurations.
+
+**Q: What are the minimum transaction sizes?**
+A: No minimum for testing, but we recommend $50k+ for institutional efficiency.
+
+## Community
+
+### Social Media
+
+- Twitter: [@bancafi](https://twitter.com/bancafi)
+- Discord: [Join our community](https://discord.gg/bancafi)
+- Telegram: [t.me/bancafi](https://t.me/bancafi)
+- Medium: [medium.com/bancafi](https://medium.com/bancafi)
+
+### Support
+
+- Email: support@bancafi.com
+- Security: security@bancafi.com
+- Partnerships: partnerships@bancafi.com
+
+## License
+
+This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- OpenZeppelin for upgradeable contract templates
+- Chainlink for reliable price oracles
+- Hardhat for development environment
+- The DeFi community for inspiration and feedback
+
+---
+
+Built with ❤️ by the Bancafi Team
+
+[Website](https://bancafi.com) | [Documentation](https://docs.bancafi.com) | [Twitter](https://twitter.com/bancafi) | [Discord](https://discord.gg/bancafi)

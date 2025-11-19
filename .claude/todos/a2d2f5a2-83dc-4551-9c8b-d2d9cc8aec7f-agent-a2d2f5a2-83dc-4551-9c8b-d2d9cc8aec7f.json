@@ -1,0 +1,52 @@
+[
+  {
+    "content": "Research and analyze system requirements for Bancafi Debt Collection",
+    "status": "completed",
+    "activeForm": "Researching and analyzing system requirements"
+  },
+  {
+    "content": "Design overall system architecture and component interactions",
+    "status": "completed",
+    "activeForm": "Designing overall system architecture"
+  },
+  {
+    "content": "Design smart contract architecture for debt tokenization",
+    "status": "in_progress",
+    "activeForm": "Designing smart contract architecture"
+  },
+  {
+    "content": "Design marketplace trading mechanism",
+    "status": "pending",
+    "activeForm": "Designing marketplace trading mechanism"
+  },
+  {
+    "content": "Design SPM (Secure Payment Marker) security layer",
+    "status": "pending",
+    "activeForm": "Designing SPM security layer"
+  },
+  {
+    "content": "Implement core smart contracts (DebtToken, DebtMarketplace)",
+    "status": "pending",
+    "activeForm": "Implementing core smart contracts"
+  },
+  {
+    "content": "Implement compliance and KYC integration layer",
+    "status": "pending",
+    "activeForm": "Implementing compliance layer"
+  },
+  {
+    "content": "Implement cross-chain compatibility layer",
+    "status": "pending",
+    "activeForm": "Implementing cross-chain compatibility"
+  },
+  {
+    "content": "Implement SPM security module",
+    "status": "pending",
+    "activeForm": "Implementing SPM security module"
+  },
+  {
+    "content": "Create deployment and testing infrastructure",
+    "status": "pending",
+    "activeForm": "Creating deployment and testing infrastructure"
+  }
+]

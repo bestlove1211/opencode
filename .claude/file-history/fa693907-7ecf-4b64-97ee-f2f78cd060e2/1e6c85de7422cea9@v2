@@ -1,0 +1,990 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IBancafiBlockMarket.sol";
+import "./interfaces/IDebtCollection.sol";
+
+/**
+ * @title BancafiBlockMarket (BBM)
+ * @notice Advanced secondary marketplace for trading defaulted debt obligations
+ * @dev Full-featured debt marketplace with auctions, bidding, and institutional buyer qualification
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiBlockMarket is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20 for IERC20;
+
+    // ============ Enums ============
+
+    enum ListingType {
+        FixedPrice,      // Fixed price - buy it now
+        DutchAuction,    // Price decreases over time
+        EnglishAuction,  // Highest bidder wins
+        BestOffer        // Seller reviews and accepts best offer
+    }
+
+    enum ListingStatus {
+        Active,
+        Sold,
+        Cancelled,
+        Expired
+    }
+
+    enum BidStatus {
+        Pending,
+        Accepted,
+        Rejected,
+        Withdrawn,
+        Outbid
+    }
+
+    // ============ Structs ============
+
+    struct DebtListing {
+        uint256 id;
+        uint256 collectionId;
+        address seller;
+        address paymentAsset;        // Asset for payment (ETH = address(0))
+        uint256 faceValue;           // Original debt amount
+        uint256 startingPrice;       // Starting/asking price
+        uint256 currentPrice;        // Current price (for Dutch auctions)
+        uint256 reservePrice;        // Minimum acceptable price
+        uint256 discountRate;        // Discount from face value (basis points)
+        ListingType listingType;
+        ListingStatus status;
+        uint256 listedAt;
+        uint256 expiresAt;
+        uint256 priceDecayRate;      // For Dutch auctions (basis points per hour)
+        uint256 minBidIncrement;
+        address highestBidder;
+        uint256 highestBid;
+        uint256 totalBids;
+        bool allowPartialFill;
+        string description;
+    }
+
+    struct Bid {
+        uint256 id;
+        uint256 listingId;
+        address bidder;
+        uint256 bidAmount;
+        uint256 timestamp;
+        BidStatus status;
+        string message;
+        bool autoRebid;              // Automatically rebid if outbid
+    }
+
+    struct TradeHistory {
+        uint256 listingId;
+        uint256 collectionId;
+        address seller;
+        address buyer;
+        uint256 salePrice;
+        uint256 faceValue;
+        uint256 discountRate;
+        uint256 timestamp;
+        ListingType tradeType;
+    }
+
+    struct BuyerProfile {
+        address buyerAddress;
+        bool isQualified;
+        uint256 reputationScore;     // 0-1000
+        uint256 totalPurchases;
+        uint256 totalVolume;
+        uint256 successfulCollections;
+        uint256 defaultedCollections;
+        uint256 joinedAt;
+        string institutionName;
+    }
+
+    struct MarketAnalytics {
+        uint256 totalListings;
+        uint256 totalTrades;
+        uint256 totalVolume;
+        uint256 averageDiscount;
+        uint256 averageTimeToSale;
+        uint256 activeListings;
+        uint256 last24hVolume;
+        uint256 last24hTrades;
+    }
+
+    // ============ State Variables ============
+
+    IDebtCollection public debtCollectionContract;
+    address public institutionalOnboardingContract;
+
+    uint256 public nextListingId;
+    uint256 public nextBidId;
+    uint256 public marketplaceFee;           // in basis points
+    uint256 public buyerQualificationFee;    // Fee to become qualified buyer
+
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MAX_MARKETPLACE_FEE = 500;     // 5%
+    uint256 public constant MIN_DISCOUNT = 100;            // 1%
+    uint256 public constant MAX_LISTING_DURATION = 90 days;
+    uint256 public constant MIN_REPUTATION = 300;          // Minimum reputation to trade
+
+    mapping(uint256 => DebtListing) public listings;
+    mapping(uint256 => Bid[]) public listingBids;
+    mapping(address => uint256[]) public sellerListings;
+    mapping(address => uint256[]) public buyerPurchases;
+    mapping(uint256 => bool) public listedCollections;
+    mapping(address => BuyerProfile) public buyerProfiles;
+    mapping(address => bool) public qualifiedBuyers;
+
+    TradeHistory[] public tradeHistory;
+    MarketAnalytics public analytics;
+
+    // Price tracking for analytics
+    mapping(uint256 => uint256) public dailyVolume;
+    mapping(uint256 => uint256) public dailyTrades;
+
+    // ============ Events ============
+
+    event DebtListed(
+        uint256 indexed listingId,
+        uint256 indexed collectionId,
+        address indexed seller,
+        uint256 price
+    );
+
+    event DebtSold(
+        uint256 indexed listingId,
+        address indexed seller,
+        address indexed buyer,
+        uint256 price
+    );
+
+    event ListingUpdated(
+        uint256 indexed listingId,
+        uint256 oldPrice,
+        uint256 newPrice
+    );
+
+    event ListingCancelled(
+        uint256 indexed listingId,
+        address indexed seller
+    );
+
+    event ListingCreatedDetailed(
+        uint256 indexed listingId,
+        uint256 indexed collectionId,
+        address indexed seller,
+        uint256 faceValue,
+        uint256 startingPrice,
+        uint256 discountRate,
+        ListingType listingType,
+        uint256 expiresAt
+    );
+
+    event ListingPriceDecayed(
+        uint256 indexed listingId,
+        uint256 oldPrice,
+        uint256 newPrice,
+        uint256 timestamp
+    );
+
+    event BidPlaced(
+        uint256 indexed bidId,
+        uint256 indexed listingId,
+        address indexed bidder,
+        uint256 bidAmount,
+        uint256 timestamp
+    );
+
+    event BidOutbid(
+        uint256 indexed bidId,
+        address indexed previousBidder,
+        address indexed newBidder,
+        uint256 newBid
+    );
+
+    event BidAccepted(
+        uint256 indexed bidId,
+        uint256 indexed listingId,
+        address indexed buyer,
+        uint256 amount
+    );
+
+    event BidRejected(
+        uint256 indexed bidId,
+        uint256 indexed listingId,
+        string reason
+    );
+
+    event BidWithdrawn(
+        uint256 indexed bidId,
+        uint256 indexed listingId,
+        address indexed bidder
+    );
+
+    event TradeExecuted(
+        uint256 indexed listingId,
+        uint256 indexed collectionId,
+        address indexed buyer,
+        address seller,
+        uint256 salePrice,
+        uint256 faceValue,
+        uint256 discountRate
+    );
+
+    event BuyerQualified(
+        address indexed buyer,
+        string institutionName,
+        uint256 timestamp
+    );
+
+    event BuyerDisqualified(
+        address indexed buyer,
+        string reason,
+        uint256 timestamp
+    );
+
+    event ReputationUpdated(
+        address indexed buyer,
+        uint256 oldScore,
+        uint256 newScore,
+        string reason
+    );
+
+    event MarketplaceFeeCollected(
+        uint256 indexed listingId,
+        uint256 feeAmount,
+        uint256 timestamp
+    );
+
+    event PriceOracleUpdated(
+        uint256 indexed listingId,
+        uint256 newPrice,
+        string reason
+    );
+
+    // ============ Modifiers ============
+
+    modifier onlyQualifiedBuyer() {
+        require(qualifiedBuyers[msg.sender], "Not a qualified buyer");
+        require(buyerProfiles[msg.sender].reputationScore >= MIN_REPUTATION, "Reputation too low");
+        _;
+    }
+
+    modifier validListing(uint256 listingId) {
+        require(listingId > 0 && listingId < nextListingId, "Invalid listing ID");
+        require(listings[listingId].id == listingId, "Listing does not exist");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        address _debtCollectionContract,
+        address _institutionalOnboardingContract,
+        uint256 _marketplaceFee,
+        uint256 _buyerQualificationFee
+    ) public initializer {
+        require(_debtCollectionContract != address(0), "Invalid debt collection address");
+        require(_marketplaceFee <= MAX_MARKETPLACE_FEE, "Fee too high");
+
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        debtCollectionContract = IDebtCollection(_debtCollectionContract);
+        institutionalOnboardingContract = _institutionalOnboardingContract;
+        marketplaceFee = _marketplaceFee;
+        buyerQualificationFee = _buyerQualificationFee;
+        nextListingId = 1;
+        nextBidId = 1;
+    }
+
+    // ============ Listing Functions ============
+
+    /**
+     * @notice List defaulted debt for sale on the marketplace
+     * @param collectionId Debt collection ID from DebtCollection contract
+     * @param startingPrice Starting/asking price
+     * @param reservePrice Minimum acceptable price (0 for no reserve)
+     * @param listingType Type of listing
+     * @param duration Listing duration in seconds
+     * @param priceDecayRate Price decay rate for Dutch auctions (basis points/hour)
+     * @param description Description of the debt
+     * @return listingId Created listing ID
+     */
+    function listDebt(
+        uint256 collectionId,
+        uint256 startingPrice,
+        uint256 reservePrice,
+        ListingType listingType,
+        uint256 duration,
+        uint256 priceDecayRate,
+        string calldata description
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(duration > 0 && duration <= MAX_LISTING_DURATION, "Invalid duration");
+        require(!listedCollections[collectionId], "Collection already listed");
+        require(startingPrice > 0, "Price must be positive");
+        require(reservePrice <= startingPrice, "Reserve cannot exceed starting price");
+
+        // Verify debt ownership and get details
+        (
+            ,
+            ,
+            address creditor,
+            uint256 originalAmount,
+            uint256 remainingAmount,
+
+        ) = debtCollectionContract.getCollectionDetails(collectionId);
+
+        require(msg.sender == creditor, "Not debt owner");
+        require(remainingAmount > 0, "No remaining debt");
+        require(startingPrice < remainingAmount, "Price must be below face value");
+
+        uint256 discountRate = ((remainingAmount - startingPrice) * BASIS_POINTS) / remainingAmount;
+        require(discountRate >= MIN_DISCOUNT, "Discount too low");
+
+        uint256 listingId = nextListingId++;
+
+        listings[listingId] = DebtListing({
+            id: listingId,
+            collectionId: collectionId,
+            seller: msg.sender,
+            paymentAsset: address(0), // ETH for now
+            faceValue: remainingAmount,
+            startingPrice: startingPrice,
+            currentPrice: startingPrice,
+            reservePrice: reservePrice,
+            discountRate: discountRate,
+            listingType: listingType,
+            status: ListingStatus.Active,
+            listedAt: block.timestamp,
+            expiresAt: block.timestamp + duration,
+            priceDecayRate: priceDecayRate,
+            minBidIncrement: startingPrice / 100,
+            highestBidder: address(0),
+            highestBid: 0,
+            totalBids: 0,
+            allowPartialFill: false,
+            description: description
+        });
+
+        listedCollections[collectionId] = true;
+        sellerListings[msg.sender].push(listingId);
+
+        analytics.totalListings++;
+        analytics.activeListings++;
+
+        emit DebtListed(listingId, collectionId, msg.sender, startingPrice);
+        emit ListingCreatedDetailed(
+            listingId,
+            collectionId,
+            msg.sender,
+            remainingAmount,
+            startingPrice,
+            discountRate,
+            listingType,
+            block.timestamp + duration
+        );
+
+        return listingId;
+    }
+
+    /**
+     * @notice Buy debt at current price (Fixed Price or Dutch Auction)
+     * @param listingId Listing ID to purchase
+     */
+    function buyDebt(
+        uint256 listingId
+    ) external payable override nonReentrant whenNotPaused onlyQualifiedBuyer validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(
+            listing.listingType == ListingType.FixedPrice || listing.listingType == ListingType.DutchAuction,
+            "Use bidding for this listing type"
+        );
+        require(block.timestamp < listing.expiresAt, "Listing expired");
+
+        // Update price for Dutch auction
+        if (listing.listingType == ListingType.DutchAuction) {
+            _updateDutchAuctionPrice(listingId);
+        }
+
+        uint256 currentPrice = listing.currentPrice;
+        require(currentPrice >= listing.reservePrice, "Price below reserve");
+        require(msg.value >= currentPrice, "Insufficient payment");
+
+        _executeTrade(listingId, msg.sender, currentPrice);
+
+        // Refund excess payment
+        if (msg.value > currentPrice) {
+            payable(msg.sender).transfer(msg.value - currentPrice);
+        }
+    }
+
+    /**
+     * @notice Place bid on a listing
+     * @param listingId Listing ID
+     * @param bidAmount Bid amount
+     * @param message Optional message to seller
+     * @param autoRebid Automatically rebid if outbid
+     */
+    function placeBid(
+        uint256 listingId,
+        uint256 bidAmount,
+        string calldata message,
+        bool autoRebid
+    ) external payable nonReentrant whenNotPaused onlyQualifiedBuyer validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(
+            listing.listingType == ListingType.EnglishAuction || listing.listingType == ListingType.BestOffer,
+            "Listing doesn't accept bids"
+        );
+        require(block.timestamp < listing.expiresAt, "Listing expired");
+        require(bidAmount >= listing.reservePrice, "Bid below reserve price");
+        require(msg.value >= bidAmount, "Insufficient payment");
+
+        // For English auctions, bid must exceed current highest
+        if (listing.listingType == ListingType.EnglishAuction && listing.highestBid > 0) {
+            require(bidAmount >= listing.highestBid + listing.minBidIncrement, "Bid increment too low");
+        }
+
+        uint256 bidId = nextBidId++;
+
+        listingBids[listingId].push(Bid({
+            id: bidId,
+            listingId: listingId,
+            bidder: msg.sender,
+            bidAmount: bidAmount,
+            timestamp: block.timestamp,
+            status: BidStatus.Pending,
+            message: message,
+            autoRebid: autoRebid
+        }));
+
+        // Update highest bid for English auctions
+        if (listing.listingType == ListingType.EnglishAuction) {
+            if (listing.highestBidder != address(0)) {
+                // Mark previous highest bid as outbid
+                _markBidAsOutbid(listingId, listing.highestBidder);
+
+                // Refund previous highest bidder
+                payable(listing.highestBidder).transfer(listing.highestBid);
+
+                emit BidOutbid(bidId, listing.highestBidder, msg.sender, bidAmount);
+            }
+
+            listing.highestBidder = msg.sender;
+            listing.highestBid = bidAmount;
+        }
+
+        listing.totalBids++;
+
+        emit BidPlaced(bidId, listingId, msg.sender, bidAmount, block.timestamp);
+
+        // Auto-execute if English auction and time expired
+        if (listing.listingType == ListingType.EnglishAuction && block.timestamp >= listing.expiresAt) {
+            _executeAuctionWinner(listingId);
+        }
+
+        // Refund excess
+        if (msg.value > bidAmount) {
+            payable(msg.sender).transfer(msg.value - bidAmount);
+        }
+    }
+
+    /**
+     * @notice Accept a bid (seller only, for BestOffer listings)
+     * @param listingId Listing ID
+     * @param bidId Bid ID to accept
+     */
+    function acceptBid(
+        uint256 listingId,
+        uint256 bidId
+    ) external nonReentrant validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(msg.sender == listing.seller, "Not listing owner");
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(listing.listingType == ListingType.BestOffer, "Not a best offer listing");
+
+        Bid[] storage bids = listingBids[listingId];
+        Bid storage acceptedBid;
+        bool found = false;
+
+        for (uint256 i = 0; i < bids.length; i++) {
+            if (bids[i].id == bidId) {
+                acceptedBid = bids[i];
+                found = true;
+                break;
+            }
+        }
+
+        require(found, "Bid not found");
+        require(acceptedBid.status == BidStatus.Pending, "Bid not pending");
+        require(acceptedBid.bidAmount >= listing.reservePrice, "Bid below reserve");
+
+        acceptedBid.status = BidStatus.Accepted;
+
+        _executeTrade(listingId, acceptedBid.bidder, acceptedBid.bidAmount);
+
+        // Reject all other pending bids
+        for (uint256 i = 0; i < bids.length; i++) {
+            if (bids[i].status == BidStatus.Pending && bids[i].id != bidId) {
+                bids[i].status = BidStatus.Rejected;
+            }
+        }
+
+        emit BidAccepted(bidId, listingId, acceptedBid.bidder, acceptedBid.bidAmount);
+    }
+
+    /**
+     * @notice Reject a bid (seller only)
+     * @param listingId Listing ID
+     * @param bidId Bid ID to reject
+     * @param reason Rejection reason
+     */
+    function rejectBid(
+        uint256 listingId,
+        uint256 bidId,
+        string calldata reason
+    ) external validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(msg.sender == listing.seller, "Not listing owner");
+        require(listing.listingType == ListingType.BestOffer, "Only for best offer listings");
+
+        Bid[] storage bids = listingBids[listingId];
+
+        for (uint256 i = 0; i < bids.length; i++) {
+            if (bids[i].id == bidId) {
+                require(bids[i].status == BidStatus.Pending, "Bid not pending");
+                bids[i].status = BidStatus.Rejected;
+
+                // Refund bidder
+                payable(bids[i].bidder).transfer(bids[i].bidAmount);
+
+                emit BidRejected(bidId, listingId, reason);
+                return;
+            }
+        }
+
+        revert("Bid not found");
+    }
+
+    /**
+     * @notice Withdraw a bid (bidder only)
+     * @param listingId Listing ID
+     * @param bidId Bid ID to withdraw
+     */
+    function withdrawBid(
+        uint256 listingId,
+        uint256 bidId
+    ) external nonReentrant validListing(listingId) {
+        Bid[] storage bids = listingBids[listingId];
+
+        for (uint256 i = 0; i < bids.length; i++) {
+            if (bids[i].id == bidId) {
+                require(bids[i].bidder == msg.sender, "Not bid owner");
+                require(bids[i].status == BidStatus.Pending, "Bid not pending");
+
+                bids[i].status = BidStatus.Withdrawn;
+
+                // Refund bidder
+                payable(msg.sender).transfer(bids[i].bidAmount);
+
+                emit BidWithdrawn(bidId, listingId, msg.sender);
+                return;
+            }
+        }
+
+        revert("Bid not found");
+    }
+
+    /**
+     * @notice Cancel a listing (seller only)
+     * @param listingId Listing ID to cancel
+     */
+    function cancelListing(
+        uint256 listingId
+    ) external override nonReentrant validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(msg.sender == listing.seller, "Not listing owner");
+        require(listing.status == ListingStatus.Active, "Listing not active");
+
+        listing.status = ListingStatus.Cancelled;
+        listedCollections[listing.collectionId] = false;
+
+        if (analytics.activeListings > 0) {
+            analytics.activeListings--;
+        }
+
+        // Refund all pending bids
+        _refundAllBids(listingId);
+
+        emit ListingCancelled(listingId, msg.sender);
+    }
+
+    /**
+     * @notice Update listing price (seller only, FixedPrice listings only)
+     * @param listingId Listing ID
+     * @param newPrice New asking price
+     */
+    function updateListingPrice(
+        uint256 listingId,
+        uint256 newPrice
+    ) external override validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(msg.sender == listing.seller, "Not listing owner");
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(listing.listingType == ListingType.FixedPrice, "Can only update fixed price listings");
+        require(newPrice < listing.faceValue, "Price must be below face value");
+        require(newPrice >= listing.reservePrice, "Price below reserve");
+
+        uint256 oldPrice = listing.currentPrice;
+        listing.currentPrice = newPrice;
+        listing.startingPrice = newPrice;
+        listing.discountRate = ((listing.faceValue - newPrice) * BASIS_POINTS) / listing.faceValue;
+
+        emit ListingUpdated(listingId, oldPrice, newPrice);
+    }
+
+    /**
+     * @notice Finalize expired English auction
+     * @param listingId Listing ID
+     */
+    function finalizeAuction(uint256 listingId) external nonReentrant validListing(listingId) {
+        DebtListing storage listing = listings[listingId];
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(listing.listingType == ListingType.EnglishAuction, "Not an auction");
+        require(block.timestamp >= listing.expiresAt, "Auction not ended");
+
+        _executeAuctionWinner(listingId);
+    }
+
+    // ============ Buyer Qualification ============
+
+    /**
+     * @notice Apply to become a qualified buyer
+     * @param institutionName Name of institution
+     */
+    function applyAsQualifiedBuyer(
+        string calldata institutionName
+    ) external payable nonReentrant {
+        require(!qualifiedBuyers[msg.sender], "Already qualified");
+        require(msg.value >= buyerQualificationFee, "Insufficient qualification fee");
+        require(bytes(institutionName).length > 0, "Institution name required");
+
+        buyerProfiles[msg.sender] = BuyerProfile({
+            buyerAddress: msg.sender,
+            isQualified: true,
+            reputationScore: 500, // Start with neutral reputation
+            totalPurchases: 0,
+            totalVolume: 0,
+            successfulCollections: 0,
+            defaultedCollections: 0,
+            joinedAt: block.timestamp,
+            institutionName: institutionName
+        });
+
+        qualifiedBuyers[msg.sender] = true;
+
+        emit BuyerQualified(msg.sender, institutionName, block.timestamp);
+
+        // Refund excess
+        if (msg.value > buyerQualificationFee) {
+            payable(msg.sender).transfer(msg.value - buyerQualificationFee);
+        }
+    }
+
+    /**
+     * @notice Update buyer reputation (admin or automated)
+     * @param buyer Buyer address
+     * @param newScore New reputation score
+     * @param reason Reason for update
+     */
+    function updateBuyerReputation(
+        address buyer,
+        uint256 newScore,
+        string calldata reason
+    ) external onlyOwner {
+        require(qualifiedBuyers[buyer], "Not a qualified buyer");
+        require(newScore <= 1000, "Score must be 0-1000");
+
+        uint256 oldScore = buyerProfiles[buyer].reputationScore;
+        buyerProfiles[buyer].reputationScore = newScore;
+
+        emit ReputationUpdated(buyer, oldScore, newScore, reason);
+    }
+
+    /**
+     * @notice Disqualify a buyer
+     * @param buyer Buyer address
+     * @param reason Disqualification reason
+     */
+    function disqualifyBuyer(
+        address buyer,
+        string calldata reason
+    ) external onlyOwner {
+        require(qualifiedBuyers[buyer], "Not a qualified buyer");
+
+        qualifiedBuyers[buyer] = false;
+        buyerProfiles[buyer].isQualified = false;
+
+        emit BuyerDisqualified(buyer, reason, block.timestamp);
+    }
+
+    // ============ View Functions ============
+
+    function getListingDetails(uint256 listingId)
+        external
+        view
+        override
+        validListing(listingId)
+        returns (
+            uint256 collectionId,
+            address seller,
+            uint256 price,
+            bool isActive,
+            uint256 listedAt
+        )
+    {
+        DebtListing memory listing = listings[listingId];
+        return (
+            listing.collectionId,
+            listing.seller,
+            listing.currentPrice,
+            listing.status == ListingStatus.Active,
+            listing.listedAt
+        );
+    }
+
+    function getListing(uint256 listingId) external view validListing(listingId) returns (DebtListing memory) {
+        return listings[listingId];
+    }
+
+    function getActiveListings() external view override returns (uint256[] memory) {
+        uint256[] memory tempIds = new uint256[](analytics.activeListings);
+        uint256 currentIndex = 0;
+
+        for (uint256 i = 1; i < nextListingId && currentIndex < analytics.activeListings; i++) {
+            if (listings[i].status == ListingStatus.Active) {
+                tempIds[currentIndex] = i;
+                currentIndex++;
+            }
+        }
+
+        return tempIds;
+    }
+
+    function getUserListings(address user) external view override returns (uint256[] memory) {
+        return sellerListings[user];
+    }
+
+    function getUserPurchases(address user) external view returns (uint256[] memory) {
+        return buyerPurchases[user];
+    }
+
+    function getListingBids(uint256 listingId) external view returns (Bid[] memory) {
+        return listingBids[listingId];
+    }
+
+    function getBuyerProfile(address buyer) external view returns (BuyerProfile memory) {
+        return buyerProfiles[buyer];
+    }
+
+    function getMarketAnalytics() external view returns (MarketAnalytics memory) {
+        return analytics;
+    }
+
+    function getTradeHistory() external view returns (TradeHistory[] memory) {
+        return tradeHistory;
+    }
+
+    // ============ Internal Functions ============
+
+    function _executeTrade(
+        uint256 listingId,
+        address buyer,
+        uint256 salePrice
+    ) internal {
+        DebtListing storage listing = listings[listingId];
+
+        // Calculate fees
+        uint256 feeAmount = (salePrice * marketplaceFee) / BASIS_POINTS;
+        uint256 sellerAmount = salePrice - feeAmount;
+
+        // Transfer debt ownership via DebtCollection
+        debtCollectionContract.sellDebt(listing.collectionId, buyer, salePrice);
+
+        // Transfer payment
+        payable(listing.seller).transfer(sellerAmount);
+        if (feeAmount > 0) {
+            payable(owner()).transfer(feeAmount);
+            emit MarketplaceFeeCollected(listingId, feeAmount, block.timestamp);
+        }
+
+        // Update listing
+        listing.status = ListingStatus.Sold;
+        listedCollections[listing.collectionId] = false;
+
+        // Update analytics
+        uint256 timeToSale = block.timestamp - listing.listedAt;
+        analytics.totalTrades++;
+        analytics.totalVolume += salePrice;
+        if (analytics.activeListings > 0) {
+            analytics.activeListings--;
+        }
+
+        // Update daily stats
+        uint256 today = block.timestamp / 1 days;
+        dailyVolume[today] += salePrice;
+        dailyTrades[today]++;
+        analytics.last24hVolume = dailyVolume[today];
+        analytics.last24hTrades = dailyTrades[today];
+
+        // Update average metrics
+        if (analytics.averageTimeToSale == 0) {
+            analytics.averageTimeToSale = timeToSale;
+        } else {
+            analytics.averageTimeToSale = (analytics.averageTimeToSale * (analytics.totalTrades - 1) + timeToSale) / analytics.totalTrades;
+        }
+
+        uint256 totalDiscount = (analytics.averageDiscount * (analytics.totalTrades - 1)) + listing.discountRate;
+        analytics.averageDiscount = totalDiscount / analytics.totalTrades;
+
+        // Update buyer profile
+        BuyerProfile storage profile = buyerProfiles[buyer];
+        profile.totalPurchases++;
+        profile.totalVolume += salePrice;
+
+        // Boost reputation for successful purchase
+        if (profile.reputationScore < 1000) {
+            profile.reputationScore += 5;
+            if (profile.reputationScore > 1000) {
+                profile.reputationScore = 1000;
+            }
+        }
+
+        // Record trade
+        tradeHistory.push(TradeHistory({
+            listingId: listingId,
+            collectionId: listing.collectionId,
+            seller: listing.seller,
+            buyer: buyer,
+            salePrice: salePrice,
+            faceValue: listing.faceValue,
+            discountRate: listing.discountRate,
+            timestamp: block.timestamp,
+            tradeType: listing.listingType
+        }));
+
+        buyerPurchases[buyer].push(listingId);
+
+        emit DebtSold(listingId, listing.seller, buyer, salePrice);
+        emit TradeExecuted(listingId, listing.collectionId, buyer, listing.seller, salePrice, listing.faceValue, listing.discountRate);
+    }
+
+    function _updateDutchAuctionPrice(uint256 listingId) internal {
+        DebtListing storage listing = listings[listingId];
+
+        uint256 timeElapsed = block.timestamp - listing.listedAt;
+        uint256 hoursElapsed = timeElapsed / 1 hours;
+
+        if (hoursElapsed > 0) {
+            uint256 priceReduction = (listing.startingPrice * listing.priceDecayRate * hoursElapsed) / BASIS_POINTS;
+            uint256 newPrice = listing.startingPrice > priceReduction ? listing.startingPrice - priceReduction : listing.reservePrice;
+
+            if (newPrice < listing.reservePrice) {
+                newPrice = listing.reservePrice;
+            }
+
+            if (newPrice != listing.currentPrice) {
+                uint256 oldPrice = listing.currentPrice;
+                listing.currentPrice = newPrice;
+                emit ListingPriceDecayed(listingId, oldPrice, newPrice, block.timestamp);
+            }
+        }
+    }
+
+    function _executeAuctionWinner(uint256 listingId) internal {
+        DebtListing storage listing = listings[listingId];
+
+        if (listing.highestBidder != address(0) && listing.highestBid >= listing.reservePrice) {
+            _executeTrade(listingId, listing.highestBidder, listing.highestBid);
+        } else {
+            // No valid bids, expire listing
+            listing.status = ListingStatus.Expired;
+            listedCollections[listing.collectionId] = false;
+            if (analytics.activeListings > 0) {
+                analytics.activeListings--;
+            }
+
+            // Refund highest bidder if exists
+            if (listing.highestBidder != address(0)) {
+                payable(listing.highestBidder).transfer(listing.highestBid);
+            }
+        }
+    }
+
+    function _markBidAsOutbid(uint256 listingId, address bidder) internal {
+        Bid[] storage bids = listingBids[listingId];
+
+        for (uint256 i = bids.length; i > 0; i--) {
+            if (bids[i - 1].bidder == bidder && bids[i - 1].status == BidStatus.Pending) {
+                bids[i - 1].status = BidStatus.Outbid;
+                break;
+            }
+        }
+    }
+
+    function _refundAllBids(uint256 listingId) internal {
+        Bid[] storage bids = listingBids[listingId];
+
+        for (uint256 i = 0; i < bids.length; i++) {
+            if (bids[i].status == BidStatus.Pending) {
+                bids[i].status = BidStatus.Withdrawn;
+                payable(bids[i].bidder).transfer(bids[i].bidAmount);
+            }
+        }
+    }
+
+    // ============ Admin Functions ============
+
+    function updateMarketplaceFee(uint256 newFee) external onlyOwner {
+        require(newFee <= MAX_MARKETPLACE_FEE, "Fee too high");
+        marketplaceFee = newFee;
+    }
+
+    function updateBuyerQualificationFee(uint256 newFee) external onlyOwner {
+        buyerQualificationFee = newFee;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    receive() external payable {}
+
+    uint256[50] private __gap;
+}

@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+interface IBancafiCompliance {
+    function isUserVerified(address user) external view returns (bool);
+    function isBlacklisted(address user) external view returns (bool);
+    function meetsMinimumLevel(address user) external view returns (bool);
+}
+
+/**
+ * @title ComplianceGuard
+ * @notice Abstract contract to add compliance checks to any contract
+ * @dev Inherit this to add KYC/KYB and blacklist protection
+ */
+abstract contract ComplianceGuard {
+    IBancafiCompliance public complianceContract;
+
+    event ComplianceContractUpdated(address indexed oldContract, address indexed newContract);
+    event ComplianceCheckFailed(address indexed user, string reason);
+
+    /**
+     * @notice Initialize compliance contract
+     * @param _complianceContract Compliance contract address
+     */
+    function _initializeCompliance(address _complianceContract) internal {
+        require(_complianceContract != address(0), "Invalid compliance contract");
+        complianceContract = IBancafiCompliance(_complianceContract);
+        emit ComplianceContractUpdated(address(0), _complianceContract);
+    }
+
+    /**
+     * @notice Modifier to check user is verified
+     */
+    modifier onlyVerified() {
+        require(_isVerified(msg.sender), "User not KYC verified");
+        _;
+    }
+
+    /**
+     * @notice Modifier to check user is not blacklisted
+     */
+    modifier notBlacklisted() {
+        require(!_isBlacklisted(msg.sender), "User is blacklisted");
+        _;
+    }
+
+    /**
+     * @notice Modifier for full compliance check
+     */
+    modifier compliant() {
+        require(_isCompliant(msg.sender), "Compliance check failed");
+        _;
+    }
+
+    /**
+     * @notice Modifier to check specific user compliance
+     * @param user User to check
+     */
+    modifier userCompliant(address user) {
+        require(_isCompliant(user), "User compliance check failed");
+        _;
+    }
+
+    /**
+     * @notice Check if user is verified
+     * @param user User address
+     * @return Whether user is verified
+     */
+    function _isVerified(address user) internal view returns (bool) {
+        if (address(complianceContract) == address(0)) return true;
+
+        try complianceContract.isUserVerified(user) returns (bool verified) {
+            return verified;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * @notice Check if user is blacklisted
+     * @param user User address
+     * @return Whether user is blacklisted
+     */
+    function _isBlacklisted(address user) internal view returns (bool) {
+        if (address(complianceContract) == address(0)) return false;
+
+        try complianceContract.isBlacklisted(user) returns (bool blacklisted) {
+            return blacklisted;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * @notice Full compliance check
+     * @param user User address
+     * @return Whether user is compliant
+     */
+    function _isCompliant(address user) internal view returns (bool) {
+        if (address(complianceContract) == address(0)) return true;
+
+        // Check verified
+        if (!_isVerified(user)) return false;
+
+        // Check not blacklisted
+        if (_isBlacklisted(user)) return false;
+
+        // Check minimum level
+        try complianceContract.meetsMinimumLevel(user) returns (bool meetsLevel) {
+            return meetsLevel;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * @notice Update compliance contract (admin only)
+     * @param newComplianceContract New compliance contract address
+     */
+    function _updateComplianceContract(address newComplianceContract) internal {
+        require(newComplianceContract != address(0), "Invalid compliance contract");
+        address oldContract = address(complianceContract);
+        complianceContract = IBancafiCompliance(newComplianceContract);
+        emit ComplianceContractUpdated(oldContract, newComplianceContract);
+    }
+
+    /**
+     * @notice Check multiple users at once
+     * @param users Array of user addresses
+     * @return compliant Array of compliance status
+     */
+    function _batchCheckCompliance(address[] memory users)
+        internal
+        view
+        returns (bool[] memory compliant)
+    {
+        compliant = new bool[](users.length);
+
+        for (uint256 i = 0; i < users.length; i++) {
+            compliant[i] = _isCompliant(users[i]);
+        }
+
+        return compliant;
+    }
+}

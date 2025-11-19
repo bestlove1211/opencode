@@ -1,0 +1,125 @@
+import { Server } from 'http';
+
+// Network-specific deployment configuration
+export const getNetworkConfig = (banca-Server) => {
+    const configs = {
+        localhost: {
+            confirmations: 1,
+            gasPrice: null, // auto
+            votingDelay: 1, // 1 block
+            votingPeriod: 50400, // ~1 week
+            timelockDelay: 172800, // 2 days
+            proposalThreshold: "100000", // 100k tokens
+            quorumPercentage: 4, // 4%
+            initialTokenSupply: "1000000", // 1M tokens
+            tradingFee: 250, // 2.5%
+            minListingDuration: 86400, // 1 day
+            maxListingDuration: 2592000, // 30 days
+            minPrincipalAmount: "100", // 100 tokens
+            maxInterestRate: 5000, // 50%
+            defaultSecurityDeposit: "1000",
+            slashingPercentage: 2000, // 20%
+            maxWarnings: 3
+        },
+        sepolia: {
+            confirmations: 2,
+            gasPrice: null,
+            votingDelay: 1,
+            votingPeriod: 50400,
+            timelockDelay: 172800,
+            proposalThreshold: "100000",
+            quorumPercentage: 4,
+            initialTokenSupply: "1000000",
+            tradingFee: 250,
+            minListingDuration: 86400,
+            maxListingDuration: 2592000,
+            minPrincipalAmount: "100",
+            maxInterestRate: 5000,
+            defaultSecurityDeposit: "1000",
+            slashingPercentage: 2000,
+            maxWarnings: 3
+        },
+        mainnet: {
+            confirmations: 5,
+            gasPrice: null,
+            votingDelay: 13140, // ~2 days (12 sec blocks)
+            votingPeriod: 50400, // ~1 week
+            timelockDelay: 172800, // 2 days
+            proposalThreshold: "100000",
+            quorumPercentage: 4,
+            initialTokenSupply: "1000000",
+            tradingFee: 250,
+            minListingDuration: 86400,
+            maxListingDuration: 2592000,
+            minPrincipalAmount: "100",
+            maxInterestRate: 5000,
+            defaultSecurityDeposit: "1000",
+            slashingPercentage: 2000,
+            maxWarnings: 3
+        }
+    };
+
+    return configs[networkName] || configs.localhost;
+};
+
+// Contract verification helper
+export const verifyContract = async (hre, address, constructorArguments = []) => {
+    console.log(`Verifying contract at ${address}...`);
+    try {
+        await hre.run("verify:verify", {
+            address,
+            constructorArguments
+        });
+        console.log("✅ Contract verified");
+    } catch (error) {
+        if (error.message.includes("Already Verified")) {
+            console.log("✅ Contract already verified");
+        } else {
+            console.log("❌ Verification failed:", error.message);
+        }
+    }
+};
+
+// Wait for confirmations
+export const waitForConfirmations = async (tx, confirmations) => {
+    console.log(`Waiting for ${confirmations} confirmations...`);
+    await tx.wait(confirmations);
+    console.log("✅ Transaction confirmed");
+};
+
+// Save deployment addresses
+export const saveDeployment = (networkName, deploymentData) => {
+    const fs = await import('fs');
+    const path = await import('path');
+
+    const deploymentsDir = path.join(process.cwd(), 'deployments');
+    if (!fs.existsSync(deploymentsDir)) {
+        fs.mkdirSync(deploymentsDir);
+    }
+
+    const filePath = path.join(deploymentsDir, `${networkName}.json`);
+    const timestamp = new Date().toISOString();
+
+    const deployment = {
+        network: networkName,
+        timestamp,
+        ...deploymentData
+    };
+
+    fs.writeFileSync(filePath, JSON.stringify(deployment, null, 2));
+    console.log(`✅ Deployment saved to ${filePath}`);
+};
+
+// Load deployment addresses
+export const loadDeployment = async (networkName) => {
+    const fs = await import('fs');
+    const path = await import('path');
+
+    const filePath = path.join(process.cwd(), 'deployments', `${networkName}.json`);
+
+    if (fs.existsSync(filePath)) {
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    }
+
+    return null;
+};

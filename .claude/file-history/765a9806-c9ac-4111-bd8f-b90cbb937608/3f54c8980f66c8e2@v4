@@ -1,0 +1,602 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("MultiAssetCollateralManager - FIXED", function () {
+  let multiAssetCollateral, priceOracle;
+  let owner, user1, manager, liquidator;
+  let mockUSDC, mockWETH, mockWBTC;
+
+  const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
+  const LIQUIDATOR_ROLE = ethers.keccak256(ethers.toUtf8Bytes("LIQUIDATOR_ROLE"));
+
+  beforeEach(async function () {
+    [owner, user1, manager, liquidator] = await ethers.getSigners();
+
+    // Deploy mock Chainlink aggregator
+    const MockChainlinkAggregator = await ethers.getContractFactory("MockChainlinkAggregator");
+    const mockChainlinkFeed = await MockChainlinkAggregator.deploy(18, "ETH/USD");
+    await mockChainlinkFeed.waitForDeployment();
+
+    // Deploy mock Price Oracle
+    const MockPriceOracle = await ethers.getContractFactory("BancafiPriceOracle");
+    priceOracle = await upgrades.deployProxy(
+      MockPriceOracle,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await priceOracle.waitForDeployment();
+
+    // Deploy mock tokens
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    mockUSDC = await MockERC20.deploy("Mock USDC", "USDC", 6);
+    mockWETH = await MockERC20.deploy("Mock WETH", "WETH", 18);
+    mockWBTC = await MockERC20.deploy("Mock WBTC", "WBTC", 8);
+
+    await mockUSDC.waitForDeployment();
+    await mockWETH.waitForDeployment();
+    await mockWBTC.waitForDeployment();
+
+    // Add price feeds to oracle for all assets
+    await priceOracle.addChainlinkFeed(
+      await mockWETH.getAddress(),
+      await mockChainlinkFeed.getAddress(),
+      3600,  // 1 hour heartbeat
+      ethers.parseEther("500"),   // Min price $500
+      ethers.parseEther("10000")  // Max price $10,000
+    );
+
+    await priceOracle.addChainlinkFeed(
+      await mockWBTC.getAddress(),
+      await mockChainlinkFeed.getAddress(),
+      3600,
+      ethers.parseEther("10000"),   // Min price $10k
+      ethers.parseEther("100000")   // Max price $100k
+    );
+
+    await priceOracle.addChainlinkFeed(
+      await mockUSDC.getAddress(),
+      await mockChainlinkFeed.getAddress(),
+      3600,
+      ethers.parseEther("0.9"),   // Min price $0.90
+      ethers.parseEther("1.1")    // Max price $1.10
+    );
+
+    // Set fallback prices
+    await priceOracle.setFallbackPrice(
+      await mockWETH.getAddress(),
+      ethers.parseEther("2000")  // $2000/ETH
+    );
+
+    await priceOracle.setFallbackPrice(
+      await mockWBTC.getAddress(),
+      ethers.parseEther("40000")  // $40,000/BTC
+    );
+
+    await priceOracle.setFallbackPrice(
+      await mockUSDC.getAddress(),
+      ethers.parseEther("1")  // $1/USDC
+    );
+
+    // Deploy Multi-Asset Collateral Manager
+    const MultiAssetCollateralManager = await ethers.getContractFactory(
+      "MultiAssetCollateralManager"
+    );
+    multiAssetCollateral = await upgrades.deployProxy(
+      MultiAssetCollateralManager,
+      [await priceOracle.getAddress()],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await multiAssetCollateral.waitForDeployment();
+
+    // Grant roles
+    await multiAssetCollateral.grantRole(MANAGER_ROLE, manager.address);
+    await multiAssetCollateral.grantRole(LIQUIDATOR_ROLE, liquidator.address);
+
+    // Configure assets
+    await multiAssetCollateral.configureAsset(
+      await mockWETH.getAddress(),
+      true,   // isSupported
+      8000,   // liquidationThreshold (80%)
+      15000,  // minCollateralRatio (150%)
+      500,    // liquidationBonus (5%)
+      7000,   // maxAllocation (70%)
+      18      // decimals
+    );
+
+    await multiAssetCollateral.configureAsset(
+      await mockWBTC.getAddress(),
+      true,
+      8000,
+      15000,
+      500,
+      7000,
+      8
+    );
+
+    await multiAssetCollateral.configureAsset(
+      await mockUSDC.getAddress(),
+      true,
+      9500,   // 95%
+      11000,  // 110%
+      300,    // 3%
+      10000,  // 100%
+      6
+    );
+
+    // Mint tokens to owner (deployer) and user1
+    await mockWETH.mint(owner.address, ethers.parseEther("1000"));
+    await mockWBTC.mint(owner.address, ethers.parseUnits("50", 8));
+    await mockUSDC.mint(owner.address, ethers.parseUnits("1000000", 6));
+
+    await mockWETH.mint(user1.address, ethers.parseEther("100"));
+    await mockWBTC.mint(user1.address, ethers.parseUnits("5", 8));
+    await mockUSDC.mint(user1.address, ethers.parseUnits("100000", 6));
+  });
+
+  describe("Deployment", function () {
+    it("Should set correct price oracle", async function () {
+      expect(await multiAssetCollateral.priceOracle()).to.equal(
+        await priceOracle.getAddress()
+      );
+    });
+
+    it("Should grant admin role to deployer", async function () {
+      const DEFAULT_ADMIN_ROLE = ethers.ZeroHash;
+      expect(
+        await multiAssetCollateral.hasRole(DEFAULT_ADMIN_ROLE, owner.address)
+      ).to.be.true;
+    });
+
+    it("Should start with basket ID 1", async function () {
+      expect(await multiAssetCollateral.nextBasketId()).to.equal(1);
+    });
+  });
+
+  describe("Basket Creation - FIXED", function () {
+    it("Should create a new basket with loanId", async function () {
+      const loanId = 1;
+
+      await expect(
+        multiAssetCollateral.createBasket(loanId)  // FIXED: Only pass loanId
+      )
+        .to.emit(multiAssetCollateral, "BasketCreated")
+        .withArgs(1, owner.address, loanId, 0);  // FIXED: Correct event args
+    });
+
+    it("Should increment basket ID", async function () {
+      await multiAssetCollateral.createBasket(1);
+      expect(await multiAssetCollateral.nextBasketId()).to.equal(2);
+    });
+
+    it("Should track user baskets", async function () {
+      await multiAssetCollateral.createBasket(1);
+
+      const userBaskets = await multiAssetCollateral.getUserBaskets(owner.address);
+      expect(userBaskets.length).to.equal(1);
+      expect(userBaskets[0]).to.equal(1);
+    });
+
+    it("Should reject duplicate basket for same loanId", async function () {
+      await multiAssetCollateral.createBasket(1);
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(
+        multiAssetCollateral.createBasket(1)
+      ).to.be.revertedWith("Basket already exists for loan");
+    });
+
+    it("Should allow basket from manager role", async function () {
+      await expect(
+        multiAssetCollateral.connect(manager).createBasket(2)
+      ).to.emit(multiAssetCollateral, "BasketCreated");
+    });
+  });
+
+  describe("Adding Collateral - FIXED", function () {
+    let basketId;
+    let loanId;
+
+    beforeEach(async function () {
+      // Use unique loanId for each test to avoid basket conflicts
+      loanId = Number(await multiAssetCollateral.nextBasketId());
+      await multiAssetCollateral.createBasket(loanId);
+      basketId = loanId;
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+    });
+
+    it("Should add single collateral asset", async function () {
+      const amount = ethers.parseEther("1");
+
+      // Owner must approve and own basket
+      await mockWETH.approve(
+        await multiAssetCollateral.getAddress(),
+        amount
+      );
+
+      await expect(
+        multiAssetCollateral.addCollateral(
+          basketId,
+          await mockWETH.getAddress(),
+          amount
+        )
+      ).to.emit(multiAssetCollateral, "AssetAddedToBasket");
+    });
+
+    it("Should add multiple collateral assets in batch", async function () {
+      const assets = [
+        await mockWETH.getAddress(),
+        await mockWBTC.getAddress(),
+        await mockUSDC.getAddress()
+      ];
+      const amounts = [
+        ethers.parseEther("1"),
+        ethers.parseUnits("0.1", 8),
+        ethers.parseUnits("1000", 6)
+      ];
+
+      // Approve all tokens
+      for (let i = 0; i < assets.length; i++) {
+        const token = await ethers.getContractAt("MockERC20", assets[i]);
+        await token.approve(
+          await multiAssetCollateral.getAddress(),
+          amounts[i]
+        );
+      }
+
+      await multiAssetCollateral.batchAddCollateral(
+        basketId,
+        assets,
+        amounts
+      );
+
+      const basketAssets = await multiAssetCollateral.getBasketAssets(basketId);
+      expect(basketAssets.length).to.equal(3);
+    });
+
+    it("Should enforce max assets per basket", async function () {
+      const MAX_ASSETS = 10;
+      expect(await multiAssetCollateral.MAX_ASSETS_PER_BASKET()).to.equal(MAX_ASSETS);
+
+      // Try to add 11 assets
+      const wethAddress = await mockWETH.getAddress();
+
+      for (let i = 0; i < 10; i++) {
+        await mockWETH.approve(
+          await multiAssetCollateral.getAddress(),
+          ethers.parseEther("0.1")
+        );
+
+        await multiAssetCollateral.addCollateral(
+          basketId,
+          wethAddress,
+          ethers.parseEther("0.1")
+        );
+
+        // Advance time past the rate limit window to reset action count
+        // Rate limit window is 60 seconds, so advance 65 seconds to be safe
+        await ethers.provider.send("evm_increaseTime", [65]);
+        await ethers.provider.send("evm_mine", []);
+      }
+
+      // 11th should fail
+      await mockWETH.approve(
+        await multiAssetCollateral.getAddress(),
+        ethers.parseEther("0.1")
+      );
+
+      await expect(
+        multiAssetCollateral.addCollateral(
+          basketId,
+          wethAddress,
+          ethers.parseEther("0.1")
+        )
+      ).to.be.revertedWith("Max assets reached");
+    });
+
+    it("Should enforce max allocation limits", async function () {
+      // WETH has 70% max allocation
+      // Add a lot of WETH to try to exceed 70%
+
+      const amount1 = ethers.parseEther("5");  // First add
+      await mockWETH.approve(await multiAssetCollateral.getAddress(), amount1);
+      await multiAssetCollateral.addCollateral(basketId, await mockWETH.getAddress(), amount1);
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+
+      // Try to add more WETH that would exceed 70%
+      const amount2 = ethers.parseEther("100");
+      await mockWETH.approve(await multiAssetCollateral.getAddress(), amount2);
+
+      await expect(
+        multiAssetCollateral.addCollateral(basketId, await mockWETH.getAddress(), amount2)
+      ).to.be.revertedWith("Exceeds max allocation");
+    });
+  });
+
+  describe("Basket Value Calculation - FIXED", function () {
+    let basketId;
+    let loanId;
+
+    beforeEach(async function () {
+      // Use unique loanId for each test to avoid basket conflicts
+      loanId = Number(await multiAssetCollateral.nextBasketId());
+      await multiAssetCollateral.createBasket(loanId);
+      basketId = loanId;
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+
+      // Add collateral
+      const amount = ethers.parseEther("1"); // 1 ETH
+      await mockWETH.approve(
+        await multiAssetCollateral.getAddress(),
+        amount
+      );
+      await multiAssetCollateral.addCollateral(
+        basketId,
+        await mockWETH.getAddress(),
+        amount
+      );
+    });
+
+    it("Should calculate basket value correctly", async function () {
+      const value = await multiAssetCollateral.getBasketValue(basketId);
+      // 1 ETH * $2000 = $2000 (in 18 decimals)
+      expect(value).to.be.closeTo(
+        ethers.parseEther("2000"),
+        ethers.parseEther("10")
+      );
+    });
+
+    it("Should update basket total value", async function () {
+      const basket = await multiAssetCollateral.getBasketDetails(basketId);
+      expect(basket.totalValueUSD).to.be.gt(0);
+    });
+  });
+
+  describe("Health Factor - FIXED", function () {
+    let basketId;
+    let loanId;
+
+    beforeEach(async function () {
+      // Use unique loanId for each test to avoid basket conflicts
+      loanId = Number(await multiAssetCollateral.nextBasketId());
+      await multiAssetCollateral.createBasket(loanId);
+      basketId = loanId;
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+
+      // Add $15,000 worth of collateral (150% of $10,000 loan)
+      const ethAmount = ethers.parseEther("7.5"); // 7.5 ETH * $2000 = $15,000
+      await mockWETH.approve(
+        await multiAssetCollateral.getAddress(),
+        ethAmount
+      );
+      await multiAssetCollateral.addCollateral(
+        basketId,
+        await mockWETH.getAddress(),
+        ethAmount
+      );
+    });
+
+    it("Should check if basket is healthy", async function () {
+      const loanValueUSD = ethers.parseEther("10000");  // $10,000 loan
+      const isHealthy = await multiAssetCollateral.isBasketHealthy(basketId, loanValueUSD);
+      expect(isHealthy).to.be.true;
+    });
+
+    it("Should detect unhealthy basket", async function () {
+      const loanValueUSD = ethers.parseEther("20000");  // $20,000 loan (exceeds collateral)
+      const isHealthy = await multiAssetCollateral.isBasketHealthy(basketId, loanValueUSD);
+      expect(isHealthy).to.be.false;
+    });
+  });
+
+  describe("Diversification Scoring - FIXED", function () {
+    let basketId;
+    let loanId;
+
+    beforeEach(async function () {
+      // Use unique loanId for each test to avoid basket conflicts
+      loanId = Number(await multiAssetCollateral.nextBasketId());
+      await multiAssetCollateral.createBasket(loanId);
+      basketId = loanId;
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+    });
+
+    it("Should return 0 for empty basket", async function () {
+      const score = await multiAssetCollateral.getBasketDiversification(basketId);
+      expect(score).to.equal(0);
+    });
+
+    it("Should return 0 for single asset basket", async function () {
+      await mockWETH.approve(
+        await multiAssetCollateral.getAddress(),
+        ethers.parseEther("1")
+      );
+      await multiAssetCollateral.addCollateral(
+        basketId,
+        await mockWETH.getAddress(),
+        ethers.parseEther("1")
+      );
+
+      const score = await multiAssetCollateral.getBasketDiversification(basketId);
+      expect(score).to.equal(0);  // Single asset = 0 diversification
+    });
+
+    it("Should return higher score for diversified basket", async function () {
+      const assets = [
+        await mockWETH.getAddress(),
+        await mockWBTC.getAddress(),
+        await mockUSDC.getAddress()
+      ];
+
+      // Equal value distribution
+      const amounts = [
+        ethers.parseEther("0.5"),       // 0.5 ETH = $1000
+        ethers.parseUnits("0.025", 8),   // 0.025 BTC = $1000
+        ethers.parseUnits("1000", 6)     // 1000 USDC = $1000
+      ];
+
+      for (let i = 0; i < assets.length; i++) {
+        const token = await ethers.getContractAt("MockERC20", assets[i]);
+        await token.approve(
+          await multiAssetCollateral.getAddress(),
+          amounts[i]
+        );
+      }
+
+      await multiAssetCollateral.batchAddCollateral(
+        basketId,
+        assets,
+        amounts
+      );
+
+      const score = await multiAssetCollateral.getBasketDiversification(basketId);
+      expect(score).to.be.gt(6000);  // Well diversified = high score
+    });
+  });
+
+  describe("Liquidation - FIXED", function () {
+    let basketId;
+    let loanId;
+
+    beforeEach(async function () {
+      // Use unique loanId for each test to avoid basket conflicts
+      loanId = Number(await multiAssetCollateral.nextBasketId());
+      await multiAssetCollateral.createBasket(loanId);
+      basketId = loanId;
+
+      // Advance time by 13 seconds to avoid flash loan protection (min delay is 12s)
+      await ethers.provider.send("evm_increaseTime", [13]);
+      await ethers.provider.send("evm_mine", []);
+
+      // Add collateral + extra for liquidation bonus (5% = 0.05 ETH)
+      await mockWETH.approve(
+        await multiAssetCollateral.getAddress(),
+        ethers.parseEther("1.1") // 1 ETH collateral + 0.1 ETH buffer for bonus
+      );
+      await multiAssetCollateral.addCollateral(
+        basketId,
+        await mockWETH.getAddress(),
+        ethers.parseEther("1")
+      );
+
+      // Transfer extra WETH to contract to cover liquidation bonus
+      await mockWETH.transfer(
+        await multiAssetCollateral.getAddress(),
+        ethers.parseEther("0.1")
+      );
+    });
+
+    it("Should liquidate entire basket", async function () {
+      // Calculate expected value: 1 ETH * $2000 = $2000, accept 95% minimum
+      const minValueUSD = ethers.parseEther("1900");
+
+      await expect(
+        multiAssetCollateral.connect(liquidator).liquidateBasket(
+          basketId,
+          liquidator.address,
+          minValueUSD
+        )
+      ).to.emit(multiAssetCollateral, "BasketLiquidated");
+    });
+
+    it("Should transfer assets to liquidator with bonus", async function () {
+      const balanceBefore = await mockWETH.balanceOf(liquidator.address);
+
+      // Calculate expected value: 1 ETH * $2000 = $2000, accept 95% minimum
+      const minValueUSD = ethers.parseEther("1900");
+
+      await multiAssetCollateral.connect(liquidator).liquidateBasket(
+        basketId,
+        liquidator.address,
+        minValueUSD
+      );
+
+      const balanceAfter = await mockWETH.balanceOf(liquidator.address);
+
+      // Should receive 1 ETH + 5% bonus = 1.05 ETH
+      const expectedAmount = ethers.parseEther("1.05");
+      expect(balanceAfter - balanceBefore).to.be.closeTo(
+        expectedAmount,
+        ethers.parseEther("0.01")
+      );
+    });
+
+    it("Should mark basket as liquidated", async function () {
+      // Calculate expected value: 1 ETH * $2000 = $2000, accept 95% minimum
+      const minValueUSD = ethers.parseEther("1900");
+
+      await multiAssetCollateral.connect(liquidator).liquidateBasket(
+        basketId,
+        liquidator.address,
+        minValueUSD
+      );
+
+      const basket = await multiAssetCollateral.getBasketDetails(basketId);
+      expect(basket.isLiquidated).to.be.true;
+      expect(basket.isActive).to.be.false;
+    });
+
+    it("Should reject double liquidation", async function () {
+      // Calculate expected value: 1 ETH * $2000 = $2000, accept 95% minimum
+      const minValueUSD = ethers.parseEther("1900");
+
+      await multiAssetCollateral.connect(liquidator).liquidateBasket(
+        basketId,
+        liquidator.address,
+        minValueUSD
+      );
+
+      await expect(
+        multiAssetCollateral.connect(liquidator).liquidateBasket(
+          basketId,
+          liquidator.address,
+          minValueUSD
+        )
+      ).to.be.revertedWith("Basket not active");
+    });
+  });
+
+  describe("Access Control - FIXED", function () {
+    it("Should allow anyone to create basket (no role required)", async function () {
+      // createBasket has no role restriction, only flash loan protection
+      await expect(
+        multiAssetCollateral.connect(user1).createBasket(100)
+      ).to.emit(multiAssetCollateral, "BasketCreated");
+    });
+
+    it("Should restrict liquidation to liquidators", async function () {
+      await multiAssetCollateral.createBasket(1);
+
+      const minValueUSD = ethers.parseEther("0"); // Zero is fine for access control test
+
+      await expect(
+        multiAssetCollateral.connect(user1).liquidateBasket(1, user1.address, minValueUSD)
+      ).to.be.reverted;  // Missing LIQUIDATOR_ROLE
+    });
+
+    it("Should allow manager to release basket", async function () {
+      await multiAssetCollateral.createBasket(1);
+
+      await expect(
+        multiAssetCollateral.connect(manager).releaseBasket(1)
+      ).to.emit(multiAssetCollateral, "BasketReleased");
+    });
+  });
+});

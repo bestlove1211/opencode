@@ -1,0 +1,22 @@
+[
+  {
+    "content": "Fix OPERATOR_ROLE grants in test files",
+    "status": "completed",
+    "activeForm": "Fixing OPERATOR_ROLE grants in test files"
+  },
+  {
+    "content": "Implement missing contract functions",
+    "status": "in_progress",
+    "activeForm": "Implementing missing contract functions"
+  },
+  {
+    "content": "Fix event emission issues",
+    "status": "pending",
+    "activeForm": "Fixing event emission issues"
+  },
+  {
+    "content": "Verify all tests pass",
+    "status": "pending",
+    "activeForm": "Verifying all tests pass"
+  }
+]

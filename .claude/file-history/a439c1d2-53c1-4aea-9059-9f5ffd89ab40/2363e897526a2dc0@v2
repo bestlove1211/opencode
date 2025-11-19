@@ -1,0 +1,284 @@
+const { ethers } = require("hardhat");
+const fs = require("fs");
+
+/**
+ * Configure Asset Parameters
+ *
+ * Sets up supported collateral assets with their parameters:
+ * - Liquidation thresholds
+ * - Minimum collateral ratios
+ * - Liquidation bonuses
+ * - Price feeds (Chainlink)
+ */
+
+// Asset configurations
+const ASSETS = {
+  // Stablecoins
+  USDC: {
+    name: "USD Coin",
+    liquidationThreshold: 9500, // 95%
+    minCollateralRatio: 11000,  // 110%
+    liquidationBonus: 300,      // 3%
+    ltv: 9000,                  // 90%
+    maxAllocation: 10000,       // 100% (can be full collateral)
+    decimals: 6,
+    riskWeight: 1,
+    canBeSwapped: true
+  },
+  USDT: {
+    name: "Tether USD",
+    liquidationThreshold: 9500,
+    minCollateralRatio: 11000,
+    liquidationBonus: 300,
+    ltv: 9000,
+    maxAllocation: 10000,
+    decimals: 6,
+    riskWeight: 1,
+    canBeSwapped: true
+  },
+  DAI: {
+    name: "Dai Stablecoin",
+    liquidationThreshold: 9500,
+    minCollateralRatio: 11000,
+    liquidationBonus: 300,
+    ltv: 9000,
+    maxAllocation: 10000,
+    decimals: 18,
+    riskWeight: 1,
+    canBeSwapped: true
+  },
+
+  // Major Cryptocurrencies
+  WETH: {
+    name: "Wrapped Ether",
+    liquidationThreshold: 8000, // 80%
+    minCollateralRatio: 15000,  // 150%
+    liquidationBonus: 500,      // 5%
+    ltv: 7500,                  // 75%
+    maxAllocation: 7000,        // 70%
+    decimals: 18,
+    riskWeight: 3,
+    canBeSwapped: true
+  },
+  WBTC: {
+    name: "Wrapped Bitcoin",
+    liquidationThreshold: 8000,
+    minCollateralRatio: 15000,
+    liquidationBonus: 500,
+    ltv: 7500,
+    maxAllocation: 7000,
+    decimals: 8,
+    riskWeight: 3,
+    canBeSwapped: true
+  },
+
+  // Alternative Cryptocurrencies
+  LINK: {
+    name: "Chainlink",
+    liquidationThreshold: 7500, // 75%
+    minCollateralRatio: 17500,  // 175%
+    liquidationBonus: 700,      // 7%
+    ltv: 7000,                  // 70%
+    maxAllocation: 5000,        // 50%
+    decimals: 18,
+    riskWeight: 5,
+    canBeSwapped: true
+  },
+  AAVE: {
+    name: "Aave Token",
+    liquidationThreshold: 7000,
+    minCollateralRatio: 18000,
+    liquidationBonus: 800,
+    ltv: 6500,
+    maxAllocation: 4000,
+    decimals: 18,
+    riskWeight: 6,
+    canBeSwapped: true
+  },
+  UNI: {
+    name: "Uniswap",
+    liquidationThreshold: 7000,
+    minCollateralRatio: 18000,
+    liquidationBonus: 800,
+    ltv: 6500,
+    maxAllocation: 4000,
+    decimals: 18,
+    riskWeight: 6,
+    canBeSwapped: true
+  }
+};
+
+// Chainlink Price Feed Addresses (Ethereum Mainnet)
+const PRICE_FEEDS = {
+  ETH: "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419",
+  BTC: "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c",
+  USDC: "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6",
+  USDT: "0x3E7d1eAB13ad0104d2750B8863b489D65364e32D",
+  DAI: "0xAed0c38402a5d19df6E4c03F4E2DceD6e29c1ee9",
+  LINK: "0x2c1d072e956AFFC0D435Cb7AC38EF18d24d9127c",
+  AAVE: "0x547a514d5e3769680Ce22B2361c10Ea13619e8a9",
+  UNI: "0x553303d460EE0afB37EdFf9bE42922D8FF63220e"
+};
+
+async function main() {
+  console.log("Loading deployment addresses...\n");
+
+  // Load deployment addresses
+  const deploymentData = JSON.parse(
+    fs.readFileSync("./deployment-addresses.json", "utf8")
+  );
+
+  const [deployer] = await ethers.getSigners();
+  console.log("Configuring with account:", deployer.address);
+  console.log();
+
+  // Connect to deployed contracts
+  const priceOracle = await ethers.getContractAt(
+    "BancafiPriceOracle",
+    deploymentData.contracts.priceOracle
+  );
+
+  const collateralManager = await ethers.getContractAt(
+    "CollateralManager",
+    deploymentData.contracts.collateralManager
+  );
+
+  const multiAssetCollateralManager = await ethers.getContractAt(
+    "MultiAssetCollateralManager",
+    deploymentData.contracts.multiAssetCollateralManager
+  );
+
+  console.log("=".repeat(60));
+  console.log("CONFIGURING PRICE FEEDS");
+  console.log("=".repeat(60));
+
+  // Configure price feeds
+  for (const [symbol, feedAddress] of Object.entries(PRICE_FEEDS)) {
+    try {
+      console.log(`Setting price feed for ${symbol}: ${feedAddress}`);
+      const tx = await priceOracle.setPriceFeed(
+        symbol,
+        feedAddress,
+        { gasLimit: 500000 }
+      );
+      await tx.wait();
+      console.log(`✓ ${symbol} price feed configured`);
+    } catch (error) {
+      console.error(`✗ Failed to configure ${symbol}:`, error.message);
+    }
+  }
+
+  console.log();
+  console.log("=".repeat(60));
+  console.log("CONFIGURING COLLATERAL ASSETS");
+  console.log("=".repeat(60));
+
+  // Get token addresses from environment or use placeholder
+  // In production, these would be actual token addresses
+  const tokenAddresses = {
+    USDC: process.env.USDC_ADDRESS || ethers.ZeroAddress,
+    USDT: process.env.USDT_ADDRESS || ethers.ZeroAddress,
+    DAI: process.env.DAI_ADDRESS || ethers.ZeroAddress,
+    WETH: process.env.WETH_ADDRESS || ethers.ZeroAddress,
+    WBTC: process.env.WBTC_ADDRESS || ethers.ZeroAddress,
+    LINK: process.env.LINK_ADDRESS || ethers.ZeroAddress,
+    AAVE: process.env.AAVE_ADDRESS || ethers.ZeroAddress,
+    UNI: process.env.UNI_ADDRESS || ethers.ZeroAddress
+  };
+
+  // Configure each asset in CollateralManager
+  console.log("\nConfiguring CollateralManager...");
+  for (const [symbol, config] of Object.entries(ASSETS)) {
+    const tokenAddress = tokenAddresses[symbol];
+
+    if (tokenAddress === ethers.ZeroAddress) {
+      console.log(`⚠ Skipping ${symbol} - no address configured`);
+      continue;
+    }
+
+    try {
+      console.log(`\nConfiguring ${config.name} (${symbol})...`);
+      console.log(`  Address: ${tokenAddress}`);
+      console.log(`  Liquidation Threshold: ${config.liquidationThreshold / 100}%`);
+      console.log(`  Min Collateral Ratio: ${config.minCollateralRatio / 100}%`);
+
+      const tx = await collateralManager.configureAsset(
+        tokenAddress,
+        true, // isSupported
+        config.liquidationThreshold,
+        config.minCollateralRatio,
+        PRICE_FEEDS[symbol === "WETH" ? "ETH" : symbol === "WBTC" ? "BTC" : symbol] || ethers.ZeroAddress,
+        { gasLimit: 500000 }
+      );
+      await tx.wait();
+      console.log(`✓ ${symbol} configured in CollateralManager`);
+    } catch (error) {
+      console.error(`✗ Failed to configure ${symbol}:`, error.message);
+    }
+  }
+
+  // Configure each asset in MultiAssetCollateralManager
+  console.log("\n\nConfiguring MultiAssetCollateralManager...");
+  for (const [symbol, config] of Object.entries(ASSETS)) {
+    const tokenAddress = tokenAddresses[symbol];
+
+    if (tokenAddress === ethers.ZeroAddress) {
+      console.log(`⚠ Skipping ${symbol} - no address configured`);
+      continue;
+    }
+
+    try {
+      console.log(`\nConfiguring ${config.name} (${symbol})...`);
+      console.log(`  LTV: ${config.ltv / 100}%`);
+      console.log(`  Liquidation Bonus: ${config.liquidationBonus / 100}%`);
+      console.log(`  Max Allocation: ${config.maxAllocation / 100}%`);
+      console.log(`  Risk Weight: ${config.riskWeight}/10`);
+
+      const tx = await multiAssetCollateralManager.configureAsset(
+        tokenAddress,
+        true, // isSupported
+        config.ltv,
+        config.liquidationThreshold,
+        config.liquidationBonus,
+        config.maxAllocation,
+        ethers.parseUnits("1", config.decimals), // minCollateralAmount (1 token)
+        config.riskWeight,
+        config.canBeSwapped,
+        { gasLimit: 500000 }
+      );
+      await tx.wait();
+      console.log(`✓ ${symbol} configured in MultiAssetCollateralManager`);
+    } catch (error) {
+      console.error(`✗ Failed to configure ${symbol}:`, error.message);
+    }
+  }
+
+  console.log();
+  console.log("=".repeat(60));
+  console.log("✅ Asset configuration completed!");
+  console.log("=".repeat(60));
+
+  // Save configuration summary
+  const configSummary = {
+    timestamp: new Date().toISOString(),
+    network: (await ethers.provider.getNetwork()).name,
+    deployer: deployer.address,
+    priceFeeds: PRICE_FEEDS,
+    assets: ASSETS,
+    tokenAddresses: tokenAddresses
+  };
+
+  fs.writeFileSync(
+    "./asset-configuration.json",
+    JSON.stringify(configSummary, null, 2)
+  );
+
+  console.log("\n✓ Configuration saved to asset-configuration.json");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

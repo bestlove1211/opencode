@@ -1,0 +1,393 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+const { time } = require("@nomicfoundation/hardhat-network-helpers");
+
+describe("Bancafi System Tests", function () {
+  let governanceToken, dao, assetToken, bailout, timelock;
+  let owner, addr1, addr2, addr3;
+
+  const INITIAL_SUPPLY = ethers.parseEther("100000000");
+  const MAX_SUPPLY = ethers.parseEther("1000000000");
+
+  beforeEach(async function () {
+    [owner, addr1, addr2, addr3] = await ethers.getSigners();
+
+    // Deploy Governance Token
+    const GovernanceToken = await ethers.getContractFactory("BancafiGovernanceToken");
+    governanceToken = await upgrades.deployProxy(
+      GovernanceToken,
+      ["Bancafi Token", "BGT", MAX_SUPPLY, INITIAL_SUPPLY, owner.address],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await governanceToken.waitForDeployment();
+
+    // Deploy Timelock
+    const TimelockController = await ethers.getContractFactory("TimelockController");
+    timelock = await TimelockController.deploy(
+      2 * 24 * 60 * 60, // 2 days
+      [owner.address],
+      [owner.address],
+      owner.address
+    );
+    await timelock.waitForDeployment();
+
+    // Deploy DAO
+    const DAO = await ethers.getContractFactory("BancafiDAO");
+    dao = await upgrades.deployProxy(
+      DAO,
+      [
+        await governanceToken.getAddress(),
+        await timelock.getAddress(),
+        1, // voting delay
+        50400, // voting period
+        ethers.parseEther("1000"), // proposal threshold
+        4 // quorum %
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await dao.waitForDeployment();
+
+    // Deploy Asset Token
+    const AssetToken = await ethers.getContractFactory("BancafiAssetToken");
+    assetToken = await upgrades.deployProxy(
+      AssetToken,
+      ["Bancafi RWA", "BRWA"],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await assetToken.waitForDeployment();
+
+    // Deploy Bailout
+    const Bailout = await ethers.getContractFactory("BancafiBailout");
+    bailout = await upgrades.deployProxy(
+      Bailout,
+      [ethers.parseEther("10000000"), 15000],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await bailout.waitForDeployment();
+
+    // Setup roles
+    const PROPOSER_ROLE = await timelock.PROPOSER_ROLE();
+    const EXECUTOR_ROLE = await timelock.EXECUTOR_ROLE();
+    await timelock.grantRole(PROPOSER_ROLE, await dao.getAddress());
+    await timelock.grantRole(EXECUTOR_ROLE, await dao.getAddress());
+
+    const MINTER_ROLE = await assetToken.MINTER_ROLE();
+    await assetToken.grantRole(MINTER_ROLE, owner.address);
+    await assetToken.grantRole(MINTER_ROLE, addr1.address);
+
+    const VERIFIER_ROLE = await assetToken.VERIFIER_ROLE();
+    await assetToken.grantRole(VERIFIER_ROLE, owner.address);
+
+    // Delegate for voting
+    await governanceToken.delegate(owner.address);
+  });
+
+  describe("Governance Token", function () {
+    it("Should deploy with correct initial supply", async function () {
+      expect(await governanceToken.totalSupply()).to.equal(INITIAL_SUPPLY);
+      expect(await governanceToken.balanceOf(owner.address)).to.equal(INITIAL_SUPPLY);
+    });
+
+    it("Should have correct max supply", async function () {
+      expect(await governanceToken.maxSupply()).to.equal(MAX_SUPPLY);
+    });
+
+    it("Should allow minting up to max supply", async function () {
+      const mintAmount = ethers.parseEther("1000");
+      await governanceToken.mint(addr1.address, mintAmount);
+      expect(await governanceToken.balanceOf(addr1.address)).to.equal(mintAmount);
+    });
+
+    it("Should not allow minting beyond max supply", async function () {
+      const excessAmount = MAX_SUPPLY - INITIAL_SUPPLY + ethers.parseEther("1");
+      await expect(
+        governanceToken.mint(addr1.address, excessAmount)
+      ).to.be.revertedWith("Exceeds max supply");
+    });
+
+    it("Should allow burning", async function () {
+      const burnAmount = ethers.parseEther("1000");
+      await governanceToken.burn(burnAmount);
+      expect(await governanceToken.totalSupply()).to.equal(INITIAL_SUPPLY - burnAmount);
+    });
+
+    it("Should pause and unpause", async function () {
+      await governanceToken.pause();
+      await expect(
+        governanceToken.transfer(addr1.address, ethers.parseEther("100"))
+      ).to.be.reverted;
+
+      await governanceToken.unpause();
+      await expect(
+        governanceToken.transfer(addr1.address, ethers.parseEther("100"))
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("Asset Tokenization", function () {
+    it("Should tokenize a new asset", async function () {
+      const tx = await assetToken.tokenizeAsset(
+        addr1.address,
+        0, // RealEstate
+        ethers.parseEther("1000000"),
+        "Dubai Marina",
+        "ipfs://Qm123"
+      );
+
+      const receipt = await tx.wait();
+      expect(receipt).to.emit(assetToken, "AssetTokenized");
+      expect(await assetToken.totalSupply()).to.equal(1);
+    });
+
+    it("Should verify an asset", async function () {
+      await assetToken.tokenizeAsset(
+        addr1.address,
+        0,
+        ethers.parseEther("1000000"),
+        "Location",
+        "ipfs://Qm123"
+      );
+
+      await assetToken.verifyAsset(1);
+      const metadata = await assetToken.assetMetadata(1);
+      expect(metadata.status).to.equal(1); // Verified
+    });
+
+    it("Should fractionalize an asset", async function () {
+      await assetToken.tokenizeAsset(
+        addr1.address,
+        1, // MineralResources
+        ethers.parseEther("5000000"),
+        "Gold Mine Location",
+        "ipfs://Qm456"
+      );
+
+      await assetToken.connect(addr1).fractionalizeAsset(1, 1000);
+
+      const metadata = await assetToken.assetMetadata(1);
+      expect(metadata.isFractionalized).to.be.true;
+      expect(metadata.totalFractions).to.equal(1000);
+    });
+
+    it("Should transfer fractional ownership", async function () {
+      await assetToken.tokenizeAsset(
+        addr1.address,
+        2, // OilAndEnergy
+        ethers.parseEther("10000000"),
+        "Oil Field",
+        "ipfs://Qm789"
+      );
+
+      await assetToken.connect(addr1).fractionalizeAsset(1, 1000);
+      await assetToken.connect(addr1).transferFractional(1, addr2.address, 250);
+
+      expect(await assetToken.fractionalOwnership(1, addr1.address)).to.equal(750);
+      expect(await assetToken.fractionalOwnership(1, addr2.address)).to.equal(250);
+    });
+
+    it("Should update asset valuation", async function () {
+      await assetToken.tokenizeAsset(
+        addr1.address,
+        3, // Gold
+        ethers.parseEther("2000000"),
+        "Gold Vault",
+        "ipfs://QmABC"
+      );
+
+      await assetToken.updateValuation(1, ethers.parseEther("2500000"));
+      const metadata = await assetToken.assetMetadata(1);
+      expect(metadata.valuation).to.equal(ethers.parseEther("2500000"));
+    });
+  });
+
+  describe("Bailout System", function () {
+    beforeEach(async function () {
+      // Deposit to treasury (reduced to avoid out of funds error)
+      await bailout.depositToTreasury({ value: ethers.parseEther("500") });
+
+      // Tokenize asset for collateral
+      await assetToken.tokenizeAsset(
+        addr1.address,
+        0,
+        ethers.parseEther("1000000"),
+        "Collateral Property",
+        "ipfs://QmCollateral"
+      );
+      await assetToken.verifyAsset(1);
+    });
+
+    it("Should request a bailout", async function () {
+      const tx = await bailout.connect(addr1).requestBailout(
+        ethers.parseEther("50"),
+        "Liquidity crisis",
+        "ipfs://proof",
+        1, // collateral token
+        12 // months
+      );
+
+      const receipt = await tx.wait();
+      expect(receipt).to.emit(bailout, "BailoutRequested");
+      expect(await bailout.userActiveBailouts(addr1.address)).to.equal(1);
+    });
+
+    it("Should approve a bailout", async function () {
+      await bailout.connect(addr1).requestBailout(
+        ethers.parseEther("50"),
+        "Reason",
+        "ipfs://proof",
+        1,
+        12
+      );
+
+      await bailout.approveBailout(1, 500); // 5% interest
+
+      const request = await bailout.bailoutRequests(1);
+      expect(request.status).to.equal(1); // Approved
+      expect(request.interestRate).to.equal(500);
+    });
+
+    it("Should disburse bailout funds", async function () {
+      await bailout.connect(addr1).requestBailout(
+        ethers.parseEther("50"),
+        "Emergency",
+        "ipfs://proof",
+        1,
+        12
+      );
+
+      await bailout.approveBailout(1, 500);
+
+      const balanceBefore = await ethers.provider.getBalance(addr1.address);
+      await bailout.disburseBailout(1, 12); // 12 installments
+      const balanceAfter = await ethers.provider.getBalance(addr1.address);
+
+      expect(balanceAfter - balanceBefore).to.equal(ethers.parseEther("50"));
+    });
+
+    it("Should allow repayment", async function () {
+      await bailout.connect(addr1).requestBailout(
+        ethers.parseEther("50"),
+        "Emergency",
+        "ipfs://proof",
+        1,
+        12
+      );
+
+      await bailout.approveBailout(1, 500);
+      await bailout.disburseBailout(1, 12);
+
+      const schedule = await bailout.repaymentSchedules(1);
+      const payment = schedule.installmentAmount;
+
+      await bailout.connect(addr1).repayBailout(1, { value: payment });
+
+      const updatedSchedule = await bailout.repaymentSchedules(1);
+      expect(updatedSchedule.amountPaid).to.equal(payment);
+    });
+
+    it("Should reject bailout request", async function () {
+      await bailout.connect(addr1).requestBailout(
+        ethers.parseEther("50"),
+        "Reason",
+        "ipfs://proof",
+        1,
+        12
+      );
+
+      await bailout.rejectBailout(1, "Insufficient proof");
+
+      const request = await bailout.bailoutRequests(1);
+      expect(request.status).to.equal(6); // Rejected
+      expect(await bailout.userActiveBailouts(addr1.address)).to.equal(0);
+    });
+
+    it("Should track treasury balance", async function () {
+      expect(await bailout.treasuryBalance()).to.equal(ethers.parseEther("500"));
+
+      await bailout.depositToTreasury({ value: ethers.parseEther("50") });
+      expect(await bailout.treasuryBalance()).to.equal(ethers.parseEther("550"));
+    });
+  });
+
+  describe("DAO Governance", function () {
+    it("Should create proposal with metadata", async function () {
+      // Transfer tokens for proposal threshold
+      await governanceToken.transfer(addr1.address, ethers.parseEther("2000"));
+      await governanceToken.connect(addr1).delegate(addr1.address);
+
+      // Mine block for delegation to take effect
+      await time.increase(1);
+
+      const targets = [await governanceToken.getAddress()];
+      const values = [0];
+      const calldatas = [governanceToken.interface.encodeFunctionData("pause", [])];
+
+      const tx = await dao.connect(addr1).proposeWithMetadata(
+        targets,
+        values,
+        calldatas,
+        "Pause token transfers",
+        "Emergency Pause",
+        false
+      );
+
+      const receipt = await tx.wait();
+      expect(receipt).to.emit(dao, "ProposalCreatedWithMetadata");
+    });
+  });
+
+  describe("Security Features", function () {
+    it("Asset Token should be pausable", async function () {
+      await assetToken.pause();
+      await expect(
+        assetToken.tokenizeAsset(addr1.address, 0, ethers.parseEther("100"), "Loc", "ipfs://")
+      ).to.be.reverted;
+    });
+
+    it("Bailout should be pausable", async function () {
+      await bailout.pause();
+      await expect(
+        bailout.requestBailout(ethers.parseEther("100"), "Reason", "ipfs://", 1, 12)
+      ).to.be.reverted;
+    });
+
+    it("Should enforce role-based access control", async function () {
+      // Use addr2 who doesn't have MINTER_ROLE (addr1 has it from setup)
+      await expect(
+        assetToken.connect(addr2).tokenizeAsset(addr2.address, 0, ethers.parseEther("100"), "Loc", "ipfs://")
+      ).to.be.reverted;
+    });
+  });
+
+  describe("Upgradeability", function () {
+    it("Should upgrade governance token", async function () {
+      const GovernanceTokenV2 = await ethers.getContractFactory("BancafiGovernanceToken");
+      const upgraded = await upgrades.upgradeProxy(
+        await governanceToken.getAddress(),
+        GovernanceTokenV2
+      );
+
+      expect(await upgraded.totalSupply()).to.equal(INITIAL_SUPPLY);
+    });
+
+    it("Should upgrade asset token", async function () {
+      const AssetTokenV2 = await ethers.getContractFactory("BancafiAssetToken");
+      const upgraded = await upgrades.upgradeProxy(
+        await assetToken.getAddress(),
+        AssetTokenV2
+      );
+
+      expect(await upgraded.totalSupply()).to.equal(0);
+    });
+
+    it("Should upgrade bailout contract", async function () {
+      const BailoutV2 = await ethers.getContractFactory("BancafiBailout");
+      const upgraded = await upgrades.upgradeProxy(
+        await bailout.getAddress(),
+        BailoutV2
+      );
+
+      expect(await upgraded.maxBailoutAmount()).to.equal(ethers.parseEther("10000000"));
+    });
+  });
+});

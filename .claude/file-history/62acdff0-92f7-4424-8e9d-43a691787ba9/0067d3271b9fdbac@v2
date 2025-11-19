@@ -1,0 +1,103 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const blockchain = require('./services/blockchain');
+
+// Import route controllers
+const assetRoutes = require('./controllers/assets');
+const bailoutRoutes = require('./controllers/bailouts');
+const daoRoutes = require('./controllers/dao');
+const stakingRoutes = require('./controllers/staking');
+const analyticsRoutes = require('./controllers/analytics');
+const marketplaceRoutes = require('./controllers/marketplace');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(helmet());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3001'
+}));
+app.use(express.json());
+
+// Rate limiting
+if (process.env.ENABLE_RATE_LIMIT === 'true') {
+  const limiter = rateLimit({
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 900000, // 15 minutes
+    max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100
+  });
+  app.use(limiter);
+}
+
+// Health check
+app.get('/health', async (req, res) => {
+  try {
+    const blockNumber = await blockchain.getBlockNumber();
+    const network = await blockchain.getNetwork();
+
+    res.json({
+      status: 'healthy',
+      blockchain: {
+        connected: true,
+        blockNumber,
+        chainId: Number(network.chainId)
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error.message
+    });
+  }
+});
+
+// API Routes
+app.use('/api/assets', assetRoutes);
+app.use('/api/bailouts', bailoutRoutes);
+app.use('/api/dao', daoRoutes);
+app.use('/api/staking', stakingRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/marketplace', marketplaceRoutes);
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not found',
+    path: req.path
+  });
+});
+
+// Initialize and start server
+async function start() {
+  try {
+    console.log('🚀 Starting Bancafi Backend API...\n');
+
+    // Initialize blockchain connection
+    await blockchain.initialize();
+
+    // Start server
+    app.listen(PORT, () => {
+      console.log(`\n✅ Server running on port ${PORT}`);
+      console.log(`📡 API: http://localhost:${PORT}`);
+      console.log(`💚 Health: http://localhost:${PORT}/health\n`);
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+start();

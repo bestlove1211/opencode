@@ -1,0 +1,165 @@
+import { expect, ethers } from "./helpers/setup.js";
+import { deployFullSystem, increaseTime } from "./helpers/setup.js";
+
+describe("ComplianceManager", function () {
+    let system, complianceManager, admin, user1, user2, user3;
+
+    beforeEach(async function () {
+        system = await deployFullSystem();
+        ({ complianceManager, admin, user1, user2, user3 } = system);
+    });
+
+    describe("KYC Management", function () {
+        it("Should update KYC status", async function () {
+            await complianceManager.updateKYCStatus(
+                user1.address,
+                2, // IDENTITY level
+                Math.floor(Date.now() / 1000) + 31536000,
+                "US",
+                ethers.id("doc-hash")
+            );
+
+            const kycData = await complianceManager.getKYCData(user1.address);
+            expect(kycData.level).to.equal(2);
+            expect(kycData.countryCode).to.equal("US");
+        });
+
+        it("Should check KYC verification", async function () {
+            await complianceManager.updateKYCStatus(
+                user1.address,
+                2,
+                Math.floor(Date.now() / 1000) + 31536000,
+                "US",
+                ethers.id("doc-hash")
+            );
+
+            expect(await complianceManager.isKYCVerified(user1.address)).to.be.true;
+        });
+
+        it("Should expire KYC after duration", async function () {
+            const expiry = Math.floor(Date.now() / 1000) + 86400; // 1 day
+            await complianceManager.updateKYCStatus(
+                user1.address,
+                2,
+                expiry,
+                "US",
+                ethers.id("doc-hash")
+            );
+
+            await increaseTime(86401);
+            expect(await complianceManager.isKYCVerified(user1.address)).to.be.false;
+        });
+
+        it("Should check transaction limits by KYC level", async function () {
+            const basicLimit = await complianceManager.getTransactionLimit(1); // BASIC
+            const identityLimit = await complianceManager.getTransactionLimit(2); // IDENTITY
+
+            expect(basicLimit).to.equal(ethers.parseEther("1000"));
+            expect(identityLimit).to.equal(ethers.parseEther("10000"));
+        });
+
+        it("Should validate transaction amount", async function () {
+            await complianceManager.updateKYCStatus(
+                user1.address,
+                2,
+                Math.floor(Date.now() / 1000) + 31536000,
+                "US",
+                ethers.id("doc-hash")
+            );
+
+            expect(
+                await complianceManager.canTransact(user1.address, ethers.parseEther("5000"))
+            ).to.be.true;
+
+            expect(
+                await complianceManager.canTransact(user1.address, ethers.parseEther("15000"))
+            ).to.be.false;
+        });
+    });
+
+    describe("Whitelist/Blacklist", function () {
+        it("Should add to whitelist", async function () {
+            await complianceManager.addToWhitelist(user1.address);
+            expect(await complianceManager.isWhitelisted(user1.address)).to.be.true;
+        });
+
+        it("Should add to blacklist", async function () {
+            await complianceManager.addToBlacklist(user1.address, "Fraud");
+            expect(await complianceManager.isBlacklisted(user1.address)).to.be.true;
+        });
+
+        it("Should remove from blacklist", async function () {
+            await complianceManager.addToBlacklist(user1.address, "Fraud");
+            await complianceManager.removeFromBlacklist(user1.address);
+            expect(await complianceManager.isBlacklisted(user1.address)).to.be.false;
+        });
+    });
+
+    describe("Geographic Restrictions", function () {
+        it("Should add restricted country", async function () {
+            await complianceManager.addRestrictedCountry("KP"); // North Korea
+            expect(await complianceManager.isCountryRestricted("KP")).to.be.true;
+        });
+
+        it("Should prevent users from restricted countries", async function () {
+            await complianceManager.addRestrictedCountry("KP");
+            await complianceManager.updateKYCStatus(
+                user1.address,
+                2,
+                Math.floor(Date.now() / 1000) + 31536000,
+                "KP",
+                ethers.id("doc-hash")
+            );
+
+            expect(await complianceManager.canTransact(user1.address, ethers.parseEther("100"))).to.be.false;
+        });
+    });
+
+    describe("Institutional Profiles", function () {
+        it("Should register institutional profile", async function () {
+            await complianceManager.registerInstitution(
+                user1.address,
+                "Test Bank",
+                "US",
+                "REG123",
+                ethers.id("doc-hash")
+            );
+
+            expect(await complianceManager.isInstitution(user1.address)).to.be.true;
+        });
+
+        it("Should get institution details", async function () {
+            await complianceManager.registerInstitution(
+                user1.address,
+                "Test Bank",
+                "US",
+                "REG123",
+                ethers.id("doc-hash")
+            );
+
+            const profile = await complianceManager.getInstitutionalProfile(user1.address);
+            expect(profile.name).to.equal("Test Bank");
+            expect(profile.registrationNumber).to.equal("REG123");
+        });
+    });
+
+    describe("Access Control", function () {
+        it("Should only allow compliance officer to update KYC", async function () {
+            await expect(
+                complianceManager.connect(user1).updateKYCStatus(
+                    user2.address,
+                    2,
+                    Math.floor(Date.now() / 1000) + 31536000,
+                    "US",
+                    ethers.id("doc-hash")
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should allow admin to grant compliance officer role", async function () {
+            const COMPLIANCE_OFFICER_ROLE = await complianceManager.COMPLIANCE_OFFICER_ROLE();
+            await complianceManager.grantRole(COMPLIANCE_OFFICER_ROLE, user1.address);
+            expect(await complianceManager.hasRole(COMPLIANCE_OFFICER_ROLE, user1.address)).to.be.true;
+        });
+    });
+});

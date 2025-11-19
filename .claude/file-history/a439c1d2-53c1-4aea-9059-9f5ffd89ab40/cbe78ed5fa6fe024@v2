@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title IMultiAssetCollateralManager
+ * @notice Interface for multi-asset collateral management
+ */
+interface IMultiAssetCollateralManager {
+
+    struct CollateralAsset {
+        address asset;
+        uint256 amount;
+        uint256 lockedAt;
+        uint256 valueAtLock;
+    }
+
+    struct CollateralBasket {
+        uint256 id;
+        address owner;
+        uint256 loanId;
+        CollateralAsset[] assets;
+        uint256 totalValueUSD;
+        uint256 createdAt;
+        bool isActive;
+        bool isLiquidated;
+    }
+
+    // ============ Events ============
+
+    event BasketCreated(
+        uint256 indexed basketId,
+        address indexed owner,
+        uint256 indexed loanId,
+        uint256 totalValueUSD
+    );
+
+    event AssetAddedToBasket(
+        uint256 indexed basketId,
+        address indexed asset,
+        uint256 amount,
+        uint256 valueUSD
+    );
+
+    event AssetRemovedFromBasket(
+        uint256 indexed basketId,
+        address indexed asset,
+        uint256 amount
+    );
+
+    event BasketReleased(
+        uint256 indexed basketId,
+        address indexed owner,
+        uint256 totalValueReleased
+    );
+
+    event BasketLiquidated(
+        uint256 indexed basketId,
+        uint256 indexed liquidationId,
+        address indexed liquidator,
+        uint256 totalValueLiquidated
+    );
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Create a new collateral basket for a loan
+     * @param loanId Associated loan ID
+     * @return basketId New basket identifier
+     */
+    function createBasket(uint256 loanId) external returns (uint256 basketId);
+
+    /**
+     * @notice Add collateral asset to a basket
+     * @param basketId Basket identifier
+     * @param asset Asset address
+     * @param amount Amount to add
+     */
+    function addCollateral(
+        uint256 basketId,
+        address asset,
+        uint256 amount
+    ) external;
+
+    /**
+     * @notice Add multiple collateral assets at once
+     * @param basketId Basket identifier
+     * @param assets Array of asset addresses
+     * @param amounts Array of amounts
+     */
+    function batchAddCollateral(
+        uint256 basketId,
+        address[] calldata assets,
+        uint256[] calldata amounts
+    ) external;
+
+    /**
+     * @notice Release entire collateral basket
+     * @param basketId Basket identifier
+     */
+    function releaseBasket(uint256 basketId) external;
+
+    /**
+     * @notice Liquidate collateral basket
+     * @param basketId Basket identifier
+     * @param recipient Liquidation recipient
+     * @return liquidationId Liquidation record ID
+     */
+    function liquidateBasket(uint256 basketId, address recipient)
+        external
+        returns (uint256 liquidationId);
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get current value of a basket in USD
+     * @param basketId Basket identifier
+     * @return totalValueUSD Current total value
+     */
+    function getBasketValue(uint256 basketId) external view returns (uint256 totalValueUSD);
+
+    /**
+     * @notice Get basket assets breakdown
+     * @param basketId Basket identifier
+     * @return assets Array of collateral assets
+     */
+    function getBasketAssets(uint256 basketId)
+        external
+        view
+        returns (CollateralAsset[] memory assets);
+
+    /**
+     * @notice Get user's basket IDs
+     * @param user User address
+     * @return basketIds Array of basket IDs
+     */
+    function getUserBaskets(address user) external view returns (uint256[] memory basketIds);
+
+    /**
+     * @notice Get basket for a loan
+     * @param loanId Loan identifier
+     * @return basketId Basket ID
+     */
+    function getLoanBasket(uint256 loanId) external view returns (uint256 basketId);
+
+    /**
+     * @notice Check if basket meets minimum collateral requirements
+     * @param basketId Basket identifier
+     * @param loanValueUSD Loan value in USD
+     * @return isHealthy Whether basket is healthy
+     */
+    function isBasketHealthy(uint256 basketId, uint256 loanValueUSD)
+        external
+        view
+        returns (bool isHealthy);
+
+    /**
+     * @notice Get liquidation threshold for basket
+     * @param basketId Basket identifier
+     * @return threshold Weighted liquidation threshold in basis points
+     */
+    function getBasketLiquidationThreshold(uint256 basketId)
+        external
+        view
+        returns (uint256 threshold);
+
+    /**
+     * @notice Calculate basket diversification score
+     * @param basketId Basket identifier
+     * @return score Diversification score (0-10000 basis points)
+     */
+    function getBasketDiversification(uint256 basketId)
+        external
+        view
+        returns (uint256 score);
+}

@@ -1,0 +1,39 @@
+node_modules
+.env
+coverage
+coverage.json
+typechain
+typechain-types
+
+# Hardhat files
+cache
+artifacts
+
+# Deployment
+deployment.json
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs
+
+# Build files
+dist
+build
+
+# Test coverage
+.nyc_output
+
+# Temporary files
+*.tmp
+*.temp

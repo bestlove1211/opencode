@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title BancafiOracle
+ * @notice Price oracle for real-world asset valuations
+ * @dev Supports multiple price sources, asset revaluations, and historical data
+ */
+contract BancafiOracle is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
+
+    enum AssetType {
+        RealEstate,
+        Minerals,
+        OilAndEnergy,
+        Gold,
+        PhysicalAsset
+    }
+
+    enum PriceSource {
+        Manual,
+        External,
+        Aggregated,
+        Market
+    }
+
+    struct PriceData {
+        uint256 price;
+        uint256 timestamp;
+        PriceSource source;
+        address updatedBy;
+        uint256 confidence; // 0-10000 (100%)
+        bool validated;
+    }
+
+    struct AssetValuation {
+        uint256 tokenId;
+        AssetType assetType;
+        uint256 currentPrice;
+        uint256 previousPrice;
+        uint256 lastUpdated;
+        uint256 updateCount;
+        bool stale;
+        uint256 stalenessThreshold; // in seconds
+    }
+
+    struct PriceHistory {
+        uint256 price;
+        uint256 timestamp;
+        PriceSource source;
+    }
+
+    // State variables
+    mapping(uint256 => AssetValuation) public assetValuations; // tokenId => valuation
+    mapping(uint256 => PriceData[]) public priceHistory; // tokenId => price history
+    mapping(uint256 => mapping(address => PriceData)) public oraclePrices; // tokenId => oracle => price
+    mapping(address => bool) public trustedOracles;
+    mapping(AssetType => uint256) public defaultStalenessThreshold;
+
+    uint256[] public trackedAssets;
+    uint256 public minConfidence = 7000; // 70% minimum confidence
+    uint256 public minOraclesForAggregation = 3;
+
+    // Events
+    event PriceUpdated(
+        uint256 indexed tokenId,
+        uint256 oldPrice,
+        uint256 newPrice,
+        PriceSource source,
+        uint256 timestamp
+    );
+
+    event PriceValidated(
+        uint256 indexed tokenId,
+        uint256 price,
+        address indexed validator,
+        uint256 timestamp
+    );
+
+    event OracleAdded(
+        address indexed oracle,
+        uint256 timestamp
+    );
+
+    event OracleRemoved(
+        address indexed oracle,
+        uint256 timestamp
+    );
+
+    event StalenessDetected(
+        uint256 indexed tokenId,
+        uint256 lastUpdate,
+        uint256 threshold,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(ORACLE_ROLE, msg.sender);
+        _grantRole(VALIDATOR_ROLE, msg.sender);
+
+        // Set default staleness thresholds
+        _setDefaultStaleness();
+    }
+
+    /**
+     * @notice Initialize asset price tracking
+     */
+    function initializeAssetPrice(
+        uint256 tokenId_,
+        AssetType assetType_,
+        uint256 initialPrice_,
+        uint256 stalenessThreshold_
+    ) external onlyRole(ORACLE_ROLE) {
+        require(assetValuations[tokenId_].tokenId == 0, "Already initialized");
+        require(initialPrice_ > 0, "Invalid price");
+
+        assetValuations[tokenId_] = AssetValuation({
+            tokenId: tokenId_,
+            assetType: assetType_,
+            currentPrice: initialPrice_,
+            previousPrice: 0,
+            lastUpdated: block.timestamp,
+            updateCount: 1,
+            stale: false,
+            stalenessThreshold: stalenessThreshold_ > 0 ? stalenessThreshold_ : defaultStalenessThreshold[assetType_]
+        });
+
+        // Add to price history
+        priceHistory[tokenId_].push(PriceHistory({
+            price: initialPrice_,
+            timestamp: block.timestamp,
+            source: PriceSource.Manual
+        }));
+
+        trackedAssets.push(tokenId_);
+
+        emit PriceUpdated(tokenId_, 0, initialPrice_, PriceSource.Manual, block.timestamp);
+    }
+
+    /**
+     * @notice Update asset price (manual/external source)
+     */
+    function updatePrice(
+        uint256 tokenId_,
+        uint256 newPrice_,
+        PriceSource source_,
+        uint256 confidence_
+    ) external onlyRole(ORACLE_ROLE) whenNotPaused {
+        AssetValuation storage valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(newPrice_ > 0, "Invalid price");
+        require(confidence_ >= minConfidence, "Confidence too low");
+
+        uint256 oldPrice = valuation.currentPrice;
+
+        // Update valuation
+        valuation.previousPrice = oldPrice;
+        valuation.currentPrice = newPrice_;
+        valuation.lastUpdated = block.timestamp;
+        valuation.updateCount++;
+        valuation.stale = false;
+
+        // Store oracle price
+        oraclePrices[tokenId_][msg.sender] = PriceData({
+            price: newPrice_,
+            timestamp: block.timestamp,
+            source: source_,
+            updatedBy: msg.sender,
+            confidence: confidence_,
+            validated: false
+        });
+
+        // Add to history
+        priceHistory[tokenId_].push(PriceHistory({
+            price: newPrice_,
+            timestamp: block.timestamp,
+            source: source_
+        }));
+
+        emit PriceUpdated(tokenId_, oldPrice, newPrice_, source_, block.timestamp);
+    }
+
+    /**
+     * @notice Submit price from oracle
+     */
+    function submitOraclePrice(
+        uint256 tokenId_,
+        uint256 price_,
+        uint256 confidence_
+    ) external whenNotPaused {
+        require(trustedOracles[msg.sender], "Not trusted oracle");
+        require(assetValuations[tokenId_].tokenId != 0, "Asset not tracked");
+        require(price_ > 0, "Invalid price");
+
+        oraclePrices[tokenId_][msg.sender] = PriceData({
+            price: price_,
+            timestamp: block.timestamp,
+            source: PriceSource.External,
+            updatedBy: msg.sender,
+            confidence: confidence_,
+            validated: false
+        });
+    }
+
+    /**
+     * @notice Aggregate prices from multiple oracles
+     */
+    function aggregatePrices(uint256 tokenId_, address[] memory oracles_) external onlyRole(ORACLE_ROLE) {
+        require(oracles_.length >= minOraclesForAggregation, "Insufficient oracles");
+        AssetValuation storage valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+
+        uint256 totalPrice = 0;
+        uint256 totalWeight = 0;
+        uint256 validOracleCount = 0;
+
+        // Weighted average based on confidence
+        for (uint256 i = 0; i < oracles_.length; i++) {
+            PriceData memory data = oraclePrices[tokenId_][oracles_[i]];
+
+            if (data.timestamp > 0 && data.confidence >= minConfidence) {
+                totalPrice += data.price * data.confidence;
+                totalWeight += data.confidence;
+                validOracleCount++;
+            }
+        }
+
+        require(validOracleCount >= minOraclesForAggregation, "Insufficient valid prices");
+
+        uint256 aggregatedPrice = totalPrice / totalWeight;
+        uint256 oldPrice = valuation.currentPrice;
+
+        // Update valuation
+        valuation.previousPrice = oldPrice;
+        valuation.currentPrice = aggregatedPrice;
+        valuation.lastUpdated = block.timestamp;
+        valuation.updateCount++;
+        valuation.stale = false;
+
+        // Add to history
+        priceHistory[tokenId_].push(PriceHistory({
+            price: aggregatedPrice,
+            timestamp: block.timestamp,
+            source: PriceSource.Aggregated
+        }));
+
+        emit PriceUpdated(tokenId_, oldPrice, aggregatedPrice, PriceSource.Aggregated, block.timestamp);
+    }
+
+    /**
+     * @notice Validate a price update
+     */
+    function validatePrice(
+        uint256 tokenId_,
+        address oracle_
+    ) external onlyRole(VALIDATOR_ROLE) {
+        PriceData storage data = oraclePrices[tokenId_][oracle_];
+        require(data.timestamp > 0, "Price not found");
+        require(!data.validated, "Already validated");
+
+        data.validated = true;
+
+        emit PriceValidated(tokenId_, data.price, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Check and mark stale prices
+     */
+    function checkStaleness(uint256 tokenId_) external {
+        AssetValuation storage valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+
+        if (block.timestamp > valuation.lastUpdated + valuation.stalenessThreshold) {
+            valuation.stale = true;
+
+            emit StalenessDetected(
+                tokenId_,
+                valuation.lastUpdated,
+                valuation.stalenessThreshold,
+                block.timestamp
+            );
+        }
+    }
+
+    /**
+     * @notice Bulk check staleness
+     */
+    function bulkCheckStaleness() external {
+        for (uint256 i = 0; i < trackedAssets.length; i++) {
+            uint256 tokenId = trackedAssets[i];
+            AssetValuation storage valuation = assetValuations[tokenId];
+
+            if (block.timestamp > valuation.lastUpdated + valuation.stalenessThreshold) {
+                valuation.stale = true;
+
+                emit StalenessDetected(
+                    tokenId,
+                    valuation.lastUpdated,
+                    valuation.stalenessThreshold,
+                    block.timestamp
+                );
+            }
+        }
+    }
+
+    /**
+     * @notice Add trusted oracle
+     */
+    function addTrustedOracle(address oracle_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(oracle_ != address(0), "Invalid oracle");
+        trustedOracles[oracle_] = true;
+
+        emit OracleAdded(oracle_, block.timestamp);
+    }
+
+    /**
+     * @notice Remove trusted oracle
+     */
+    function removeTrustedOracle(address oracle_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        trustedOracles[oracle_] = false;
+
+        emit OracleRemoved(oracle_, block.timestamp);
+    }
+
+    /**
+     * @notice Get current price
+     */
+    function getPrice(uint256 tokenId_) external view returns (uint256) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(!valuation.stale, "Price is stale");
+
+        return valuation.currentPrice;
+    }
+
+    /**
+     * @notice Get price with staleness info
+     */
+    function getPriceWithStatus(uint256 tokenId_) external view returns (
+        uint256 price,
+        bool isStale,
+        uint256 lastUpdated
+    ) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+
+        return (valuation.currentPrice, valuation.stale, valuation.lastUpdated);
+    }
+
+    /**
+     * @notice Get price history
+     */
+    function getPriceHistory(uint256 tokenId_) external view returns (PriceHistory[] memory) {
+        return priceHistory[tokenId_];
+    }
+
+    /**
+     * @notice Get price change percentage
+     */
+    function getPriceChange(uint256 tokenId_) external view returns (int256) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(valuation.previousPrice > 0, "No previous price");
+
+        int256 change = int256(valuation.currentPrice) - int256(valuation.previousPrice);
+        return (change * 10000) / int256(valuation.previousPrice); // in basis points
+    }
+
+    /**
+     * @notice Get all tracked assets
+     */
+    function getTrackedAssets() external view returns (uint256[] memory) {
+        return trackedAssets;
+    }
+
+    /**
+     * @notice Set minimum confidence
+     */
+    function setMinConfidence(uint256 confidence_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(confidence_ <= 10000, "Invalid confidence");
+        minConfidence = confidence_;
+    }
+
+    /**
+     * @notice Set minimum oracles for aggregation
+     */
+    function setMinOraclesForAggregation(uint256 count_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(count_ > 0, "Invalid count");
+        minOraclesForAggregation = count_;
+    }
+
+    /**
+     * @notice Set default staleness thresholds
+     */
+    function _setDefaultStaleness() internal {
+        defaultStalenessThreshold[AssetType.RealEstate] = 30 days;
+        defaultStalenessThreshold[AssetType.Minerals] = 7 days;
+        defaultStalenessThreshold[AssetType.OilAndEnergy] = 1 days;
+        defaultStalenessThreshold[AssetType.Gold] = 1 days;
+        defaultStalenessThreshold[AssetType.PhysicalAsset] = 14 days;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

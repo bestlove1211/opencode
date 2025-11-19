@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title ICreditScore
+ * @notice Interface for credit scoring system
+ */
+interface ICreditScore {
+    // Events
+    event CreditScoreUpdated(address indexed user, uint256 oldScore, uint256 newScore);
+    event RepaymentRecorded(address indexed user, uint256 indexed loanId, bool successful);
+    event CreditHistoryAdded(address indexed user, string eventType, uint256 value);
+
+    /**
+     * @notice Get credit score for a user
+     * @param user User address
+     * @return Credit score (0-1000 scale)
+     */
+    function getCreditScore(address user) external view returns (uint256);
+
+    /**
+     * @notice Record loan repayment
+     * @param user User address
+     * @param loanId Loan ID
+     * @param successful Whether repayment was successful
+     */
+    function recordRepayment(address user, uint256 loanId, bool successful) external;
+
+    /**
+     * @notice Update credit score based on activity
+     * @param user User address
+     */
+    function updateCreditScore(address user) external;
+
+    /**
+     * @notice Get detailed credit history
+     * @param user User address
+     * @return totalLoans Total number of loans
+     * @return successfulRepayments Number of successful repayments
+     * @return defaults Number of defaults
+     * @return currentScore Current credit score
+     */
+    function getCreditHistory(address user) external view returns (
+        uint256 totalLoans,
+        uint256 successfulRepayments,
+        uint256 defaults,
+        uint256 currentScore
+    );
+}

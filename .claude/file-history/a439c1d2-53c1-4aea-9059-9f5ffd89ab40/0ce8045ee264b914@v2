@@ -1,0 +1,208 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("CreditScore", function () {
+  let creditScore;
+  let owner, user1, user2, authorizedContract;
+
+  beforeEach(async function () {
+    [owner, user1, user2, authorizedContract] = await ethers.getSigners();
+
+    const CreditScore = await ethers.getContractFactory("CreditScore");
+    creditScore = await upgrades.deployProxy(CreditScore, [], {
+      initializer: "initialize",
+      kind: "uups"
+    });
+    await creditScore.waitForDeployment();
+
+    // Authorize contract to update scores
+    await creditScore.setAuthorizedCaller(authorizedContract.address, true);
+  });
+
+  describe("Deployment", function () {
+    it("Should set the correct owner", async function () {
+      expect(await creditScore.owner()).to.equal(owner.address);
+    });
+
+    it("Should have correct initial score", async function () {
+      const initialScore = await creditScore.INITIAL_SCORE();
+      expect(initialScore).to.equal(500);
+    });
+
+    it("Should have correct score bounds", async function () {
+      expect(await creditScore.MIN_SCORE()).to.equal(0);
+      expect(await creditScore.MAX_SCORE()).to.equal(1000);
+    });
+  });
+
+  describe("Credit Score Management", function () {
+    it("Should initialize new user with initial score", async function () {
+      const score = await creditScore.getCreditScore(user1.address);
+      expect(score).to.equal(500);
+    });
+
+    it("Should allow authorized caller to update score", async function () {
+      await creditScore.connect(authorizedContract).updateCreditScore(
+        user1.address,
+        750,
+        "Payment on time"
+      );
+
+      const score = await creditScore.getCreditScore(user1.address);
+      expect(score).to.equal(750);
+    });
+
+    it("Should reject unauthorized score updates", async function () {
+      await expect(
+        creditScore.connect(user1).updateCreditScore(user1.address, 750, "Unauthorized")
+      ).to.be.reverted;
+    });
+
+    it("Should enforce minimum score", async function () {
+      await creditScore.connect(authorizedContract).updateCreditScore(
+        user1.address,
+        -100,
+        "Below minimum"
+      );
+
+      const score = await creditScore.getCreditScore(user1.address);
+      expect(score).to.equal(0); // MIN_SCORE
+    });
+
+    it("Should enforce maximum score", async function () {
+      await creditScore.connect(authorizedContract).updateCreditScore(
+        user1.address,
+        1100,
+        "Above maximum"
+      );
+
+      const score = await creditScore.getCreditScore(user1.address);
+      expect(score).to.equal(1000); // MAX_SCORE
+    });
+  });
+
+  describe("Loan Records", function () {
+    it("Should record successful loan", async function () {
+      await creditScore.connect(authorizedContract).recordLoanRepayment(
+        user1.address,
+        ethers.parseEther("1000"),
+        true
+      );
+
+      const metrics = await creditScore.getDetailedCreditMetrics(user1.address);
+      expect(metrics.totalLoans).to.equal(1);
+      expect(metrics.successfulRepayments).to.equal(1);
+    });
+
+    it("Should record default", async function () {
+      await creditScore.connect(authorizedContract).recordLoanRepayment(
+        user1.address,
+        ethers.parseEther("1000"),
+        false
+      );
+
+      const metrics = await creditScore.getDetailedCreditMetrics(user1.address);
+      expect(metrics.defaults).to.equal(1);
+    });
+
+    it("Should track total borrowed and repaid", async function () {
+      await creditScore.connect(authorizedContract).recordLoanRepayment(
+        user1.address,
+        ethers.parseEther("1000"),
+        true
+      );
+
+      const metrics = await creditScore.getDetailedCreditMetrics(user1.address);
+      expect(metrics.totalBorrowed).to.equal(ethers.parseEther("1000"));
+      expect(metrics.totalRepaid).to.equal(ethers.parseEther("1000"));
+    });
+  });
+
+  describe("Score Adjustments", function () {
+    it("Should increase score on successful payment", async function () {
+      const scoreBefore = await creditScore.getCreditScore(user1.address);
+
+      await creditScore.connect(authorizedContract).recordLoanRepayment(
+        user1.address,
+        ethers.parseEther("1000"),
+        true
+      );
+
+      const scoreAfter = await creditScore.getCreditScore(user1.address);
+      expect(scoreAfter).to.be.gte(scoreBefore);
+    });
+
+    it("Should decrease score on default", async function () {
+      const scoreBefore = await creditScore.getCreditScore(user1.address);
+
+      await creditScore.connect(authorizedContract).recordLoanRepayment(
+        user1.address,
+        ethers.parseEther("1000"),
+        false
+      );
+
+      const scoreAfter = await creditScore.getCreditScore(user1.address);
+      expect(scoreAfter).to.be.lt(scoreBefore);
+    });
+  });
+
+  describe("Authorization", function () {
+    it("Should allow owner to add authorized caller", async function () {
+      await creditScore.setAuthorizedCaller(user2.address, true);
+
+      await creditScore.connect(user2).updateCreditScore(
+        user1.address,
+        700,
+        "Authorized update"
+      );
+
+      const score = await creditScore.getCreditScore(user1.address);
+      expect(score).to.equal(700);
+    });
+
+    it("Should allow owner to remove authorized caller", async function () {
+      await creditScore.setAuthorizedCaller(authorizedContract.address, false);
+
+      await expect(
+        creditScore.connect(authorizedContract).updateCreditScore(
+          user1.address,
+          700,
+          "Should fail"
+        )
+      ).to.be.reverted;
+    });
+  });
+
+  describe("Pause Functionality", function () {
+    it("Should allow owner to pause", async function () {
+      await creditScore.pause();
+      expect(await creditScore.paused()).to.be.true;
+    });
+
+    it("Should reject operations when paused", async function () {
+      await creditScore.pause();
+
+      await expect(
+        creditScore.connect(authorizedContract).updateCreditScore(
+          user1.address,
+          700,
+          "Paused"
+        )
+      ).to.be.reverted;
+    });
+
+    it("Should allow operations after unpause", async function () {
+      await creditScore.pause();
+      await creditScore.unpause();
+
+      await creditScore.connect(authorizedContract).updateCreditScore(
+        user1.address,
+        700,
+        "Unpaused"
+      );
+
+      const score = await creditScore.getCreditScore(user1.address);
+      expect(score).to.equal(700);
+    });
+  });
+});

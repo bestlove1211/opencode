@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/ICreditScore.sol";
+
+/**
+ * @title CreditScore
+ * @notice Blockchain-based credit scoring system for Bancafi Credit
+ * @dev Calculates credit scores based on on-chain lending history and behavior
+ */
+contract CreditScore is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable,
+    ICreditScore
+{
+    // ============ Structs ============
+
+    struct CreditHistory {
+        uint256 totalLoans;
+        uint256 successfulRepayments;
+        uint256 defaults;
+        uint256 totalBorrowed;
+        uint256 totalRepaid;
+        uint256 currentScore;
+        uint256 lastUpdated;
+        bool isInitialized;
+    }
+
+    struct LoanRecord {
+        uint256 loanId;
+        uint256 amount;
+        uint256 timestamp;
+        bool successful;
+    }
+
+    // ============ Constants ============
+
+    uint256 public constant MAX_SCORE = 1000;
+    uint256 public constant MIN_SCORE = 0;
+    uint256 public constant INITIAL_SCORE = 500;
+    uint256 public constant BASIS_POINTS = 10000;
+
+    // Score adjustment parameters
+    uint256 public successfulRepaymentBonus; // +20 points per successful repayment
+    uint256 public defaultPenalty; // -100 points per default
+    uint256 public timeLapsedBonus; // +5 points per month of good standing
+    uint256 public volumeBonus; // Bonus points for higher volume
+
+    // ============ State Variables ============
+
+    mapping(address => CreditHistory) public creditHistories;
+    mapping(address => LoanRecord[]) public loanRecords;
+    mapping(address => bool) public authorizedCallers;
+
+    uint256 public totalUsersWithScore;
+
+    // ============ Events ============
+    // (Inherited from ICreditScore interface)
+
+    event ScoreParametersUpdated(
+        uint256 successfulRepaymentBonus,
+        uint256 defaultPenalty,
+        uint256 timeLapsedBonus,
+        uint256 volumeBonus
+    );
+    event AuthorizedCallerUpdated(address indexed caller, bool authorized);
+    event CreditHistoryInitialized(address indexed user, uint256 initialScore);
+
+    // ============ Modifiers ============
+
+    modifier onlyAuthorized() {
+        require(
+            authorizedCallers[msg.sender] || msg.sender == owner(),
+            "Not authorized"
+        );
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize() public initializer {
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        // Initialize score adjustment parameters
+        successfulRepaymentBonus = 20; // +20 points per successful repayment
+        defaultPenalty = 100; // -100 points per default
+        timeLapsedBonus = 5; // +5 points per month of good standing
+        volumeBonus = 10; // Bonus points for higher volume
+    }
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Get credit score for a user
+     * @param user User address
+     * @return Credit score (0-1000 scale)
+     */
+    function getCreditScore(address user) external view override returns (uint256) {
+        CreditHistory memory history = creditHistories[user];
+
+        if (!history.isInitialized) {
+            return INITIAL_SCORE;
+        }
+
+        return history.currentScore;
+    }
+
+    /**
+     * @notice Record loan repayment
+     * @param user User address
+     * @param loanId Loan ID
+     * @param successful Whether repayment was successful
+     */
+    function recordRepayment(
+        address user,
+        uint256 loanId,
+        bool successful
+    ) external override onlyAuthorized nonReentrant {
+        require(user != address(0), "Invalid user address");
+
+        CreditHistory storage history = creditHistories[user];
+
+        // Initialize if first interaction
+        if (!history.isInitialized) {
+            _initializeCreditHistory(user);
+        }
+
+        // Record loan
+        loanRecords[user].push(LoanRecord({
+            loanId: loanId,
+            amount: 0, // Can be enhanced to track amount
+            timestamp: block.timestamp,
+            successful: successful
+        }));
+
+        // Update history
+        history.totalLoans++;
+
+        if (successful) {
+            history.successfulRepayments++;
+        } else {
+            history.defaults++;
+        }
+
+        history.lastUpdated = block.timestamp;
+
+        emit RepaymentRecorded(user, loanId, successful);
+
+        // Update score
+        _updateCreditScoreInternal(user);
+    }
+
+    /**
+     * @notice Update credit score based on activity
+     * @param user User address
+     */
+    function updateCreditScore(address user) external override onlyAuthorized {
+        require(user != address(0), "Invalid user address");
+        _updateCreditScoreInternal(user);
+    }
+
+    /**
+     * @notice Get detailed credit history
+     * @param user User address
+     * @return totalLoans Total number of loans
+     * @return successfulRepayments Number of successful repayments
+     * @return defaults Number of defaults
+     * @return currentScore Current credit score
+     */
+    function getCreditHistory(address user) external view override returns (
+        uint256 totalLoans,
+        uint256 successfulRepayments,
+        uint256 defaults,
+        uint256 currentScore
+    ) {
+        CreditHistory memory history = creditHistories[user];
+
+        if (!history.isInitialized) {
+            return (0, 0, 0, INITIAL_SCORE);
+        }
+
+        return (
+            history.totalLoans,
+            history.successfulRepayments,
+            history.defaults,
+            history.currentScore
+        );
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get user's loan records
+     * @param user User address
+     * @return Array of loan records
+     */
+    function getUserLoanRecords(address user) external view returns (LoanRecord[] memory) {
+        return loanRecords[user];
+    }
+
+    /**
+     * @notice Get detailed credit metrics
+     * @param user User address
+     * @return totalLoans Total number of loans
+     * @return successfulRepayments Number of successful repayments
+     * @return defaults Number of defaults
+     * @return totalBorrowed Total amount borrowed
+     * @return totalRepaid Total amount repaid
+     * @return currentScore Current credit score
+     * @return successRate Success rate in basis points
+     * @return lastUpdated Last update timestamp
+     */
+    function getDetailedCreditMetrics(address user) external view returns (
+        uint256 totalLoans,
+        uint256 successfulRepayments,
+        uint256 defaults,
+        uint256 totalBorrowed,
+        uint256 totalRepaid,
+        uint256 currentScore,
+        uint256 successRate,
+        uint256 lastUpdated
+    ) {
+        CreditHistory memory history = creditHistories[user];
+
+        if (!history.isInitialized) {
+            return (0, 0, 0, 0, 0, INITIAL_SCORE, 0, 0);
+        }
+
+        uint256 rate = history.totalLoans > 0
+            ? (history.successfulRepayments * BASIS_POINTS) / history.totalLoans
+            : 0;
+
+        return (
+            history.totalLoans,
+            history.successfulRepayments,
+            history.defaults,
+            history.totalBorrowed,
+            history.totalRepaid,
+            history.currentScore,
+            rate,
+            history.lastUpdated
+        );
+    }
+
+    /**
+     * @notice Calculate projected score after an action
+     * @param user User address
+     * @param successful Whether the projected action is successful
+     * @return Projected credit score
+     */
+    function projectCreditScore(
+        address user,
+        bool successful
+    ) external view returns (uint256) {
+        CreditHistory memory history = creditHistories[user];
+
+        if (!history.isInitialized) {
+            return INITIAL_SCORE;
+        }
+
+        uint256 projectedScore = history.currentScore;
+
+        if (successful) {
+            projectedScore += successfulRepaymentBonus;
+        } else {
+            if (projectedScore > defaultPenalty) {
+                projectedScore -= defaultPenalty;
+            } else {
+                projectedScore = MIN_SCORE;
+            }
+        }
+
+        // Apply time bonus
+        uint256 monthsSinceLastUpdate = (block.timestamp - history.lastUpdated) / 30 days;
+        if (successful && monthsSinceLastUpdate > 0) {
+            projectedScore += monthsSinceLastUpdate * timeLapsedBonus;
+        }
+
+        // Cap at max score
+        if (projectedScore > MAX_SCORE) {
+            projectedScore = MAX_SCORE;
+        }
+
+        return projectedScore;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update score calculation parameters
+     * @param _successBonus Successful repayment bonus
+     * @param _defaultPenalty Default penalty
+     * @param _timeBonus Time lapsed bonus
+     * @param _volumeBonus Volume bonus
+     */
+    function updateScoreParameters(
+        uint256 _successBonus,
+        uint256 _defaultPenalty,
+        uint256 _timeBonus,
+        uint256 _volumeBonus
+    ) external onlyOwner {
+        require(_successBonus <= 100, "Success bonus too high");
+        require(_defaultPenalty <= 200, "Default penalty too high");
+        require(_timeBonus <= 20, "Time bonus too high");
+        require(_volumeBonus <= 50, "Volume bonus too high");
+
+        successfulRepaymentBonus = _successBonus;
+        defaultPenalty = _defaultPenalty;
+        timeLapsedBonus = _timeBonus;
+        volumeBonus = _volumeBonus;
+
+        emit ScoreParametersUpdated(
+            _successBonus,
+            _defaultPenalty,
+            _timeBonus,
+            _volumeBonus
+        );
+    }
+
+    /**
+     * @notice Set authorized caller status
+     * @param caller Address to authorize/deauthorize
+     * @param authorized Authorization status
+     */
+    function setAuthorizedCaller(address caller, bool authorized) external onlyOwner {
+        require(caller != address(0), "Invalid caller address");
+        authorizedCallers[caller] = authorized;
+        emit AuthorizedCallerUpdated(caller, authorized);
+    }
+
+    /**
+     * @notice Manually adjust a user's credit score (emergency only)
+     * @param user User address
+     * @param newScore New credit score
+     * @param reason Reason for adjustment
+     */
+    function manualScoreAdjustment(
+        address user,
+        uint256 newScore,
+        string calldata reason
+    ) external onlyOwner {
+        require(user != address(0), "Invalid user address");
+        require(newScore <= MAX_SCORE, "Score exceeds maximum");
+
+        CreditHistory storage history = creditHistories[user];
+
+        if (!history.isInitialized) {
+            _initializeCreditHistory(user);
+        }
+
+        uint256 oldScore = history.currentScore;
+        history.currentScore = newScore;
+        history.lastUpdated = block.timestamp;
+
+        emit CreditScoreUpdated(user, oldScore, newScore);
+        emit CreditHistoryAdded(user, reason, newScore);
+    }
+
+    // ============ Internal Functions ============
+
+    function _initializeCreditHistory(address user) internal {
+        creditHistories[user] = CreditHistory({
+            totalLoans: 0,
+            successfulRepayments: 0,
+            defaults: 0,
+            totalBorrowed: 0,
+            totalRepaid: 0,
+            currentScore: INITIAL_SCORE,
+            lastUpdated: block.timestamp,
+            isInitialized: true
+        });
+
+        totalUsersWithScore++;
+
+        emit CreditHistoryInitialized(user, INITIAL_SCORE);
+    }
+
+    function _updateCreditScoreInternal(address user) internal {
+        CreditHistory storage history = creditHistories[user];
+
+        if (!history.isInitialized) {
+            return;
+        }
+
+        uint256 oldScore = history.currentScore;
+        uint256 newScore = _calculateCreditScore(user);
+
+        history.currentScore = newScore;
+        history.lastUpdated = block.timestamp;
+
+        emit CreditScoreUpdated(user, oldScore, newScore);
+    }
+
+    function _calculateCreditScore(address user) internal view returns (uint256) {
+        CreditHistory memory history = creditHistories[user];
+
+        // Start with initial score
+        uint256 score = INITIAL_SCORE;
+
+        // Apply successful repayment bonuses
+        score += history.successfulRepayments * successfulRepaymentBonus;
+
+        // Apply default penalties
+        if (score > history.defaults * defaultPenalty) {
+            score -= history.defaults * defaultPenalty;
+        } else {
+            score = MIN_SCORE;
+        }
+
+        // Apply time bonus (months of good standing)
+        if (history.lastUpdated > 0 && history.defaults == 0) {
+            uint256 monthsSinceStart = (block.timestamp - history.lastUpdated) / 30 days;
+            score += monthsSinceStart * timeLapsedBonus;
+        }
+
+        // Apply success rate multiplier
+        if (history.totalLoans > 0) {
+            uint256 successRate = (history.successfulRepayments * BASIS_POINTS) / history.totalLoans;
+
+            if (successRate >= 9500) { // 95%+ success rate
+                score += 50;
+            } else if (successRate >= 9000) { // 90%+ success rate
+                score += 30;
+            } else if (successRate >= 8000) { // 80%+ success rate
+                score += 10;
+            }
+        }
+
+        // Apply volume bonus (reward higher total volume)
+        if (history.totalLoans >= 50) {
+            score += volumeBonus * 3;
+        } else if (history.totalLoans >= 20) {
+            score += volumeBonus * 2;
+        } else if (history.totalLoans >= 10) {
+            score += volumeBonus;
+        }
+
+        // Ensure score is within bounds
+        if (score > MAX_SCORE) {
+            score = MAX_SCORE;
+        } else if (score < MIN_SCORE) {
+            score = MIN_SCORE;
+        }
+
+        return score;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    /**
+     * @dev Reserved storage space for future versions
+     */
+    uint256[50] private __gap;
+}

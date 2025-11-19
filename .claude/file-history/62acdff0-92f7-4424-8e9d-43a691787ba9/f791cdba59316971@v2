@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IBancafiOracle {
+    function updatePriceFromChainlink(uint256 tokenId) external;
+    function checkStaleness(uint256 tokenId) external;
+    function assetValuations(uint256 tokenId) external view returns (
+        uint256 tokenId_,
+        uint8 assetType,
+        address chainlinkFeed,
+        uint256 currentPrice,
+        uint256 previousPrice,
+        uint256 lastUpdated,
+        uint256 updateCount,
+        bool stale,
+        uint256 stalenessThreshold,
+        uint8 priceSource
+    );
+}
+
+/**
+ * @title BancafiAutomation
+ * @notice Chainlink Automation compatible contract for automatic oracle price updates
+ * @dev Implements checkUpkeep and performUpkeep for Chainlink Keepers
+ */
+contract BancafiAutomation is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
+
+    IBancafiOracle public oracle;
+
+    // Automation configuration
+    uint256 public updateInterval; // Minimum time between updates
+    uint256[] public trackedAssets; // Assets to monitor
+    mapping(uint256 => uint256) public lastUpdateTime;
+    mapping(uint256 => bool) public isTracked;
+
+    uint256 public maxAssetsPerUpkeep; // Batch size limit
+    uint256 public stalenessBuffer; // Extra time before marking stale
+
+    // Events
+    event AssetAdded(uint256 indexed tokenId, uint256 timestamp);
+    event AssetRemoved(uint256 indexed tokenId, uint256 timestamp);
+    event PriceUpdated(uint256 indexed tokenId, uint256 timestamp);
+    event StalenessChecked(uint256 indexed tokenId, bool isStale, uint256 timestamp);
+    event UpdateIntervalChanged(uint256 oldInterval, uint256 newInterval, uint256 timestamp);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address oracle_, uint256 updateInterval_) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(KEEPER_ROLE, msg.sender);
+
+        require(oracle_ != address(0), "Invalid oracle");
+        oracle = IBancafiOracle(oracle_);
+
+        updateInterval = updateInterval_; // e.g., 1 hour
+        maxAssetsPerUpkeep = 50; // Batch process up to 50 assets
+        stalenessBuffer = 1 hours; // Check staleness 1 hour before threshold
+    }
+
+    /**
+     * @notice Add asset to automated tracking
+     */
+    function addAsset(uint256 tokenId_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(!isTracked[tokenId_], "Already tracked");
+
+        trackedAssets.push(tokenId_);
+        isTracked[tokenId_] = true;
+        lastUpdateTime[tokenId_] = block.timestamp;
+
+        emit AssetAdded(tokenId_, block.timestamp);
+    }
+
+    /**
+     * @notice Add multiple assets to tracking
+     */
+    function addAssetsBatch(uint256[] memory tokenIds_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        for (uint256 i = 0; i < tokenIds_.length; i++) {
+            if (!isTracked[tokenIds_[i]]) {
+                trackedAssets.push(tokenIds_[i]);
+                isTracked[tokenIds_[i]] = true;
+                lastUpdateTime[tokenIds_[i]] = block.timestamp;
+
+                emit AssetAdded(tokenIds_[i], block.timestamp);
+            }
+        }
+    }
+
+    /**
+     * @notice Remove asset from tracking
+     */
+    function removeAsset(uint256 tokenId_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(isTracked[tokenId_], "Not tracked");
+
+        // Find and remove from array
+        for (uint256 i = 0; i < trackedAssets.length; i++) {
+            if (trackedAssets[i] == tokenId_) {
+                trackedAssets[i] = trackedAssets[trackedAssets.length - 1];
+                trackedAssets.pop();
+                break;
+            }
+        }
+
+        isTracked[tokenId_] = false;
+        delete lastUpdateTime[tokenId_];
+
+        emit AssetRemoved(tokenId_, block.timestamp);
+    }
+
+    /**
+     * @notice Chainlink Automation: Check if upkeep is needed
+     * @dev Returns true if any asset needs price update or staleness check
+     */
+    function checkUpkeep(bytes calldata /* checkData */)
+        external
+        view
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        uint256[] memory assetsToUpdate = new uint256[](maxAssetsPerUpkeep);
+        uint256[] memory assetsToCheckStaleness = new uint256[](maxAssetsPerUpkeep);
+        uint256 updateCount = 0;
+        uint256 stalenessCount = 0;
+
+        for (uint256 i = 0; i < trackedAssets.length && updateCount < maxAssetsPerUpkeep; i++) {
+            uint256 tokenId = trackedAssets[i];
+
+            // Check if price update needed
+            if (block.timestamp >= lastUpdateTime[tokenId] + updateInterval) {
+                try oracle.assetValuations(tokenId) returns (
+                    uint256, uint8, address chainlinkFeed, uint256, uint256,
+                    uint256, uint256, bool, uint256, uint8
+                ) {
+                    // Only update if asset has Chainlink feed
+                    if (chainlinkFeed != address(0)) {
+                        assetsToUpdate[updateCount] = tokenId;
+                        updateCount++;
+                    }
+                } catch {
+                    // Skip if asset doesn't exist
+                }
+            }
+
+            // Check if staleness check needed
+            try oracle.assetValuations(tokenId) returns (
+                uint256, uint8, address, uint256, uint256,
+                uint256 lastUpdated, uint256, bool, uint256 stalenessThreshold, uint8
+            ) {
+                // Check if approaching staleness threshold
+                if (block.timestamp >= lastUpdated + stalenessThreshold - stalenessBuffer) {
+                    if (stalenessCount < maxAssetsPerUpkeep) {
+                        assetsToCheckStaleness[stalenessCount] = tokenId;
+                        stalenessCount++;
+                    }
+                }
+            } catch {
+                // Skip
+            }
+        }
+
+        // Trim arrays to actual size
+        uint256[] memory finalUpdates = new uint256[](updateCount);
+        uint256[] memory finalStaleness = new uint256[](stalenessCount);
+
+        for (uint256 i = 0; i < updateCount; i++) {
+            finalUpdates[i] = assetsToUpdate[i];
+        }
+
+        for (uint256 i = 0; i < stalenessCount; i++) {
+            finalStaleness[i] = assetsToCheckStaleness[i];
+        }
+
+        upkeepNeeded = (updateCount > 0 || stalenessCount > 0);
+        performData = abi.encode(finalUpdates, finalStaleness);
+    }
+
+    /**
+     * @notice Chainlink Automation: Perform upkeep
+     * @dev Updates prices and checks staleness for assets
+     */
+    function performUpkeep(bytes calldata performData) external onlyRole(KEEPER_ROLE) whenNotPaused {
+        (uint256[] memory assetsToUpdate, uint256[] memory assetsToCheckStaleness) = abi.decode(
+            performData,
+            (uint256[], uint256[])
+        );
+
+        // Update prices
+        for (uint256 i = 0; i < assetsToUpdate.length; i++) {
+            uint256 tokenId = assetsToUpdate[i];
+
+            try oracle.updatePriceFromChainlink(tokenId) {
+                lastUpdateTime[tokenId] = block.timestamp;
+                emit PriceUpdated(tokenId, block.timestamp);
+            } catch {
+                // Continue on error
+            }
+        }
+
+        // Check staleness
+        for (uint256 i = 0; i < assetsToCheckStaleness.length; i++) {
+            uint256 tokenId = assetsToCheckStaleness[i];
+
+            try oracle.checkStaleness(tokenId) {
+                (, , , , , , , bool isStale, , ) = oracle.assetValuations(tokenId);
+                emit StalenessChecked(tokenId, isStale, block.timestamp);
+            } catch {
+                // Continue on error
+            }
+        }
+    }
+
+    /**
+     * @notice Manual update trigger (for testing or emergency)
+     */
+    function manualUpdate(uint256 tokenId_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        oracle.updatePriceFromChainlink(tokenId_);
+        lastUpdateTime[tokenId_] = block.timestamp;
+
+        emit PriceUpdated(tokenId_, block.timestamp);
+    }
+
+    /**
+     * @notice Batch manual update
+     */
+    function manualUpdateBatch(uint256[] memory tokenIds_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        for (uint256 i = 0; i < tokenIds_.length; i++) {
+            try oracle.updatePriceFromChainlink(tokenIds_[i]) {
+                lastUpdateTime[tokenIds_[i]] = block.timestamp;
+                emit PriceUpdated(tokenIds_[i], block.timestamp);
+            } catch {
+                // Continue on error
+            }
+        }
+    }
+
+    /**
+     * @notice Update automation parameters
+     */
+    function setUpdateInterval(uint256 newInterval_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newInterval_ > 0, "Invalid interval");
+
+        uint256 oldInterval = updateInterval;
+        updateInterval = newInterval_;
+
+        emit UpdateIntervalChanged(oldInterval, newInterval_, block.timestamp);
+    }
+
+    function updateMaxAssetsPerUpkeep(uint256 max_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(max_ > 0, "Invalid max");
+        maxAssetsPerUpkeep = max_;
+    }
+
+    function updateStalenessBuffer(uint256 buffer_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        stalenessBuffer = buffer_;
+    }
+
+    /**
+     * @notice Get all tracked assets
+     */
+    function getTrackedAssets() external view returns (uint256[] memory) {
+        return trackedAssets;
+    }
+
+    /**
+     * @notice Check if asset needs update
+     */
+    function needsUpdate(uint256 tokenId_) external view returns (bool) {
+        if (!isTracked[tokenId_]) return false;
+        return block.timestamp >= lastUpdateTime[tokenId_] + updateInterval;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

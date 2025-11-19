@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IPausable {
+    function pause() external;
+    function unpause() external;
+    function paused() external view returns (bool);
+}
+
+/**
+ * @title BancafiEmergencyCoordinator
+ * @notice Central emergency pause coordinator for all Bancafi contracts
+ * @dev Can pause/unpause multiple contracts simultaneously
+ */
+contract BancafiEmergencyCoordinator is
+    Initializable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    enum ContractType {
+        AssetToken,
+        Bailout,
+        RentalIncome,
+        Institutional,
+        KYC,
+        Marketplace,
+        LiquidityPool,
+        Oracle,
+        Staking,
+        Insurance,
+        Vesting,
+        Treasury
+    }
+
+    struct ManagedContract {
+        address contractAddress;
+        ContractType contractType;
+        string name;
+        bool isActive;
+        uint256 addedAt;
+    }
+
+    mapping(address => ManagedContract) public managedContracts;
+    address[] public contractList;
+
+    bool public globalEmergency; // System-wide emergency flag
+    uint256 public lastEmergencyTime;
+    uint256 public emergencyCount;
+
+    // Events
+    event ContractAdded(address indexed contractAddress, ContractType contractType, string name, uint256 timestamp);
+    event ContractRemoved(address indexed contractAddress, uint256 timestamp);
+    event EmergencyPauseActivated(address indexed by, uint256 contractCount, uint256 timestamp);
+    event EmergencyPauseDeactivated(address indexed by, uint256 timestamp);
+    event ContractPaused(address indexed contractAddress, string name, uint256 timestamp);
+    event ContractUnpaused(address indexed contractAddress, string name, uint256 timestamp);
+    event GlobalEmergencyDeclared(address indexed by, string reason, uint256 timestamp);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(EMERGENCY_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Register a contract for emergency management
+     */
+    function addContract(
+        address contractAddress_,
+        ContractType contractType_,
+        string memory name_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(contractAddress_ != address(0), "Invalid address");
+        require(!managedContracts[contractAddress_].isActive, "Already added");
+
+        managedContracts[contractAddress_] = ManagedContract({
+            contractAddress: contractAddress_,
+            contractType: contractType_,
+            name: name_,
+            isActive: true,
+            addedAt: block.timestamp
+        });
+
+        contractList.push(contractAddress_);
+
+        emit ContractAdded(contractAddress_, contractType_, name_, block.timestamp);
+    }
+
+    /**
+     * @notice Batch add contracts
+     */
+    function addContractsBatch(
+        address[] memory addresses_,
+        ContractType[] memory types_,
+        string[] memory names_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(
+            addresses_.length == types_.length && addresses_.length == names_.length,
+            "Array length mismatch"
+        );
+
+        for (uint256 i = 0; i < addresses_.length; i++) {
+            if (addresses_[i] != address(0) && !managedContracts[addresses_[i]].isActive) {
+                managedContracts[addresses_[i]] = ManagedContract({
+                    contractAddress: addresses_[i],
+                    contractType: types_[i],
+                    name: names_[i],
+                    isActive: true,
+                    addedAt: block.timestamp
+                });
+
+                contractList.push(addresses_[i]);
+
+                emit ContractAdded(addresses_[i], types_[i], names_[i], block.timestamp);
+            }
+        }
+    }
+
+    /**
+     * @notice Remove contract from management
+     */
+    function removeContract(address contractAddress_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(managedContracts[contractAddress_].isActive, "Not managed");
+
+        // Mark as inactive
+        managedContracts[contractAddress_].isActive = false;
+
+        // Remove from list
+        for (uint256 i = 0; i < contractList.length; i++) {
+            if (contractList[i] == contractAddress_) {
+                contractList[i] = contractList[contractList.length - 1];
+                contractList.pop();
+                break;
+            }
+        }
+
+        emit ContractRemoved(contractAddress_, block.timestamp);
+    }
+
+    /**
+     * @notice EMERGENCY: Pause all managed contracts
+     */
+    function emergencyPauseAll(string memory reason_) external onlyRole(EMERGENCY_ROLE) {
+        require(!globalEmergency, "Already in emergency");
+
+        globalEmergency = true;
+        lastEmergencyTime = block.timestamp;
+        emergencyCount++;
+
+        uint256 pausedCount = 0;
+
+        for (uint256 i = 0; i < contractList.length; i++) {
+            address contractAddr = contractList[i];
+
+            if (managedContracts[contractAddr].isActive) {
+                try IPausable(contractAddr).pause() {
+                    pausedCount++;
+                    emit ContractPaused(
+                        contractAddr,
+                        managedContracts[contractAddr].name,
+                        block.timestamp
+                    );
+                } catch {
+                    // Continue even if one fails
+                }
+            }
+        }
+
+        emit GlobalEmergencyDeclared(msg.sender, reason_, block.timestamp);
+        emit EmergencyPauseActivated(msg.sender, pausedCount, block.timestamp);
+    }
+
+    /**
+     * @notice Resume all contracts after emergency
+     */
+    function emergencyUnpauseAll() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(globalEmergency, "Not in emergency");
+
+        globalEmergency = false;
+
+        for (uint256 i = 0; i < contractList.length; i++) {
+            address contractAddr = contractList[i];
+
+            if (managedContracts[contractAddr].isActive) {
+                try IPausable(contractAddr).unpause() {
+                    emit ContractUnpaused(
+                        contractAddr,
+                        managedContracts[contractAddr].name,
+                        block.timestamp
+                    );
+                } catch {
+                    // Continue
+                }
+            }
+        }
+
+        emit EmergencyPauseDeactivated(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Pause specific contract
+     */
+    function pauseContract(address contractAddress_) external onlyRole(EMERGENCY_ROLE) {
+        require(managedContracts[contractAddress_].isActive, "Not managed");
+
+        IPausable(contractAddress_).pause();
+
+        emit ContractPaused(
+            contractAddress_,
+            managedContracts[contractAddress_].name,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Unpause specific contract
+     */
+    function unpauseContract(address contractAddress_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(managedContracts[contractAddress_].isActive, "Not managed");
+
+        IPausable(contractAddress_).unpause();
+
+        emit ContractUnpaused(
+            contractAddress_,
+            managedContracts[contractAddress_].name,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Pause contracts by type
+     */
+    function pauseByType(ContractType contractType_) external onlyRole(EMERGENCY_ROLE) {
+        for (uint256 i = 0; i < contractList.length; i++) {
+            address contractAddr = contractList[i];
+            ManagedContract memory managed = managedContracts[contractAddr];
+
+            if (managed.isActive && managed.contractType == contractType_) {
+                try IPausable(contractAddr).pause() {
+                    emit ContractPaused(contractAddr, managed.name, block.timestamp);
+                } catch {
+                    // Continue
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Get status of all contracts
+     */
+    function getSystemStatus() external view returns (
+        uint256 totalContracts,
+        uint256 pausedContracts,
+        bool inEmergency
+    ) {
+        totalContracts = contractList.length;
+        pausedContracts = 0;
+
+        for (uint256 i = 0; i < contractList.length; i++) {
+            try IPausable(contractList[i]).paused() returns (bool isPaused) {
+                if (isPaused) {
+                    pausedContracts++;
+                }
+            } catch {
+                // Skip
+            }
+        }
+
+        inEmergency = globalEmergency;
+    }
+
+    /**
+     * @notice Get detailed status of specific contract
+     */
+    function getContractStatus(address contractAddress_) external view returns (
+        bool isManaged,
+        bool isPaused,
+        ContractType contractType,
+        string memory name
+    ) {
+        isManaged = managedContracts[contractAddress_].isActive;
+
+        if (isManaged) {
+            try IPausable(contractAddress_).paused() returns (bool paused) {
+                isPaused = paused;
+            } catch {
+                isPaused = false;
+            }
+
+            contractType = managedContracts[contractAddress_].contractType;
+            name = managedContracts[contractAddress_].name;
+        }
+    }
+
+    /**
+     * @notice Get all managed contracts
+     */
+    function getAllManagedContracts() external view returns (address[] memory) {
+        return contractList;
+    }
+
+    /**
+     * @notice Get contracts by type
+     */
+    function getContractsByType(ContractType contractType_) external view returns (address[] memory) {
+        // Count matching contracts
+        uint256 count = 0;
+        for (uint256 i = 0; i < contractList.length; i++) {
+            if (managedContracts[contractList[i]].contractType == contractType_ &&
+                managedContracts[contractList[i]].isActive) {
+                count++;
+            }
+        }
+
+        // Build result array
+        address[] memory result = new address[](count);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < contractList.length; i++) {
+            if (managedContracts[contractList[i]].contractType == contractType_ &&
+                managedContracts[contractList[i]].isActive) {
+                result[index] = contractList[i];
+                index++;
+            }
+        }
+
+        return result;
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

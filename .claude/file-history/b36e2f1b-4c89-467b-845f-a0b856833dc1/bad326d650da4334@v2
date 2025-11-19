@@ -1,0 +1,441 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+/**
+ * @title BTTB Unified Interfaces
+ * @notice Central interface definitions for all BTTB contracts
+ * @dev Import this file in all contracts to ensure interface consistency
+ */
+
+// ============================================================================
+// Bond Token Interfaces
+// ============================================================================
+
+/**
+ * @title IBondToken
+ * @notice Complete interface for bond token interactions
+ */
+interface IBondToken {
+    // ERC20-like functions
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    // Minting and burning (for custody operations)
+    function mint(address to, uint256 amount) external;
+    function burn(address from, uint256 amount) external;
+
+    // Bond-specific functions
+    function getHealthRatio() external view returns (uint256);
+    function getCurrentBondValue() external view returns (uint256);
+    function calculateAccruedInterest() external view returns (uint256);
+    function checkMaturity() external;
+    function depositCollateral(uint256 amount) external;
+
+    // Metadata
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+
+    // Initialize (for factory pattern)
+    function initialize(
+        address identityRegistry_,
+        address compliance_,
+        string memory name_,
+        string memory symbol_,
+        uint8 decimals_,
+        bytes memory metadata_
+    ) external;
+}
+
+/**
+ * @title IBondTokenMetadata
+ * @notice Extended metadata interface
+ */
+interface IBondTokenMetadata {
+    struct BondMetadata {
+        string isin;
+        string cusip;
+        uint256 faceValue;
+        uint256 couponRate;
+        uint256 issueDate;
+        uint256 maturityDate;
+        uint256 frequency;
+        address issuer;
+        string bondType;
+        string rating;
+        string jurisdiction;
+        string documentHash;
+    }
+
+    function getBondMetadata() external view returns (BondMetadata memory);
+}
+
+// ============================================================================
+// Registry Interfaces
+// ============================================================================
+
+/**
+ * @title IBondRegistry
+ * @notice Interface for bond registration and lookup
+ */
+interface IBondRegistry {
+    function registerBond(
+        address bondToken,
+        string memory isin,
+        string memory name,
+        string memory symbol,
+        address issuer,
+        address custodian,
+        string memory metadata
+    ) external;
+
+    function deactivateBond(address bondToken) external;
+    function getBondByISIN(string memory isin) external view returns (address);
+    function getActiveBonds() external view returns (address[] memory);
+    function getTotalBonds() external view returns (uint256);
+}
+
+// ============================================================================
+// Collateral Management Interfaces
+// ============================================================================
+
+/**
+ * @title ICollateralManager
+ * @notice Interface for collateral tracking and liquidation
+ */
+interface ICollateralManager {
+    enum CollateralStatus {
+        HEALTHY,
+        WARNING,
+        CRITICAL,
+        LIQUIDATING,
+        SUSPENDED
+    }
+
+    function registerBond(
+        address bondToken,
+        address custodian,
+        address priceFeed,
+        uint256 liquidationThreshold,
+        uint256 targetHealthRatio
+    ) external;
+
+    function updateCollateral(address bondToken, uint256 collateralAmount) external;
+    function triggerLiquidation(address bondToken) external returns (uint256);
+    function completeLiquidation(uint256 liquidationId, uint256 amountProvided) external;
+    function useInsuranceFund(address bondToken, uint256 amount) external;
+    function depositInsuranceFund(uint256 amount) external;
+    function getCriticalBonds() external view returns (address[] memory);
+    function needsLiquidation(address bondToken) external view returns (bool);
+}
+
+// ============================================================================
+// Custody Bridge Interfaces
+// ============================================================================
+
+/**
+ * @title ICustodyBridge
+ * @notice Interface for custody operations
+ */
+interface ICustodyBridge {
+    enum RequestType { DEPOSIT, WITHDRAWAL }
+    enum RequestStatus { PENDING, VERIFIED, COMPLETED, REJECTED, CANCELLED }
+
+    function createDepositRequest(
+        address bondToken,
+        uint256 amount,
+        string memory bondIdentifier,
+        bytes32 proofHash
+    ) external returns (uint256);
+
+    function createWithdrawalRequest(
+        address bondToken,
+        uint256 amount,
+        string memory bondIdentifier
+    ) external returns (uint256);
+
+    function verifyDeposit(uint256 requestId, string memory custodyReference) external;
+    function completeDeposit(uint256 requestId) external;
+    function completeWithdrawal(uint256 requestId, string memory custodyReference) external;
+    function rejectRequest(uint256 requestId, string memory reason) external;
+    function assignCustodian(address bondToken, address custodian) external;
+}
+
+// ============================================================================
+// Escrow Interfaces
+// ============================================================================
+
+/**
+ * @title IEscrowSettlement
+ * @notice Interface for escrow and dispute resolution
+ */
+interface IEscrowSettlement {
+    enum EscrowStatus {
+        ACTIVE,
+        RELEASED,
+        REFUNDED,
+        DISPUTED,
+        RESOLVED_RELEASE,
+        RESOLVED_REFUND,
+        EXPIRED
+    }
+
+    enum EscrowType {
+        CUSTODY_DEPOSIT,
+        CUSTODY_WITHDRAWAL,
+        CONVERSION,
+        COUPON_PAYMENT,
+        GENERAL
+    }
+
+    enum DisputeResolution {
+        PENDING,
+        RELEASE_TO_BENEFICIARY,
+        REFUND_TO_DEPOSITOR,
+        SPLIT_PAYMENT
+    }
+
+    function createEscrow(
+        address beneficiary,
+        address token,
+        uint256 amount,
+        EscrowType escrowType,
+        bytes32 referenceId,
+        uint256 customReleaseTime
+    ) external returns (uint256);
+
+    function releaseEscrow(uint256 escrowId) external;
+    function refundEscrow(uint256 escrowId, string memory reason) external;
+    function raiseDispute(uint256 escrowId, string memory reason) external;
+    function resolveDispute(uint256 escrowId, DisputeResolution resolution, uint256 refundAmount) external;
+    function extendEscrow(uint256 escrowId, uint256 additionalTime) external;
+    function isEscrowReleasable(uint256 escrowId) external view returns (bool);
+}
+
+// ============================================================================
+// Compliance Interfaces
+// ============================================================================
+
+/**
+ * @title IComplianceEngine
+ * @notice Interface for compliance checks and KYC management
+ */
+interface IComplianceEngine {
+    enum KYCStatus {
+        NOT_VERIFIED,
+        PENDING,
+        VERIFIED,
+        EXPIRED,
+        REJECTED,
+        SUSPENDED
+    }
+
+    enum AccreditationLevel {
+        RETAIL,
+        ACCREDITED,
+        QUALIFIED_INSTITUTIONAL,
+        PROFESSIONAL
+    }
+
+    function updateInvestorProfile(
+        address investor,
+        KYCStatus kycStatus,
+        AccreditationLevel accreditationLevel,
+        string memory jurisdiction,
+        uint256 kycExpiryDate,
+        uint256 riskScore,
+        bytes32 kycHash
+    ) external;
+
+    function canTransfer(
+        address from,
+        address to,
+        address bondToken,
+        uint256 amount
+    ) external view returns (bool, string memory);
+
+    function recordTransfer(
+        address from,
+        address to,
+        address bondToken,
+        uint256 amount
+    ) external;
+
+    function blacklistInvestor(address investor) external;
+    function whitelistInvestor(address investor) external;
+    function isInvestorCompliant(address investor) external view returns (bool);
+}
+
+// ============================================================================
+// Conversion Engine Interfaces
+// ============================================================================
+
+/**
+ * @title IConversionEngine
+ * @notice Interface for crypto <-> bond conversions
+ */
+interface IConversionEngine {
+    function convertCryptoToBond(
+        address cryptoToken,
+        address bondToken,
+        uint256 cryptoAmount
+    ) external returns (uint256);
+
+    function convertBondToCrypto(
+        address bondToken,
+        address cryptoToken,
+        uint256 bondAmount
+    ) external returns (uint256);
+
+    function quoteConversion(
+        address fromToken,
+        address toToken,
+        uint256 fromAmount
+    ) external view returns (uint256 toAmount, uint256 fee);
+
+    function addConversionPair(
+        address cryptoToken,
+        address bondToken,
+        address priceFeed,
+        uint256 conversionFee,
+        uint256 minAmount,
+        uint256 maxAmount
+    ) external;
+}
+
+// ============================================================================
+// Coupon Distribution Interfaces
+// ============================================================================
+
+/**
+ * @title ICouponDistributor
+ * @notice Interface for coupon payment distribution
+ */
+interface ICouponDistributor {
+    function scheduleCouponPayment(
+        address bondToken,
+        uint256 totalAmount,
+        uint256 paymentDate,
+        uint256 recordDate,
+        address paymentToken
+    ) external returns (uint256);
+
+    function distributeCoupon(uint256 paymentId, address[] calldata holders) external;
+    function claimCoupon(uint256 paymentId) external;
+    function batchClaimCoupons(uint256[] calldata paymentIds) external;
+    function getClaimableAmount(uint256 paymentId, address user) external view returns (uint256);
+}
+
+// ============================================================================
+// Factory Interfaces
+// ============================================================================
+
+/**
+ * @title IBondFactory
+ * @notice Interface for bond token deployment
+ */
+interface IBondFactory {
+    enum BondType {
+        GOVERNMENT,
+        CORPORATE,
+        MUNICIPAL,
+        AGENCY,
+        SUPRANATIONAL,
+        COVERED,
+        CONVERTIBLE
+    }
+
+    enum DeploymentStatus {
+        PENDING,
+        APPROVED,
+        DEPLOYED,
+        REJECTED,
+        CANCELLED
+    }
+
+    struct BondParameters {
+        string name;
+        string symbol;
+        uint8 decimals;
+        string isin;
+        string cusip;
+        uint256 faceValue;
+        uint256 couponRate;
+        uint256 issueDate;
+        uint256 maturityDate;
+        uint256 frequency;
+        address issuer;
+        address custodian;
+        address identityRegistry;
+        address complianceModule;
+        address priceFeed;
+        string documentHash;
+        string jurisdiction;
+        uint256 minInvestment;
+        uint256 maxInvestment;
+        bool requiresAccreditation;
+    }
+
+    function addTemplate(
+        string memory templateName,
+        address implementation,
+        BondType bondType,
+        bytes memory defaultConfig
+    ) external returns (uint256);
+
+    function requestDeployment(
+        uint256 templateId,
+        BondParameters memory params
+    ) external payable returns (uint256);
+
+    function approveAndDeploy(uint256 requestId) external returns (address);
+    function rejectDeployment(uint256 requestId, string memory reason) external;
+    function getBondByISIN(string memory isin) external view returns (address);
+}
+
+// ============================================================================
+// Governance Interfaces
+// ============================================================================
+
+/**
+ * @title IGovernanceModule
+ * @notice Interface for multi-sig governance
+ */
+interface IGovernanceModule {
+    function createProposal(
+        address target,
+        bytes32 operationType,
+        bytes memory callData,
+        uint256 value
+    ) external returns (uint256);
+
+    function approveProposal(uint256 proposalId) external;
+    function executeProposal(uint256 proposalId) external;
+    function cancelProposal(uint256 proposalId) external;
+}
+
+// ============================================================================
+// Oracle Interfaces
+// ============================================================================
+
+/**
+ * @title IBondPriceOracle
+ * @notice Interface for Chainlink-based bond price oracle
+ */
+interface IBondPriceOracle {
+    struct BondPrice {
+        uint256 price;
+        uint256 yield;
+        uint256 timestamp;
+        uint8 rating;
+        bool isValid;
+    }
+
+    function requestBondPrice(string memory isin, address oracle) external returns (bytes32);
+    function getBondData(string memory isin) external view returns (BondPrice memory);
+    function isPriceStale(string memory isin) external view returns (bool);
+}

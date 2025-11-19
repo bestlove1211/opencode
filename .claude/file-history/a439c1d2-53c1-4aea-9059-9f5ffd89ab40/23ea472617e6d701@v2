@@ -1,0 +1,652 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IDebtCollection.sol";
+import "./interfaces/IBancafiBlockMarket.sol";
+
+/**
+ * @title BancafiPortfolioManager
+ * @notice Bundle multiple debts into portfolios for institutional buyers
+ * @dev Allows bulk debt trading with diversification benefits
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiPortfolioManager is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    // ============ Structs ============
+
+    struct DebtPortfolio {
+        uint256 id;
+        string name;
+        address creator;
+        uint256[] collectionIds;
+        uint256 totalFaceValue;
+        uint256 askingPrice;
+        uint256 discountRate;
+        uint256 createdAt;
+        uint256 expiresAt;
+        PortfolioStatus status;
+        PortfolioStrategy strategy;
+        mapping(uint256 => DebtMetadata) debtMetadata;
+    }
+
+    struct DebtMetadata {
+        uint256 collectionId;
+        uint256 faceValue;
+        uint256 daysOverdue;
+        address borrower;
+        uint8 severityLevel;
+    }
+
+    struct PortfolioListing {
+        uint256 portfolioId;
+        uint256 listingId;
+        address seller;
+        uint256 price;
+        bool isActive;
+        uint256 listedAt;
+    }
+
+    struct PortfolioAnalytics {
+        uint256 averageOverdueDays;
+        uint256 totalDebts;
+        uint256 weightedDiscountRate;
+        uint256 estimatedRecoveryRate;
+        uint256 diversificationScore;
+    }
+
+    enum PortfolioStatus {
+        Draft,
+        Active,
+        Listed,
+        Sold,
+        Dissolved
+    }
+
+    enum PortfolioStrategy {
+        Diversified,        // Mix of different debt types
+        Concentrated,       // Similar debt characteristics
+        Geographic,         // Geographic diversification
+        Sector,            // Industry/sector focus
+        TimeBasedaging,    // Based on overdue duration
+        Custom             // Custom criteria
+    }
+
+    // ============ State Variables ============
+
+    IDebtCollection public debtCollectionContract;
+    IBancafiBlockMarket public blockMarket;
+
+    uint256 public nextPortfolioId;
+    uint256 public minPortfolioSize;
+    uint256 public maxPortfolioSize;
+    uint256 public minDiscountRate;
+
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MIN_PORTFOLIO_SIZE = 3;
+    uint256 public constant MAX_PORTFOLIO_SIZE = 100;
+
+    mapping(uint256 => DebtPortfolio) private portfolios;
+    mapping(uint256 => uint256[]) public portfolioCollections; // portfolioId => collectionIds
+    mapping(uint256 => PortfolioAnalytics) public portfolioAnalytics;
+    mapping(uint256 => bool) public usedCollections; // collectionId => used in portfolio
+    mapping(address => uint256[]) public userPortfolios;
+    mapping(uint256 => PortfolioListing) public portfolioListings;
+
+    // ============ Events ============
+
+    event PortfolioCreated(
+        uint256 indexed portfolioId,
+        address indexed creator,
+        string name,
+        uint256 totalFaceValue,
+        uint256 debtCount
+    );
+
+    event DebtAddedToPortfolio(
+        uint256 indexed portfolioId,
+        uint256 indexed collectionId,
+        uint256 faceValue
+    );
+
+    event DebtRemovedFromPortfolio(
+        uint256 indexed portfolioId,
+        uint256 indexed collectionId
+    );
+
+    event PortfolioListed(
+        uint256 indexed portfolioId,
+        uint256 askingPrice,
+        uint256 discountRate
+    );
+
+    event PortfolioSold(
+        uint256 indexed portfolioId,
+        address indexed seller,
+        address indexed buyer,
+        uint256 salePrice
+    );
+
+    event PortfolioDissolved(
+        uint256 indexed portfolioId,
+        address indexed owner
+    );
+
+    event PortfolioAnalyticsUpdated(
+        uint256 indexed portfolioId,
+        uint256 estimatedRecoveryRate,
+        uint256 diversificationScore
+    );
+
+    // ============ Modifiers ============
+
+    modifier validPortfolio(uint256 portfolioId) {
+        require(portfolioId > 0 && portfolioId < nextPortfolioId, "Invalid portfolio ID");
+        _;
+    }
+
+    modifier onlyPortfolioOwner(uint256 portfolioId) {
+        require(portfolios[portfolioId].creator == msg.sender, "Not portfolio owner");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        address _debtCollectionContract,
+        address _blockMarket
+    ) public initializer {
+        require(_debtCollectionContract != address(0), "Invalid debt collection address");
+        require(_blockMarket != address(0), "Invalid block market address");
+
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        debtCollectionContract = IDebtCollection(_debtCollectionContract);
+        blockMarket = IBancafiBlockMarket(_blockMarket);
+
+        nextPortfolioId = 1;
+        minPortfolioSize = MIN_PORTFOLIO_SIZE;
+        maxPortfolioSize = MAX_PORTFOLIO_SIZE;
+        minDiscountRate = 1000; // 10% minimum discount
+    }
+
+    // ============ Portfolio Creation ============
+
+    /**
+     * @notice Create a new debt portfolio
+     * @param name Portfolio name
+     * @param strategy Portfolio strategy
+     * @return portfolioId Created portfolio ID
+     */
+    function createPortfolio(
+        string calldata name,
+        PortfolioStrategy strategy
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(bytes(name).length > 0, "Name required");
+
+        uint256 portfolioId = nextPortfolioId++;
+
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        portfolio.id = portfolioId;
+        portfolio.name = name;
+        portfolio.creator = msg.sender;
+        portfolio.createdAt = block.timestamp;
+        portfolio.status = PortfolioStatus.Draft;
+        portfolio.strategy = strategy;
+
+        userPortfolios[msg.sender].push(portfolioId);
+
+        emit PortfolioCreated(portfolioId, msg.sender, name, 0, 0);
+
+        return portfolioId;
+    }
+
+    /**
+     * @notice Add debt to portfolio
+     * @param portfolioId Portfolio ID
+     * @param collectionId Collection ID to add
+     */
+    function addDebtToPortfolio(
+        uint256 portfolioId,
+        uint256 collectionId
+    ) external validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Draft, "Portfolio not in draft");
+        require(!usedCollections[collectionId], "Collection already in portfolio");
+        require(
+            portfolioCollections[portfolioId].length < maxPortfolioSize,
+            "Portfolio full"
+        );
+
+        // Get debt details from DebtCollection
+        (
+            ,
+            ,
+            address creditor,
+            uint256 originalAmount,
+            uint256 remainingAmount,
+
+        ) = debtCollectionContract.getCollectionDetails(collectionId);
+
+        require(creditor == msg.sender, "Not debt owner");
+        require(remainingAmount > 0, "No remaining debt");
+
+        // Add to portfolio
+        portfolioCollections[portfolioId].push(collectionId);
+        usedCollections[collectionId] = true;
+
+        portfolio.totalFaceValue += remainingAmount;
+
+        // Store metadata
+        portfolio.debtMetadata[collectionId] = DebtMetadata({
+            collectionId: collectionId,
+            faceValue: remainingAmount,
+            daysOverdue: 0, // Calculate from debt collection
+            borrower: address(0),
+            severityLevel: 0
+        });
+
+        emit DebtAddedToPortfolio(portfolioId, collectionId, remainingAmount);
+
+        // Update analytics
+        _updatePortfolioAnalytics(portfolioId);
+    }
+
+    /**
+     * @notice Remove debt from portfolio (before listing)
+     * @param portfolioId Portfolio ID
+     * @param collectionId Collection ID to remove
+     */
+    function removeDebtFromPortfolio(
+        uint256 portfolioId,
+        uint256 collectionId
+    ) external validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Draft, "Portfolio not in draft");
+
+        uint256[] storage collections = portfolioCollections[portfolioId];
+        bool found = false;
+
+        for (uint256 i = 0; i < collections.length; i++) {
+            if (collections[i] == collectionId) {
+                // Remove from array
+                collections[i] = collections[collections.length - 1];
+                collections.pop();
+                found = true;
+                break;
+            }
+        }
+
+        require(found, "Collection not in portfolio");
+
+        // Update totals
+        DebtMetadata memory metadata = portfolio.debtMetadata[collectionId];
+        portfolio.totalFaceValue -= metadata.faceValue;
+
+        delete portfolio.debtMetadata[collectionId];
+        usedCollections[collectionId] = false;
+
+        emit DebtRemovedFromPortfolio(portfolioId, collectionId);
+
+        // Update analytics
+        _updatePortfolioAnalytics(portfolioId);
+    }
+
+    /**
+     * @notice Batch add debts to portfolio
+     * @param portfolioId Portfolio ID
+     * @param collectionIds Array of collection IDs
+     */
+    function batchAddDebts(
+        uint256 portfolioId,
+        uint256[] calldata collectionIds
+    ) external validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        require(
+            portfolioCollections[portfolioId].length + collectionIds.length <= maxPortfolioSize,
+            "Exceeds max portfolio size"
+        );
+
+        for (uint256 i = 0; i < collectionIds.length; i++) {
+            this.addDebtToPortfolio(portfolioId, collectionIds[i]);
+        }
+    }
+
+    // ============ Portfolio Listing ============
+
+    /**
+     * @notice List portfolio for sale
+     * @param portfolioId Portfolio ID
+     * @param askingPrice Asking price for entire portfolio
+     * @param duration Listing duration
+     */
+    function listPortfolio(
+        uint256 portfolioId,
+        uint256 askingPrice,
+        uint256 duration
+    ) external validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) nonReentrant {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Draft, "Portfolio already listed");
+        require(
+            portfolioCollections[portfolioId].length >= minPortfolioSize,
+            "Portfolio too small"
+        );
+        require(askingPrice > 0, "Invalid price");
+        require(askingPrice < portfolio.totalFaceValue, "Price must be below face value");
+
+        uint256 discountRate = ((portfolio.totalFaceValue - askingPrice) * BASIS_POINTS) / portfolio.totalFaceValue;
+        require(discountRate >= minDiscountRate, "Discount too low");
+
+        portfolio.status = PortfolioStatus.Listed;
+        portfolio.askingPrice = askingPrice;
+        portfolio.discountRate = discountRate;
+        portfolio.expiresAt = block.timestamp + duration;
+
+        portfolioListings[portfolioId] = PortfolioListing({
+            portfolioId: portfolioId,
+            listingId: 0,
+            seller: msg.sender,
+            price: askingPrice,
+            isActive: true,
+            listedAt: block.timestamp
+        });
+
+        emit PortfolioListed(portfolioId, askingPrice, discountRate);
+    }
+
+    /**
+     * @notice Buy entire portfolio
+     * @param portfolioId Portfolio ID to purchase
+     */
+    function buyPortfolio(
+        uint256 portfolioId
+    ) external payable validPortfolio(portfolioId) nonReentrant whenNotPaused {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Listed, "Portfolio not listed");
+        require(block.timestamp < portfolio.expiresAt, "Listing expired");
+        require(msg.value >= portfolio.askingPrice, "Insufficient payment");
+
+        address seller = portfolio.creator;
+        uint256 price = portfolio.askingPrice;
+
+        // Transfer ownership of all debts
+        uint256[] memory collections = portfolioCollections[portfolioId];
+        for (uint256 i = 0; i < collections.length; i++) {
+            // Transfer debt ownership via DebtCollection
+            debtCollectionContract.sellDebt(collections[i], msg.sender, price / collections.length);
+        }
+
+        // Update portfolio
+        portfolio.status = PortfolioStatus.Sold;
+        portfolio.creator = msg.sender;
+        portfolioListings[portfolioId].isActive = false;
+
+        // Transfer payment
+        payable(seller).transfer(price);
+
+        emit PortfolioSold(portfolioId, seller, msg.sender, price);
+
+        // Refund excess
+        if (msg.value > price) {
+            payable(msg.sender).transfer(msg.value - price);
+        }
+    }
+
+    /**
+     * @notice Dissolve portfolio and return debts to individual listings
+     * @param portfolioId Portfolio ID to dissolve
+     */
+    function dissolvePortfolio(
+        uint256 portfolioId
+    ) external validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(
+            portfolio.status == PortfolioStatus.Draft || portfolio.status == PortfolioStatus.Listed,
+            "Cannot dissolve sold portfolio"
+        );
+
+        // Release all collections
+        uint256[] memory collections = portfolioCollections[portfolioId];
+        for (uint256 i = 0; i < collections.length; i++) {
+            usedCollections[collections[i]] = false;
+        }
+
+        portfolio.status = PortfolioStatus.Dissolved;
+        portfolioListings[portfolioId].isActive = false;
+
+        emit PortfolioDissolved(portfolioId, msg.sender);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get portfolio details
+     * @param portfolioId Portfolio ID
+     * @return name Portfolio name
+     * @return creator Portfolio creator address
+     * @return totalFaceValue Total face value of debts
+     * @return askingPrice Asking price for portfolio
+     * @return status Portfolio status
+     * @return debtCount Number of debts in portfolio
+     */
+    function getPortfolioDetails(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (
+            string memory name,
+            address creator,
+            uint256 totalFaceValue,
+            uint256 askingPrice,
+            PortfolioStatus status,
+            uint256 debtCount
+        )
+    {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        return (
+            portfolio.name,
+            portfolio.creator,
+            portfolio.totalFaceValue,
+            portfolio.askingPrice,
+            portfolio.status,
+            portfolioCollections[portfolioId].length
+        );
+    }
+
+    /**
+     * @notice Get all debts in portfolio
+     * @param portfolioId Portfolio ID
+     * @return Array of collection IDs
+     */
+    function getPortfolioDebts(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (uint256[] memory)
+    {
+        return portfolioCollections[portfolioId];
+    }
+
+    /**
+     * @notice Get portfolio analytics
+     * @param portfolioId Portfolio ID
+     * @return PortfolioAnalytics struct
+     */
+    function getPortfolioAnalytics(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (PortfolioAnalytics memory)
+    {
+        return portfolioAnalytics[portfolioId];
+    }
+
+    /**
+     * @notice Get user's portfolios
+     * @param user User address
+     * @return Array of portfolio IDs
+     */
+    function getUserPortfolios(address user) external view returns (uint256[] memory) {
+        return userPortfolios[user];
+    }
+
+    /**
+     * @notice Get all active portfolio listings
+     * @return Array of portfolio IDs
+     */
+    function getActivePortfolios() external view returns (uint256[] memory) {
+        uint256 count = 0;
+
+        // Count active portfolios
+        for (uint256 i = 1; i < nextPortfolioId; i++) {
+            if (portfolios[i].status == PortfolioStatus.Listed) {
+                count++;
+            }
+        }
+
+        // Create array
+        uint256[] memory active = new uint256[](count);
+        uint256 index = 0;
+
+        for (uint256 i = 1; i < nextPortfolioId; i++) {
+            if (portfolios[i].status == PortfolioStatus.Listed) {
+                active[index] = i;
+                index++;
+            }
+        }
+
+        return active;
+    }
+
+    /**
+     * @notice Calculate portfolio value metrics
+     * @param portfolioId Portfolio ID
+     * @return faceValue Total face value
+     * @return estimatedValue Estimated recovery value
+     * @return discountRate Discount rate in basis points
+     */
+    function calculatePortfolioMetrics(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (
+            uint256 faceValue,
+            uint256 estimatedValue,
+            uint256 discountRate
+        )
+    {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        PortfolioAnalytics memory analytics = portfolioAnalytics[portfolioId];
+
+        faceValue = portfolio.totalFaceValue;
+        estimatedValue = (faceValue * analytics.estimatedRecoveryRate) / BASIS_POINTS;
+        discountRate = portfolio.discountRate;
+
+        return (faceValue, estimatedValue, discountRate);
+    }
+
+    // ============ Analytics Functions ============
+
+    /**
+     * @notice Update portfolio analytics
+     * @param portfolioId Portfolio ID
+     */
+    function _updatePortfolioAnalytics(uint256 portfolioId) internal {
+        uint256[] memory collections = portfolioCollections[portfolioId];
+
+        if (collections.length == 0) {
+            return;
+        }
+
+        uint256 totalOverdueDays = 0;
+        uint256 totalDebts = collections.length;
+
+        // Calculate averages
+        for (uint256 i = 0; i < collections.length; i++) {
+            // Would calculate days overdue from DebtCollection
+            totalOverdueDays += 30; // Placeholder
+        }
+
+        uint256 averageOverdue = totalOverdueDays / totalDebts;
+
+        // Estimate recovery rate based on overdue days
+        uint256 estimatedRecovery;
+        if (averageOverdue <= 30) {
+            estimatedRecovery = 8000; // 80% recovery
+        } else if (averageOverdue <= 90) {
+            estimatedRecovery = 6000; // 60% recovery
+        } else if (averageOverdue <= 180) {
+            estimatedRecovery = 4000; // 40% recovery
+        } else {
+            estimatedRecovery = 2000; // 20% recovery
+        }
+
+        // Diversification score (higher is better)
+        uint256 diversification = totalDebts >= 10 ? 9000 : (totalDebts * 900);
+
+        portfolioAnalytics[portfolioId] = PortfolioAnalytics({
+            averageOverdueDays: averageOverdue,
+            totalDebts: totalDebts,
+            weightedDiscountRate: 0,
+            estimatedRecoveryRate: estimatedRecovery,
+            diversificationScore: diversification
+        });
+
+        emit PortfolioAnalyticsUpdated(portfolioId, estimatedRecovery, diversification);
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update portfolio size limits
+     * @param newMin New minimum size
+     * @param newMax New maximum size
+     */
+    function updatePortfolioSizeLimits(uint256 newMin, uint256 newMax) external onlyOwner {
+        require(newMin >= MIN_PORTFOLIO_SIZE, "Min too low");
+        require(newMax <= MAX_PORTFOLIO_SIZE, "Max too high");
+        require(newMin < newMax, "Invalid range");
+
+        minPortfolioSize = newMin;
+        maxPortfolioSize = newMax;
+    }
+
+    /**
+     * @notice Update minimum discount rate
+     * @param newRate New minimum discount (basis points)
+     */
+    function updateMinDiscountRate(uint256 newRate) external onlyOwner {
+        require(newRate > 0 && newRate < BASIS_POINTS, "Invalid rate");
+        minDiscountRate = newRate;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    receive() external payable {}
+
+    uint256[50] private __gap;
+}

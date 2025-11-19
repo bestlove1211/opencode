@@ -1,0 +1,615 @@
+/**
+ * Bancafi Wallet Integration Library
+ * Unified interface for connecting to multiple wallet providers
+ */
+
+import { ethers } from 'ethers';
+
+export enum WalletProvider {
+  METAMASK = 'metamask',
+  WALLET_CONNECT = 'walletconnect',
+  COINBASE_WALLET = 'coinbase',
+  GNOSIS_SAFE = 'gnosis',
+  LEDGER = 'ledger',
+  TREZOR = 'trezor',
+}
+
+export enum WalletType {
+  EOA = 0,
+  MULTISIG = 1,
+  SMART_CONTRACT = 2,
+  INSTITUTIONAL = 3,
+}
+
+export interface WalletConnection {
+  address: string;
+  provider: ethers.providers.Web3Provider;
+  signer: ethers.Signer;
+  chainId: number;
+  providerType: WalletProvider;
+  isConnected: boolean;
+}
+
+export interface WalletProfile {
+  wallet: string;
+  walletType: WalletType;
+  isRegistered: boolean;
+  isVerified: boolean;
+  registeredAt: number;
+  transactionCount: number;
+  totalVolume: string;
+  metadata: string;
+}
+
+export interface MultiSigConfig {
+  signers: string[];
+  requiredSignatures: number;
+  signatureTimeout: number;
+  isActive: boolean;
+}
+
+export interface BatchTransaction {
+  id: number;
+  initiator: string;
+  targets: string[];
+  calldatas: string[];
+  values: string[];
+  deadline: number;
+  status: TransactionStatus;
+  approvalCount: number;
+}
+
+export enum TransactionStatus {
+  Pending = 0,
+  Approved = 1,
+  Executed = 2,
+  Cancelled = 3,
+  Expired = 4,
+}
+
+/**
+ * Main Wallet Connector Class
+ */
+export class BancafiWalletConnector {
+  private connection: WalletConnection | null = null;
+  private walletIntegrationContract: ethers.Contract | null = null;
+
+  constructor(
+    private walletIntegrationAddress: string,
+    private walletIntegrationABI: any[]
+  ) {}
+
+  /**
+   * Connect to MetaMask
+   */
+  async connectMetaMask(): Promise<WalletConnection> {
+    if (typeof window === 'undefined' || !(window as any).ethereum) {
+      throw new Error('MetaMask not installed');
+    }
+
+    const ethereum = (window as any).ethereum;
+
+    // Request account access
+    const accounts = await ethereum.request({
+      method: 'eth_requestAccounts',
+    });
+
+    const provider = new ethers.providers.Web3Provider(ethereum);
+    const signer = provider.getSigner();
+    const address = await signer.getAddress();
+    const network = await provider.getNetwork();
+
+    this.connection = {
+      address,
+      provider,
+      signer,
+      chainId: network.chainId,
+      providerType: WalletProvider.METAMASK,
+      isConnected: true,
+    };
+
+    // Initialize contract
+    this.walletIntegrationContract = new ethers.Contract(
+      this.walletIntegrationAddress,
+      this.walletIntegrationABI,
+      signer
+    );
+
+    // Listen for account changes
+    ethereum.on('accountsChanged', (accounts: string[]) => {
+      if (accounts.length === 0) {
+        this.disconnect();
+      } else {
+        this.connection!.address = accounts[0];
+      }
+    });
+
+    // Listen for chain changes
+    ethereum.on('chainChanged', (chainId: string) => {
+      window.location.reload();
+    });
+
+    return this.connection;
+  }
+
+  /**
+   * Connect to WalletConnect
+   */
+  async connectWalletConnect(): Promise<WalletConnection> {
+    // WalletConnect v2 implementation
+    try {
+      const { EthereumProvider } = await import('@walletconnect/ethereum-provider');
+
+      const walletConnectProvider = await EthereumProvider.init({
+        projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID!,
+        chains: [1], // Ethereum mainnet
+        showQrModal: true,
+        methods: [
+          'eth_sendTransaction',
+          'eth_signTransaction',
+          'eth_sign',
+          'personal_sign',
+          'eth_signTypedData',
+        ],
+      });
+
+      await walletConnectProvider.enable();
+
+      const provider = new ethers.providers.Web3Provider(walletConnectProvider as any);
+      const signer = provider.getSigner();
+      const address = await signer.getAddress();
+      const network = await provider.getNetwork();
+
+      this.connection = {
+        address,
+        provider,
+        signer,
+        chainId: network.chainId,
+        providerType: WalletProvider.WALLET_CONNECT,
+        isConnected: true,
+      };
+
+      this.walletIntegrationContract = new ethers.Contract(
+        this.walletIntegrationAddress,
+        this.walletIntegrationABI,
+        signer
+      );
+
+      return this.connection;
+    } catch (error) {
+      throw new Error(`WalletConnect connection failed: ${error}`);
+    }
+  }
+
+  /**
+   * Connect to Coinbase Wallet
+   */
+  async connectCoinbaseWallet(): Promise<WalletConnection> {
+    try {
+      const { CoinbaseWalletSDK } = await import('@coinbase/wallet-sdk');
+
+      const coinbaseWallet = new CoinbaseWalletSDK({
+        appName: 'Bancafi Credit',
+        appLogoUrl: process.env.NEXT_PUBLIC_LOGO_URL,
+        darkMode: false,
+      });
+
+      const ethereum = coinbaseWallet.makeWeb3Provider(
+        process.env.NEXT_PUBLIC_RPC_URL!,
+        parseInt(process.env.NEXT_PUBLIC_CHAIN_ID!)
+      );
+
+      const accounts = await ethereum.request({
+        method: 'eth_requestAccounts',
+      });
+
+      const provider = new ethers.providers.Web3Provider(ethereum as any);
+      const signer = provider.getSigner();
+      const address = await signer.getAddress();
+      const network = await provider.getNetwork();
+
+      this.connection = {
+        address,
+        provider,
+        signer,
+        chainId: network.chainId,
+        providerType: WalletProvider.COINBASE_WALLET,
+        isConnected: true,
+      };
+
+      this.walletIntegrationContract = new ethers.Contract(
+        this.walletIntegrationAddress,
+        this.walletIntegrationABI,
+        signer
+      );
+
+      return this.connection;
+    } catch (error) {
+      throw new Error(`Coinbase Wallet connection failed: ${error}`);
+    }
+  }
+
+  /**
+   * Connect to Gnosis Safe
+   */
+  async connectGnosisSafe(safeAddress: string): Promise<WalletConnection> {
+    try {
+      const SafeAppsSDK = (await import('@safe-global/safe-apps-sdk')).default;
+      const sdk = new SafeAppsSDK();
+
+      const safe = await sdk.safe.getInfo();
+
+      // Use the underlying provider
+      const provider = new ethers.providers.Web3Provider((window as any).ethereum);
+      const signer = provider.getSigner();
+
+      this.connection = {
+        address: safe.safeAddress,
+        provider,
+        signer,
+        chainId: parseInt(safe.chainId),
+        providerType: WalletProvider.GNOSIS_SAFE,
+        isConnected: true,
+      };
+
+      this.walletIntegrationContract = new ethers.Contract(
+        this.walletIntegrationAddress,
+        this.walletIntegrationABI,
+        signer
+      );
+
+      return this.connection;
+    } catch (error) {
+      throw new Error(`Gnosis Safe connection failed: ${error}`);
+    }
+  }
+
+  /**
+   * Disconnect wallet
+   */
+  disconnect(): void {
+    this.connection = null;
+    this.walletIntegrationContract = null;
+  }
+
+  /**
+   * Get current connection
+   */
+  getConnection(): WalletConnection | null {
+    return this.connection;
+  }
+
+  /**
+   * Check if wallet is connected
+   */
+  isConnected(): boolean {
+    return this.connection !== null && this.connection.isConnected;
+  }
+
+  // ============ Wallet Integration Contract Methods ============
+
+  /**
+   * Register wallet with the platform
+   */
+  async registerWallet(walletType: WalletType, metadata: string): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.registerWallet(walletType, metadata);
+  }
+
+  /**
+   * Get wallet profile
+   */
+  async getWalletProfile(address?: string): Promise<WalletProfile> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+    return await this.walletIntegrationContract!.getWalletProfile(walletAddress);
+  }
+
+  /**
+   * Configure multi-signature settings
+   */
+  async configureMultiSig(
+    signers: string[],
+    requiredSignatures: number,
+    signatureTimeout: number
+  ): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.configureMultiSig(
+      signers,
+      requiredSignatures,
+      signatureTimeout
+    );
+  }
+
+  /**
+   * Get multi-sig configuration
+   */
+  async getMultiSigConfig(address?: string): Promise<MultiSigConfig> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+    return await this.walletIntegrationContract!.getMultiSigConfig(walletAddress);
+  }
+
+  /**
+   * Create batch transaction
+   */
+  async createBatchTransaction(
+    targets: string[],
+    calldatas: string[],
+    values: string[],
+    deadline: number
+  ): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.createBatchTransaction(
+      targets,
+      calldatas,
+      values,
+      deadline
+    );
+  }
+
+  /**
+   * Approve batch transaction
+   */
+  async approveBatchTransaction(batchId: number): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.approveBatchTransaction(batchId);
+  }
+
+  /**
+   * Execute batch transaction
+   */
+  async executeBatchTransaction(batchId: number): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.executeBatchTransaction(batchId);
+  }
+
+  /**
+   * Cancel batch transaction
+   */
+  async cancelBatchTransaction(batchId: number): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.cancelBatchTransaction(batchId);
+  }
+
+  /**
+   * Get wallet's batch transactions
+   */
+  async getWalletBatches(address?: string): Promise<number[]> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+    return await this.walletIntegrationContract!.getWalletBatches(walletAddress);
+  }
+
+  /**
+   * Get batch details
+   */
+  async getBatchDetails(batchId: number): Promise<{
+    initiator: string;
+    targets: string[];
+    status: TransactionStatus;
+    approvalCount: number;
+  }> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.getBatchDetails(batchId);
+  }
+
+  /**
+   * Add delegate
+   */
+  async addDelegate(
+    delegate: string,
+    canTransact: boolean,
+    canApprove: boolean,
+    duration: number
+  ): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.addDelegate(
+      delegate,
+      canTransact,
+      canApprove,
+      duration
+    );
+  }
+
+  /**
+   * Revoke delegate
+   */
+  async revokeDelegate(delegate: string): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.revokeDelegate(delegate);
+  }
+
+  /**
+   * Get wallet delegates
+   */
+  async getWalletDelegates(address?: string): Promise<string[]> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+    return await this.walletIntegrationContract!.getWalletDelegates(walletAddress);
+  }
+
+  /**
+   * Create session
+   */
+  async createSession(sessionHash: string, duration: number): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.createSession(
+      ethers.utils.id(sessionHash),
+      duration
+    );
+  }
+
+  /**
+   * Revoke session
+   */
+  async revokeSession(sessionHash: string): Promise<ethers.ContractTransaction> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.revokeSession(ethers.utils.id(sessionHash));
+  }
+
+  /**
+   * Check if session is active
+   */
+  async isSessionActive(sessionHash: string, address?: string): Promise<boolean> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+    return await this.walletIntegrationContract!.isSessionActive(
+      walletAddress,
+      ethers.utils.id(sessionHash)
+    );
+  }
+
+  /**
+   * Check if batch is ready to execute
+   */
+  async isReadyToExecute(batchId: number): Promise<boolean> {
+    this.ensureConnected();
+    return await this.walletIntegrationContract!.isReadyToExecute(batchId);
+  }
+
+  // ============ Helper Methods ============
+
+  /**
+   * Sign message
+   */
+  async signMessage(message: string): Promise<string> {
+    this.ensureConnected();
+    return await this.connection!.signer.signMessage(message);
+  }
+
+  /**
+   * Sign typed data (EIP-712)
+   */
+  async signTypedData(
+    domain: ethers.TypedDataDomain,
+    types: Record<string, ethers.TypedDataField[]>,
+    value: Record<string, any>
+  ): Promise<string> {
+    this.ensureConnected();
+
+    const signer = this.connection!.signer as ethers.providers.JsonRpcSigner;
+    return await signer._signTypedData(domain, types, value);
+  }
+
+  /**
+   * Switch network
+   */
+  async switchNetwork(chainId: number): Promise<void> {
+    this.ensureConnected();
+
+    const ethereum = (window as any).ethereum;
+    if (!ethereum) throw new Error('No ethereum provider');
+
+    try {
+      await ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: `0x${chainId.toString(16)}` }],
+      });
+    } catch (error: any) {
+      // Chain not added, add it
+      if (error.code === 4902) {
+        throw new Error('Chain not configured in wallet');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get balance
+   */
+  async getBalance(address?: string): Promise<ethers.BigNumber> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+    return await this.connection!.provider.getBalance(walletAddress);
+  }
+
+  /**
+   * Get token balance
+   */
+  async getTokenBalance(tokenAddress: string, address?: string): Promise<ethers.BigNumber> {
+    this.ensureConnected();
+    const walletAddress = address || this.connection!.address;
+
+    const tokenABI = ['function balanceOf(address) view returns (uint256)'];
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      tokenABI,
+      this.connection!.provider
+    );
+
+    return await tokenContract.balanceOf(walletAddress);
+  }
+
+  /**
+   * Ensure wallet is connected
+   */
+  private ensureConnected(): void {
+    if (!this.isConnected()) {
+      throw new Error('Wallet not connected');
+    }
+  }
+}
+
+/**
+ * Utility Functions
+ */
+
+export function shortenAddress(address: string, chars = 4): string {
+  return `${address.substring(0, chars + 2)}...${address.substring(42 - chars)}`;
+}
+
+export function formatBalance(balance: ethers.BigNumber, decimals = 18, displayDecimals = 4): string {
+  return parseFloat(ethers.utils.formatUnits(balance, decimals)).toFixed(displayDecimals);
+}
+
+export function getWalletTypeName(walletType: WalletType): string {
+  switch (walletType) {
+    case WalletType.EOA:
+      return 'Personal Wallet';
+    case WalletType.MULTISIG:
+      return 'Multi-Signature';
+    case WalletType.SMART_CONTRACT:
+      return 'Smart Contract';
+    case WalletType.INSTITUTIONAL:
+      return 'Institutional';
+    default:
+      return 'Unknown';
+  }
+}
+
+export function getProviderName(provider: WalletProvider): string {
+  switch (provider) {
+    case WalletProvider.METAMASK:
+      return 'MetaMask';
+    case WalletProvider.WALLET_CONNECT:
+      return 'WalletConnect';
+    case WalletProvider.COINBASE_WALLET:
+      return 'Coinbase Wallet';
+    case WalletProvider.GNOSIS_SAFE:
+      return 'Gnosis Safe';
+    case WalletProvider.LEDGER:
+      return 'Ledger';
+    case WalletProvider.TREZOR:
+      return 'Trezor';
+    default:
+      return 'Unknown';
+  }
+}
+
+export function getTransactionStatusName(status: TransactionStatus): string {
+  switch (status) {
+    case TransactionStatus.Pending:
+      return 'Pending';
+    case TransactionStatus.Approved:
+      return 'Approved';
+    case TransactionStatus.Executed:
+      return 'Executed';
+    case TransactionStatus.Cancelled:
+      return 'Cancelled';
+    case TransactionStatus.Expired:
+      return 'Expired';
+    default:
+      return 'Unknown';
+  }
+}

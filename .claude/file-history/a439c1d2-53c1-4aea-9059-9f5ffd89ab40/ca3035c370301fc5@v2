@@ -1,0 +1,313 @@
+/**
+ * Complete Deployment Script for Bancafi Credit Platform
+ * Deploys all contracts in the correct order with proper configuration
+ */
+
+import { ethers, upgrades } from 'hardhat';
+import { writeFileSync, mkdirSync, existsSync } from 'fs';
+import { join } from 'path';
+
+interface DeploymentAddresses {
+  // Core contracts
+  bancafiLending: string;
+  collateralManager: string;
+  creditScore: string;
+
+  // Advanced features
+  debtCollection: string;
+  privateCreditLine: string;
+  institutionalOnboarding: string;
+  bancafiBlockMarket: string;
+  portfolioManager: string;
+
+  // Infrastructure
+  priceOracle: string;
+  insurance: string;
+  compliance: string;
+  multiAssetCollateral: string;
+  walletIntegration: string;
+
+  // Metadata
+  deployer: string;
+  network: string;
+  chainId: number;
+  timestamp: number;
+}
+
+async function main() {
+  console.log('🚀 Starting Bancafi Credit Platform Deployment...\n');
+
+  const [deployer] = await ethers.getSigners();
+  const network = await ethers.provider.getNetwork();
+
+  console.log('Deployer address:', deployer.address);
+  console.log('Network:', network.name);
+  console.log('Chain ID:', network.chainId);
+  console.log('Balance:', ethers.utils.formatEther(await deployer.getBalance()), 'ETH\n');
+
+  const addresses: Partial<DeploymentAddresses> = {
+    deployer: deployer.address,
+    network: network.name,
+    chainId: network.chainId,
+    timestamp: Date.now(),
+  };
+
+  // ============ Deploy Price Oracle ============
+  console.log('📊 Deploying BancafiPriceOracle...');
+  const PriceOracle = await ethers.getContractFactory('BancafiPriceOracle');
+  const priceOracle = await upgrades.deployProxy(
+    PriceOracle,
+    [],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await priceOracle.deployed();
+  addresses.priceOracle = priceOracle.address;
+  console.log('✅ Price Oracle deployed at:', priceOracle.address, '\n');
+
+  // Configure common price feeds (example for Ethereum mainnet)
+  if (network.chainId === 1) {
+    console.log('Configuring Chainlink price feeds for Ethereum mainnet...');
+
+    // ETH/USD
+    await priceOracle.addAsset(
+      '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
+      '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419', // ETH/USD feed
+      3600, // 1 hour heartbeat
+      ethers.utils.parseEther('500'), // Min price $500
+      ethers.utils.parseEther('10000') // Max price $10,000
+    );
+
+    console.log('Price feeds configured ✅\n');
+  }
+
+  // ============ Deploy Compliance System ============
+  console.log('🔐 Deploying BancafiCompliance...');
+  const Compliance = await ethers.getContractFactory('BancafiCompliance');
+  const compliance = await upgrades.deployProxy(
+    Compliance,
+    [],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await compliance.deployed();
+  addresses.compliance = compliance.address;
+  console.log('✅ Compliance deployed at:', compliance.address, '\n');
+
+  // Configure KYC expiry (365 days)
+  await compliance.setKycExpiryDuration(365 * 24 * 3600);
+  console.log('KYC expiry set to 365 days ✅\n');
+
+  // ============ Deploy Credit Score ============
+  console.log('💯 Deploying CreditScore...');
+  const CreditScore = await ethers.getContractFactory('CreditScore');
+  const creditScore = await upgrades.deployProxy(
+    CreditScore,
+    [],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await creditScore.deployed();
+  addresses.creditScore = creditScore.address;
+  console.log('✅ Credit Score deployed at:', creditScore.address, '\n');
+
+  // ============ Deploy Collateral Manager ============
+  console.log('🔒 Deploying CollateralManager...');
+  const CollateralManager = await ethers.getContractFactory('CollateralManager');
+  const collateralManager = await upgrades.deployProxy(
+    CollateralManager,
+    [],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await collateralManager.deployed();
+  addresses.collateralManager = collateralManager.address;
+  console.log('✅ Collateral Manager deployed at:', collateralManager.address, '\n');
+
+  // ============ Deploy Multi-Asset Collateral Manager ============
+  console.log('🎯 Deploying MultiAssetCollateralManager...');
+  const MultiAssetCollateral = await ethers.getContractFactory('MultiAssetCollateralManager');
+  const multiAssetCollateral = await upgrades.deployProxy(
+    MultiAssetCollateral,
+    [priceOracle.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await multiAssetCollateral.deployed();
+  addresses.multiAssetCollateral = multiAssetCollateral.address;
+  console.log('✅ Multi-Asset Collateral Manager deployed at:', multiAssetCollateral.address, '\n');
+
+  // ============ Deploy Bancafi Lending ============
+  console.log('💰 Deploying BancafiLending...');
+  const BancafiLending = await ethers.getContractFactory('BancafiLending');
+  const bancafiLending = await upgrades.deployProxy(
+    BancafiLending,
+    [creditScore.address, collateralManager.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await bancafiLending.deployed();
+  addresses.bancafiLending = bancafiLending.address;
+  console.log('✅ Bancafi Lending deployed at:', bancafiLending.address, '\n');
+
+  // Authorize Bancafi Lending to use Credit Score and Collateral Manager
+  await creditScore.setAuthorizedCaller(bancafiLending.address, true);
+  await collateralManager.setAuthorizedCaller(bancafiLending.address, true);
+  console.log('Authorizations configured ✅\n');
+
+  // ============ Deploy Debt Collection ============
+  console.log('📋 Deploying DebtCollection...');
+  const DebtCollection = await ethers.getContractFactory('DebtCollection');
+  const debtCollection = await upgrades.deployProxy(
+    DebtCollection,
+    [bancafiLending.address, creditScore.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await debtCollection.deployed();
+  addresses.debtCollection = debtCollection.address;
+  console.log('✅ Debt Collection deployed at:', debtCollection.address, '\n');
+
+  // ============ Deploy Private Credit Line ============
+  console.log('💳 Deploying BancafiPrivateCreditLine...');
+  const PrivateCreditLine = await ethers.getContractFactory('BancafiPrivateCreditLine');
+  const privateCreditLine = await upgrades.deployProxy(
+    PrivateCreditLine,
+    [creditScore.address, collateralManager.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await privateCreditLine.deployed();
+  addresses.privateCreditLine = privateCreditLine.address;
+  console.log('✅ Private Credit Line deployed at:', privateCreditLine.address, '\n');
+
+  // Authorize Private Credit Line
+  await creditScore.setAuthorizedCaller(privateCreditLine.address, true);
+  await collateralManager.setAuthorizedCaller(privateCreditLine.address, true);
+  console.log('Private Credit Line authorized ✅\n');
+
+  // ============ Deploy Institutional Onboarding ============
+  console.log('🏦 Deploying InstitutionalOnboarding...');
+  const InstitutionalOnboarding = await ethers.getContractFactory('InstitutionalOnboarding');
+  const institutionalOnboarding = await upgrades.deployProxy(
+    InstitutionalOnboarding,
+    [compliance.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await institutionalOnboarding.deployed();
+  addresses.institutionalOnboarding = institutionalOnboarding.address;
+  console.log('✅ Institutional Onboarding deployed at:', institutionalOnboarding.address, '\n');
+
+  // ============ Deploy Bancafi Block Market ============
+  console.log('🏪 Deploying BancafiBlockMarket...');
+  const BancafiBlockMarket = await ethers.getContractFactory('BancafiBlockMarket');
+  const bancafiBlockMarket = await upgrades.deployProxy(
+    BancafiBlockMarket,
+    [debtCollection.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await bancafiBlockMarket.deployed();
+  addresses.bancafiBlockMarket = bancafiBlockMarket.address;
+  console.log('✅ Bancafi Block Market deployed at:', bancafiBlockMarket.address, '\n');
+
+  // ============ Deploy Portfolio Manager ============
+  console.log('📊 Deploying BancafiPortfolioManager...');
+  const PortfolioManager = await ethers.getContractFactory('BancafiPortfolioManager');
+  const portfolioManager = await upgrades.deployProxy(
+    PortfolioManager,
+    [debtCollection.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await portfolioManager.deployed();
+  addresses.portfolioManager = portfolioManager.address;
+  console.log('✅ Portfolio Manager deployed at:', portfolioManager.address, '\n');
+
+  // ============ Deploy Insurance Pool ============
+  console.log('🛡️ Deploying BancafiInsurance...');
+  const Insurance = await ethers.getContractFactory('BancafiInsurance');
+  const insurance = await upgrades.deployProxy(
+    Insurance,
+    [priceOracle.address],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await insurance.deployed();
+  addresses.insurance = insurance.address;
+  console.log('✅ Insurance Pool deployed at:', insurance.address, '\n');
+
+  // ============ Deploy Wallet Integration ============
+  console.log('👛 Deploying BancafiWalletIntegration...');
+  const WalletIntegration = await ethers.getContractFactory('BancafiWalletIntegration');
+  const walletIntegration = await upgrades.deployProxy(
+    WalletIntegration,
+    [],
+    { initializer: 'initialize', kind: 'uups' }
+  );
+  await walletIntegration.deployed();
+  addresses.walletIntegration = walletIntegration.address;
+  console.log('✅ Wallet Integration deployed at:', walletIntegration.address, '\n');
+
+  // ============ Post-Deployment Configuration ============
+  console.log('⚙️  Post-deployment configuration...\n');
+
+  // Set platform fee (0.5%)
+  await bancafiLending.setPlatformFee(50); // 50 basis points
+  console.log('Platform fee set to 0.5% ✅');
+
+  // Set minimum loan duration (7 days)
+  await bancafiLending.setMinLoanDuration(7 * 24 * 3600);
+  console.log('Min loan duration set to 7 days ✅');
+
+  // Set max loan duration (365 days)
+  await bancafiLending.setMaxLoanDuration(365 * 24 * 3600);
+  console.log('Max loan duration set to 365 days ✅');
+
+  // Configure insurance pool minimum coverage (20%)
+  await insurance.setMinimumCoverageRatio(2000); // 20%
+  console.log('Min insurance coverage set to 20% ✅');
+
+  // Grant roles
+  const DEBT_COLLECTOR_ROLE = ethers.utils.id('DEBT_COLLECTOR_ROLE');
+  await debtCollection.grantRole(DEBT_COLLECTOR_ROLE, bancafiLending.address);
+  console.log('Debt Collector role granted to Lending contract ✅\n');
+
+  // ============ Save Deployment Addresses ============
+  const deploymentDir = join(__dirname, '../deployments');
+  if (!existsSync(deploymentDir)) {
+    mkdirSync(deploymentDir, { recursive: true });
+  }
+
+  const filename = `${network.name}-${network.chainId}-${Date.now()}.json`;
+  const filepath = join(deploymentDir, filename);
+
+  writeFileSync(filepath, JSON.stringify(addresses, null, 2));
+  console.log('📝 Deployment addresses saved to:', filepath, '\n');
+
+  // Also save as latest
+  const latestFilepath = join(deploymentDir, `${network.name}-latest.json`);
+  writeFileSync(latestFilepath, JSON.stringify(addresses, null, 2));
+  console.log('📝 Latest deployment saved to:', latestFilepath, '\n');
+
+  // ============ Deployment Summary ============
+  console.log('========================================');
+  console.log('🎉 DEPLOYMENT COMPLETE!');
+  console.log('========================================\n');
+
+  console.log('Contract Addresses:');
+  console.log('-------------------');
+  Object.entries(addresses).forEach(([name, address]) => {
+    if (name !== 'deployer' && name !== 'network' && name !== 'chainId' && name !== 'timestamp') {
+      console.log(`${name}: ${address}`);
+    }
+  });
+
+  console.log('\n========================================');
+  console.log('Next Steps:');
+  console.log('-------------------');
+  console.log('1. Verify contracts on block explorer');
+  console.log('2. Update frontend environment variables');
+  console.log('3. Configure price feeds for your assets');
+  console.log('4. Add initial KYC verifiers');
+  console.log('5. Test all integrations');
+  console.log('========================================\n');
+
+  return addresses;
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

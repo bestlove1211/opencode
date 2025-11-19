@@ -1,0 +1,389 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title BancafiAnalytics
+ * @notice On-chain analytics and reporting for the Bancafi ecosystem
+ * @dev Aggregates metrics across all contracts
+ */
+contract BancafiAnalytics is
+    Initializable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant REPORTER_ROLE = keccak256("REPORTER_ROLE");
+
+    // Contract addresses
+    address public assetToken;
+    address public bailout;
+    address public staking;
+    address public marketplace;
+    address public liquidityPool;
+    address public insurance;
+    address public treasury;
+    address public oracle;
+
+    // System-wide metrics
+    struct SystemMetrics {
+        uint256 totalValueLocked;      // Total TVL across all contracts
+        uint256 totalAssets;            // Total tokenized assets
+        uint256 totalFractionalizedAssets;
+        uint256 totalActiveBailouts;
+        uint256 totalStakers;
+        uint256 totalMarketplaceVolume;
+        uint256 totalInsurancePremiums;
+        uint256 lastUpdated;
+    }
+
+    struct DailyMetrics {
+        uint256 date;                   // Unix timestamp (day granularity)
+        uint256 newAssets;
+        uint256 bailoutsRequested;
+        uint256 bailoutsDisbursed;
+        uint256 marketplaceVolume;
+        uint256 liquidityAdded;
+        uint256 stakingRewards;
+        uint256 insuranceClaims;
+    }
+
+    SystemMetrics public currentMetrics;
+    mapping(uint256 => DailyMetrics) public dailyMetrics; // date => metrics
+
+    // Top performers tracking
+    struct TopAsset {
+        uint256 tokenId;
+        uint256 value;
+        uint256 rank;
+    }
+
+    uint256[] public topAssetsByValue;      // Top 10 by valuation
+    uint256[] public topAssetsByTrading;    // Top 10 by trading volume
+
+    // Events
+    event MetricsUpdated(uint256 timestamp);
+    event DailyMetricsRecorded(uint256 date, uint256 timestamp);
+    event ContractAddressesUpdated(uint256 timestamp);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(REPORTER_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Set contract addresses
+     */
+    function setContractAddresses(
+        address assetToken_,
+        address bailout_,
+        address staking_,
+        address marketplace_,
+        address liquidityPool_,
+        address insurance_,
+        address treasury_,
+        address oracle_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        assetToken = assetToken_;
+        bailout = bailout_;
+        staking = staking_;
+        marketplace = marketplace_;
+        liquidityPool = liquidityPool_;
+        insurance = insurance_;
+        treasury = treasury_;
+        oracle = oracle_;
+
+        emit ContractAddressesUpdated(block.timestamp);
+    }
+
+    /**
+     * @notice Update system-wide metrics
+     */
+    function updateSystemMetrics(
+        uint256 totalValueLocked_,
+        uint256 totalAssets_,
+        uint256 totalFractionalizedAssets_,
+        uint256 totalActiveBailouts_,
+        uint256 totalStakers_,
+        uint256 totalMarketplaceVolume_,
+        uint256 totalInsurancePremiums_
+    ) external onlyRole(REPORTER_ROLE) {
+        currentMetrics = SystemMetrics({
+            totalValueLocked: totalValueLocked_,
+            totalAssets: totalAssets_,
+            totalFractionalizedAssets: totalFractionalizedAssets_,
+            totalActiveBailouts: totalActiveBailouts_,
+            totalStakers: totalStakers_,
+            totalMarketplaceVolume: totalMarketplaceVolume_,
+            totalInsurancePremiums: totalInsurancePremiums_,
+            lastUpdated: block.timestamp
+        });
+
+        emit MetricsUpdated(block.timestamp);
+    }
+
+    /**
+     * @notice Record daily metrics
+     */
+    function recordDailyMetrics(
+        uint256 date_,
+        uint256 newAssets_,
+        uint256 bailoutsRequested_,
+        uint256 bailoutsDisbursed_,
+        uint256 marketplaceVolume_,
+        uint256 liquidityAdded_,
+        uint256 stakingRewards_,
+        uint256 insuranceClaims_
+    ) external onlyRole(REPORTER_ROLE) {
+        dailyMetrics[date_] = DailyMetrics({
+            date: date_,
+            newAssets: newAssets_,
+            bailoutsRequested: bailoutsRequested_,
+            bailoutsDisbursed: bailoutsDisbursed_,
+            marketplaceVolume: marketplaceVolume_,
+            liquidityAdded: liquidityAdded_,
+            stakingRewards: stakingRewards_,
+            insuranceClaims: insuranceClaims_
+        });
+
+        emit DailyMetricsRecorded(date_, block.timestamp);
+    }
+
+    /**
+     * @notice Get metrics for date range
+     */
+    function getMetricsRange(
+        uint256 startDate_,
+        uint256 endDate_
+    ) external view returns (DailyMetrics[] memory) {
+        require(endDate_ >= startDate_, "Invalid range");
+
+        uint256 numDays = ((endDate_ - startDate_) / 1 days) + 1;
+        require(numDays <= 365, "Range too large");
+
+        DailyMetrics[] memory metrics = new DailyMetrics[](numDays);
+
+        for (uint256 i = 0; i < numDays; i++) {
+            uint256 date = startDate_ + (i * 1 days);
+            metrics[i] = dailyMetrics[date];
+        }
+
+        return metrics;
+    }
+
+    /**
+     * @notice Calculate TVL across all contracts
+     */
+    function calculateTotalValueLocked() external view returns (uint256) {
+        uint256 tvl = 0;
+
+        // Add staking TVL
+        if (staking != address(0)) {
+            try IStaking(staking).pool() returns (
+                uint256 totalStaked,
+                uint256,
+                uint256,
+                uint256,
+                uint256,
+                uint256
+            ) {
+                tvl += totalStaked;
+            } catch {}
+        }
+
+        // Add liquidity pool TVL
+        // (Would need to iterate through all pools)
+
+        // Add bailout treasury (use public variable)
+        if (bailout != address(0)) {
+            try IBailout(bailout).treasuryBalance() returns (uint256 balance) {
+                tvl += balance;
+            } catch {}
+        }
+
+        // Add treasury balance
+        if (treasury != address(0)) {
+            try ITreasury(treasury).getTreasuryStats() returns (
+                uint256,
+                uint256,
+                uint256,
+                uint256,
+                uint256 currentETHBalance
+            ) {
+                tvl += currentETHBalance;
+            } catch {}
+        }
+
+        // Add insurance pool
+        if (insurance != address(0)) {
+            try IInsurance(insurance).poolStats() returns (
+                uint256,
+                uint256,
+                uint256,
+                uint256 activeBalance
+            ) {
+                tvl += activeBalance;
+            } catch {}
+        }
+
+        return tvl;
+    }
+
+    /**
+     * @notice Get comprehensive system snapshot
+     */
+    function getSystemSnapshot() external view returns (
+        uint256 totalValueLocked,
+        uint256 totalAssets,
+        uint256 totalStakers,
+        uint256 totalMarketplaceVolume,
+        uint256 dailyVolume,
+        uint256 lastUpdated
+    ) {
+        totalValueLocked = currentMetrics.totalValueLocked;
+        totalAssets = currentMetrics.totalAssets;
+        totalStakers = currentMetrics.totalStakers;
+        totalMarketplaceVolume = currentMetrics.totalMarketplaceVolume;
+        lastUpdated = currentMetrics.lastUpdated;
+
+        // Get today's volume
+        uint256 today = (block.timestamp / 1 days) * 1 days;
+        dailyVolume = dailyMetrics[today].marketplaceVolume;
+    }
+
+    /**
+     * @notice Get growth metrics (comparing periods)
+     */
+    function getGrowthMetrics(
+        uint256 periodStart_,
+        uint256 periodEnd_
+    ) external view returns (
+        int256 assetGrowth,
+        int256 volumeGrowth,
+        int256 stakersGrowth
+    ) {
+        DailyMetrics memory startMetrics = dailyMetrics[periodStart_];
+        DailyMetrics memory endMetrics = dailyMetrics[periodEnd_];
+
+        // Calculate percentage growth
+        if (startMetrics.newAssets > 0) {
+            assetGrowth = int256((endMetrics.newAssets * 10000) / startMetrics.newAssets) - 10000;
+        }
+
+        if (startMetrics.marketplaceVolume > 0) {
+            volumeGrowth = int256((endMetrics.marketplaceVolume * 10000) / startMetrics.marketplaceVolume) - 10000;
+        }
+
+        // Note: Daily stakers metric would need to be added to DailyMetrics
+    }
+
+    /**
+     * @notice Health score calculation (0-100)
+     */
+    function calculateHealthScore() external view returns (uint256) {
+        uint256 score = 0;
+
+        // TVL component (30 points)
+        if (currentMetrics.totalValueLocked >= 10000 ether) {
+            score += 30;
+        } else if (currentMetrics.totalValueLocked >= 1000 ether) {
+            score += 20;
+        } else if (currentMetrics.totalValueLocked >= 100 ether) {
+            score += 10;
+        }
+
+        // Active assets component (25 points)
+        if (currentMetrics.totalAssets >= 100) {
+            score += 25;
+        } else if (currentMetrics.totalAssets >= 50) {
+            score += 15;
+        } else if (currentMetrics.totalAssets >= 10) {
+            score += 10;
+        }
+
+        // Bailout health (20 points) - lower is better
+        uint256 bailoutRatio = 0;
+        if (currentMetrics.totalAssets > 0) {
+            bailoutRatio = (currentMetrics.totalActiveBailouts * 100) / currentMetrics.totalAssets;
+        }
+
+        if (bailoutRatio < 5) {
+            score += 20;
+        } else if (bailoutRatio < 10) {
+            score += 10;
+        }
+
+        // Trading activity (15 points)
+        if (currentMetrics.totalMarketplaceVolume >= 100000 ether) {
+            score += 15;
+        } else if (currentMetrics.totalMarketplaceVolume >= 10000 ether) {
+            score += 10;
+        } else if (currentMetrics.totalMarketplaceVolume >= 1000 ether) {
+            score += 5;
+        }
+
+        // Staking participation (10 points)
+        if (currentMetrics.totalStakers >= 1000) {
+            score += 10;
+        } else if (currentMetrics.totalStakers >= 100) {
+            score += 5;
+        }
+
+        return score;
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// Interfaces for external contracts
+interface IStaking {
+    function pool() external view returns (
+        uint256 totalStaked,
+        uint256 totalVotingPower,
+        uint256 rewardsPerSecond,
+        uint256 accRewardPerShare,
+        uint256 lastRewardTime,
+        uint256 totalRewardsDistributed
+    );
+}
+
+interface IBailout {
+    function treasuryBalance() external view returns (uint256);
+    function totalDisbursed() external view returns (uint256);
+    function totalRepaid() external view returns (uint256);
+}
+
+interface ITreasury {
+    function getTreasuryStats() external view returns (
+        uint256 totalETHReceived,
+        uint256 totalETHSpent,
+        uint256 totalProposals,
+        uint256 executedProposals,
+        uint256 currentETHBalance
+    );
+}
+
+interface IInsurance {
+    function poolStats() external view returns (
+        uint256 totalPremiums,
+        uint256 totalClaims,
+        uint256 totalPayouts,
+        uint256 activeBalance
+    );
+}

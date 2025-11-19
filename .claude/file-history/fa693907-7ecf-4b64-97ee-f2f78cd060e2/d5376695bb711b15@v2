@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title IBancafiBlockMarket
+ * @notice Interface for Bancafi Block Market (BBM) - Debt trading marketplace
+ */
+interface IBancafiBlockMarket {
+    // Events
+    event DebtListed(uint256 indexed listingId, uint256 indexed collectionId, address indexed seller, uint256 price);
+    event DebtSold(uint256 indexed listingId, address indexed seller, address indexed buyer, uint256 price);
+    event ListingCancelled(uint256 indexed listingId, address indexed seller);
+    event ListingUpdated(uint256 indexed listingId, uint256 oldPrice, uint256 newPrice);
+    event MarketFeeUpdated(uint256 oldFee, uint256 newFee);
+
+    /**
+     * @notice List debt for sale on BBM
+     * @param collectionId Collection ID from debt collection
+     * @param price Asking price
+     * @return listingId Unique listing identifier
+     */
+    function listDebt(uint256 collectionId, uint256 price) external returns (uint256 listingId);
+
+    /**
+     * @notice Buy listed debt
+     * @param listingId Listing ID
+     */
+    function buyDebt(uint256 listingId) external payable;
+
+    /**
+     * @notice Cancel debt listing
+     * @param listingId Listing ID
+     */
+    function cancelListing(uint256 listingId) external;
+
+    /**
+     * @notice Update listing price
+     * @param listingId Listing ID
+     * @param newPrice New asking price
+     */
+    function updateListingPrice(uint256 listingId, uint256 newPrice) external;
+
+    /**
+     * @notice Get listing details
+     * @param listingId Listing ID
+     * @return collectionId Collection ID
+     * @return seller Seller address
+     * @return price Listing price
+     * @return isActive Whether listing is active
+     * @return listedAt Listing timestamp
+     */
+    function getListingDetails(uint256 listingId) external view returns (
+        uint256 collectionId,
+        address seller,
+        uint256 price,
+        bool isActive,
+        uint256 listedAt
+    );
+
+    /**
+     * @notice Get all active listings
+     * @return Array of listing IDs
+     */
+    function getActiveListings() external view returns (uint256[] memory);
+
+    /**
+     * @notice Get user's listings
+     * @param user User address
+     * @return Array of listing IDs
+     */
+    function getUserListings(address user) external view returns (uint256[] memory);
+}

@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/governance/GovernorUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorSettingsUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorCountingSimpleUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorVotesUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorVotesQuorumFractionUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorTimelockControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+/**
+ * @title BancafiDAO
+ * @notice Decentralized Autonomous Organization for Bancafi governance
+ * @dev Full-featured DAO with timelock, voting, and proposal management
+ */
+contract BancafiDAO is
+    GovernorUpgradeable,
+    GovernorSettingsUpgradeable,
+    GovernorCountingSimpleUpgradeable,
+    GovernorVotesUpgradeable,
+    GovernorVotesQuorumFractionUpgradeable,
+    GovernorTimelockControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
+
+    // Proposal metadata
+    struct ProposalMetadata {
+        uint256 proposalId;
+        address proposer;
+        string title;
+        string description;
+        uint256 createdAt;
+        uint256 executedAt;
+        bool isBailoutProposal;
+    }
+
+    mapping(uint256 => ProposalMetadata) public proposalMetadata;
+    mapping(uint256 => bool) public proposalExecuted;
+
+    // Events
+    event ProposalCreatedWithMetadata(
+        uint256 indexed proposalId,
+        address indexed proposer,
+        string title,
+        uint256 timestamp
+    );
+
+    event ProposalExecutedWithTimestamp(
+        uint256 indexed proposalId,
+        uint256 timestamp
+    );
+
+    event ProposalCanceledWithTimestamp(
+        uint256 indexed proposalId,
+        uint256 timestamp
+    );
+
+    event VoteCastWithTimestamp(
+        address indexed voter,
+        uint256 indexed proposalId,
+        uint8 support,
+        uint256 weight,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the DAO
+     * @param token_ Governance token address
+     * @param timelock_ Timelock controller address
+     * @param votingDelay_ Delay before voting starts (in blocks)
+     * @param votingPeriod_ Voting duration (in blocks)
+     * @param proposalThreshold_ Minimum tokens required to propose
+     * @param quorumPercentage_ Quorum as percentage (e.g., 4 = 4%)
+     */
+    function initialize(
+        IVotesUpgradeable token_,
+        TimelockControllerUpgradeable timelock_,
+        uint256 votingDelay_,
+        uint256 votingPeriod_,
+        uint256 proposalThreshold_,
+        uint256 quorumPercentage_
+    ) public initializer {
+        __Governor_init("BancafiDAO");
+        __GovernorSettings_init(votingDelay_, votingPeriod_, proposalThreshold_);
+        __GovernorCountingSimple_init();
+        __GovernorVotes_init(token_);
+        __GovernorVotesQuorumFraction_init(quorumPercentage_);
+        __GovernorTimelockControl_init(timelock_);
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(PROPOSER_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Create proposal with metadata
+     * @param targets_ Target addresses
+     * @param values_ ETH values
+     * @param calldatas_ Function call data
+     * @param description_ Proposal description
+     * @param title_ Proposal title
+     * @param isBailoutProposal_ Whether this is a bailout proposal
+     */
+    function proposeWithMetadata(
+        address[] memory targets_,
+        uint256[] memory values_,
+        bytes[] memory calldatas_,
+        string memory description_,
+        string memory title_,
+        bool isBailoutProposal_
+    ) public whenNotPaused returns (uint256) {
+        require(hasRole(PROPOSER_ROLE, msg.sender) ||
+                getVotes(msg.sender, block.number - 1) >= proposalThreshold(),
+                "Insufficient voting power");
+
+        uint256 proposalId = propose(targets_, values_, calldatas_, description_);
+
+        proposalMetadata[proposalId] = ProposalMetadata({
+            proposalId: proposalId,
+            proposer: msg.sender,
+            title: title_,
+            description: description_,
+            createdAt: block.timestamp,
+            executedAt: 0,
+            isBailoutProposal: isBailoutProposal_
+        });
+
+        emit ProposalCreatedWithMetadata(proposalId, msg.sender, title_, block.timestamp);
+
+        return proposalId;
+    }
+
+    /**
+     * @notice Cast vote with timestamp tracking
+     * @param proposalId Proposal ID
+     * @param support Vote type (0=Against, 1=For, 2=Abstain)
+     */
+    function castVoteWithTimestamp(
+        uint256 proposalId,
+        uint8 support
+    ) public whenNotPaused returns (uint256) {
+        uint256 weight = castVote(proposalId, support);
+
+        emit VoteCastWithTimestamp(msg.sender, proposalId, support, weight, block.timestamp);
+
+        return weight;
+    }
+
+    /**
+     * @notice Execute proposal with timestamp
+     * @param targets_ Target addresses
+     * @param values_ ETH values
+     * @param calldatas_ Function call data
+     * @param descriptionHash_ Hashed description
+     */
+    function executeWithTimestamp(
+        address[] memory targets_,
+        uint256[] memory values_,
+        bytes[] memory calldatas_,
+        bytes32 descriptionHash_
+    ) public payable whenNotPaused nonReentrant returns (uint256) {
+        uint256 proposalId = execute(targets_, values_, calldatas_, descriptionHash_);
+
+        proposalExecuted[proposalId] = true;
+        proposalMetadata[proposalId].executedAt = block.timestamp;
+
+        emit ProposalExecutedWithTimestamp(proposalId, block.timestamp);
+
+        return proposalId;
+    }
+
+    /**
+     * @notice Cancel proposal with timestamp
+     * @param targets_ Target addresses
+     * @param values_ ETH values
+     * @param calldatas_ Function call data
+     * @param descriptionHash_ Hashed description
+     */
+    function cancelWithTimestamp(
+        address[] memory targets_,
+        uint256[] memory values_,
+        bytes[] memory calldatas_,
+        bytes32 descriptionHash_
+    ) public returns (uint256) {
+        uint256 proposalId = cancel(targets_, values_, calldatas_, descriptionHash_);
+
+        emit ProposalCanceledWithTimestamp(proposalId, block.timestamp);
+
+        return proposalId;
+    }
+
+    /**
+     * @notice Pause the DAO
+     */
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the DAO
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    // Required overrides
+
+    function votingDelay()
+        public
+        view
+        override(GovernorUpgradeable, GovernorSettingsUpgradeable)
+        returns (uint256)
+    {
+        return super.votingDelay();
+    }
+
+    function votingPeriod()
+        public
+        view
+        override(GovernorUpgradeable, GovernorSettingsUpgradeable)
+        returns (uint256)
+    {
+        return super.votingPeriod();
+    }
+
+    function quorum(uint256 blockNumber)
+        public
+        view
+        override(GovernorUpgradeable, GovernorVotesQuorumFractionUpgradeable)
+        returns (uint256)
+    {
+        return super.quorum(blockNumber);
+    }
+
+    function state(uint256 proposalId)
+        public
+        view
+        override(GovernorUpgradeable, GovernorTimelockControlUpgradeable)
+        returns (ProposalState)
+    {
+        return super.state(proposalId);
+    }
+
+    function proposalNeedsQueuing(uint256 proposalId)
+        public
+        view
+        override(GovernorUpgradeable, GovernorTimelockControlUpgradeable)
+        returns (bool)
+    {
+        return super.proposalNeedsQueuing(proposalId);
+    }
+
+    function proposalThreshold()
+        public
+        view
+        override(GovernorUpgradeable, GovernorSettingsUpgradeable)
+        returns (uint256)
+    {
+        return super.proposalThreshold();
+    }
+
+    function _queueOperations(
+        uint256 proposalId,
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (uint48) {
+        return super._queueOperations(proposalId, targets, values, calldatas, descriptionHash);
+    }
+
+    function _executeOperations(
+        uint256 proposalId,
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) {
+        super._executeOperations(proposalId, targets, values, calldatas, descriptionHash);
+    }
+
+    function _cancel(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal override(GovernorUpgradeable, GovernorTimelockControlUpgradeable) returns (uint256) {
+        return super._cancel(targets, values, calldatas, descriptionHash);
+    }
+
+    function _executor()
+        internal
+        view
+        override(GovernorUpgradeable, GovernorTimelockControlUpgradeable)
+        returns (address)
+    {
+        return super._executor();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(GovernorUpgradeable, GovernorTimelockControlUpgradeable, AccessControlUpgradeable)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}

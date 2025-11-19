@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title BancafiInsurance
+ * @notice Insurance pool for protecting investors against asset defaults
+ * @dev Covers bailout defaults, asset devaluation, and fraud protection
+ */
+contract BancafiInsurance is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant CLAIMS_MANAGER_ROLE = keccak256("CLAIMS_MANAGER_ROLE");
+
+    enum ClaimType {
+        BailoutDefault,
+        AssetDevaluation,
+        Fraud,
+        Other
+    }
+
+    enum ClaimStatus {
+        Submitted,
+        Approved,
+        Rejected,
+        Paid
+    }
+
+    struct Policy {
+        uint256 policyId;
+        address holder;
+        uint256 tokenId;
+        uint256 coverageAmount;
+        uint256 premium;
+        uint256 startDate;
+        uint256 endDate;
+        bool active;
+    }
+
+    struct Claim {
+        uint256 claimId;
+        uint256 policyId;
+        address claimant;
+        ClaimType claimType;
+        ClaimStatus status;
+        uint256 claimAmount;
+        uint256 approvedAmount;
+        uint256 submittedAt;
+    }
+
+    struct PoolStats {
+        uint256 totalPremiums;
+        uint256 totalClaims;
+        uint256 totalPayouts;
+        uint256 activeBalance;
+    }
+
+    uint256 private _policyIds;
+    uint256 private _claimIds;
+
+    mapping(uint256 => Policy) public policies;
+    mapping(uint256 => Claim) public claims;
+    mapping(address => uint256[]) public userPolicies;
+
+    PoolStats public poolStats;
+    uint256 public premiumRate; // 5% annually
+    uint256 public maxCoveragePerAsset;
+
+    event PolicyCreated(uint256 indexed policyId, address indexed holder, uint256 coverageAmount, uint256 timestamp);
+    event ClaimSubmitted(uint256 indexed claimId, uint256 indexed policyId, uint256 amount, uint256 timestamp);
+    event ClaimProcessed(uint256 indexed claimId, ClaimStatus status, uint256 approvedAmount, uint256 timestamp);
+    event ClaimPaid(uint256 indexed claimId, address indexed beneficiary, uint256 amount, uint256 timestamp);
+    event PoolContribution(address indexed contributor, uint256 amount, uint256 timestamp);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(CLAIMS_MANAGER_ROLE, msg.sender);
+
+        // Set default values
+        premiumRate = 500; // 5% annually
+        maxCoveragePerAsset = 100000 ether;
+    }
+
+    function createPolicy(
+        uint256 tokenId_,
+        uint256 coverageAmount_,
+        uint256 duration_
+    ) external payable whenNotPaused nonReentrant returns (uint256) {
+        require(coverageAmount_ > 0 && coverageAmount_ <= maxCoveragePerAsset, "Invalid coverage");
+        require(duration_ >= 30 days, "Minimum 30 days");
+
+        uint256 annualPremium = (coverageAmount_ * premiumRate) / 10000;
+        uint256 premium = (annualPremium * duration_) / 365 days;
+        require(msg.value >= premium, "Insufficient premium");
+
+        _policyIds++;
+        policies[_policyIds] = Policy({
+            policyId: _policyIds,
+            holder: msg.sender,
+            tokenId: tokenId_,
+            coverageAmount: coverageAmount_,
+            premium: premium,
+            startDate: block.timestamp,
+            endDate: block.timestamp + duration_,
+            active: true
+        });
+
+        userPolicies[msg.sender].push(_policyIds);
+        poolStats.totalPremiums += premium;
+        poolStats.activeBalance += premium;
+
+        if (msg.value > premium) {
+            payable(msg.sender).transfer(msg.value - premium);
+        }
+
+        emit PolicyCreated(_policyIds, msg.sender, coverageAmount_, block.timestamp);
+        return _policyIds;
+    }
+
+    function submitClaim(
+        uint256 policyId_,
+        ClaimType claimType_,
+        uint256 claimAmount_
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        Policy storage policy = policies[policyId_];
+        require(policy.holder == msg.sender, "Not policy holder");
+        require(policy.active && block.timestamp <= policy.endDate, "Policy not active");
+        require(claimAmount_ <= policy.coverageAmount, "Exceeds coverage");
+
+        _claimIds++;
+        claims[_claimIds] = Claim({
+            claimId: _claimIds,
+            policyId: policyId_,
+            claimant: msg.sender,
+            claimType: claimType_,
+            status: ClaimStatus.Submitted,
+            claimAmount: claimAmount_,
+            approvedAmount: 0,
+            submittedAt: block.timestamp
+        });
+
+        emit ClaimSubmitted(_claimIds, policyId_, claimAmount_, block.timestamp);
+        return _claimIds;
+    }
+
+    function processClaim(
+        uint256 claimId_,
+        bool approve_,
+        uint256 approvedAmount_
+    ) external onlyRole(CLAIMS_MANAGER_ROLE) nonReentrant {
+        Claim storage claim = claims[claimId_];
+        require(claim.status == ClaimStatus.Submitted, "Already processed");
+
+        if (approve_) {
+            require(approvedAmount_ > 0 && approvedAmount_ <= claim.claimAmount, "Invalid amount");
+            require(poolStats.activeBalance >= approvedAmount_, "Insufficient balance");
+
+            claim.status = ClaimStatus.Approved;
+            claim.approvedAmount = approvedAmount_;
+        } else {
+            claim.status = ClaimStatus.Rejected;
+        }
+
+        emit ClaimProcessed(claimId_, claim.status, approvedAmount_, block.timestamp);
+    }
+
+    function payClaim(uint256 claimId_) external onlyRole(CLAIMS_MANAGER_ROLE) nonReentrant {
+        Claim storage claim = claims[claimId_];
+        require(claim.status == ClaimStatus.Approved, "Not approved");
+
+        uint256 payout = claim.approvedAmount;
+        require(poolStats.activeBalance >= payout, "Insufficient balance");
+
+        claim.status = ClaimStatus.Paid;
+        poolStats.totalPayouts += payout;
+        poolStats.totalClaims++;
+        poolStats.activeBalance -= payout;
+
+        payable(claim.claimant).transfer(payout);
+        emit ClaimPaid(claimId_, claim.claimant, payout, block.timestamp);
+    }
+
+    function contributeToPool() external payable nonReentrant {
+        require(msg.value > 0, "Invalid amount");
+        poolStats.activeBalance += msg.value;
+        emit PoolContribution(msg.sender, msg.value, block.timestamp);
+    }
+
+    function getUserPolicies(address user_) external view returns (uint256[] memory) {
+        return userPolicies[user_];
+    }
+
+    function getPoolStats() external view returns (PoolStats memory) {
+        return poolStats;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+
+    receive() external payable {
+        poolStats.activeBalance += msg.value;
+        emit PoolContribution(msg.sender, msg.value, block.timestamp);
+    }
+}

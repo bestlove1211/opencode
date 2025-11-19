@@ -33,6 +33,11 @@ ntuser.dat*
 .redhat/
 vscode-remote-wsl/
 
+# Claude Code Credentials (DO NOT COMMIT)
+.claude/config.json
+.claude/.credentials.json
+.claude/debug/
+
 # Node
 node_modules/
 package-lock.json

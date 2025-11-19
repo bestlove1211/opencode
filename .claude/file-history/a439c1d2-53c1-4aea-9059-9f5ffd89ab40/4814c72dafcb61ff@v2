@@ -1,0 +1,112 @@
+/**
+ * Contract Upgrade Script
+ * Upgrades a UUPS proxy to a new implementation
+ */
+
+import { ethers, upgrades } from 'hardhat';
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+
+async function main() {
+  const contractName = process.env.CONTRACT_NAME;
+  const proxyAddress = process.env.PROXY_ADDRESS;
+
+  if (!contractName || !proxyAddress) {
+    console.error('❌ Missing required environment variables:');
+    console.error('CONTRACT_NAME - Name of contract to upgrade (e.g., BancafiLending)');
+    console.error('PROXY_ADDRESS - Address of proxy contract');
+    process.exit(1);
+  }
+
+  console.log('🔄 Starting contract upgrade...\n');
+  console.log('Contract:', contractName);
+  console.log('Proxy Address:', proxyAddress);
+
+  const [deployer] = await ethers.getSigners();
+  console.log('Upgrader:', deployer.address);
+  console.log('Balance:', ethers.utils.formatEther(await deployer.getBalance()), 'ETH\n');
+
+  // Get contract factory
+  console.log(`Loading ${contractName} factory...`);
+  const ContractFactory = await ethers.getContractFactory(contractName);
+
+  // Validate upgrade
+  console.log('Validating upgrade compatibility...');
+  try {
+    await upgrades.validateUpgrade(proxyAddress, ContractFactory, {
+      kind: 'uups',
+    });
+    console.log('✅ Upgrade validation passed\n');
+  } catch (error: any) {
+    console.error('❌ Upgrade validation failed:', error.message);
+    console.error('\nPossible issues:');
+    console.error('- Storage layout changed');
+    console.error('- Removed existing state variables');
+    console.error('- Changed variable types');
+    process.exit(1);
+  }
+
+  // Perform upgrade
+  console.log('Upgrading contract...');
+  try {
+    const upgraded = await upgrades.upgradeProxy(proxyAddress, ContractFactory);
+    await upgraded.deployed();
+
+    const implementationAddress = await upgrades.erc1967.getImplementationAddress(
+      proxyAddress
+    );
+
+    console.log('\n========================================');
+    console.log('✅ UPGRADE SUCCESSFUL!');
+    console.log('========================================');
+    console.log('Proxy Address:', proxyAddress);
+    console.log('New Implementation:', implementationAddress);
+    console.log('========================================\n');
+
+    // Save upgrade history
+    const network = await ethers.provider.getNetwork();
+    const upgradeHistoryPath = join(__dirname, '../deployments/upgrade-history.json');
+
+    let history: any = {};
+    try {
+      history = JSON.parse(readFileSync(upgradeHistoryPath, 'utf-8'));
+    } catch {
+      history = {};
+    }
+
+    if (!history[network.name]) {
+      history[network.name] = {};
+    }
+
+    if (!history[network.name][contractName]) {
+      history[network.name][contractName] = [];
+    }
+
+    history[network.name][contractName].push({
+      proxyAddress,
+      implementationAddress,
+      timestamp: Date.now(),
+      upgrader: deployer.address,
+      blockNumber: await ethers.provider.getBlockNumber(),
+    });
+
+    writeFileSync(upgradeHistoryPath, JSON.stringify(history, null, 2));
+    console.log('📝 Upgrade history saved\n');
+
+    console.log('Next Steps:');
+    console.log('1. Verify new implementation on block explorer');
+    console.log('2. Test upgraded contract functionality');
+    console.log('3. Monitor for any issues');
+    console.log('4. Update frontend if needed\n');
+  } catch (error: any) {
+    console.error('❌ Upgrade failed:', error.message);
+    process.exit(1);
+  }
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

@@ -1,0 +1,53 @@
+const express = require('express');
+const router = express.Router();
+const { param, query, validationResult } = require('express-validator');
+const transactionController = require('../controllers/transactionController');
+
+// Validation middleware
+const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  next();
+};
+
+/**
+ * GET /api/transactions/:walletAddress
+ * Get transaction history for a wallet address
+ */
+router.get(
+  '/:walletAddress',
+  [
+    param('walletAddress').matches(/^0x[a-fA-F0-9]{40}$/).withMessage('Invalid Ethereum address'),
+    query('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
+    query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
+    query('type').optional().isIn(['DEPOSIT', 'WITHDRAWAL', 'INTEREST_CLAIM']).withMessage('Invalid transaction type')
+  ],
+  validate,
+  transactionController.getTransactionHistory
+);
+
+/**
+ * GET /api/transactions/hash/:txHash
+ * Get transaction details by hash
+ */
+router.get(
+  '/hash/:txHash',
+  [
+    param('txHash').matches(/^0x[a-fA-F0-9]{64}$/).withMessage('Invalid transaction hash')
+  ],
+  validate,
+  transactionController.getTransactionByHash
+);
+
+/**
+ * POST /api/transactions/track
+ * Track a new transaction
+ */
+router.post(
+  '/track',
+  transactionController.trackTransaction
+);
+
+module.exports = router;

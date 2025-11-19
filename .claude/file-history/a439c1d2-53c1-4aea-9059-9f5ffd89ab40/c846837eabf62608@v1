@@ -1,0 +1,124 @@
+# Chainlink Price Feed Addresses
+
+## Ethereum Mainnet
+
+### Major Assets
+- **ETH/USD**: `0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419`
+- **BTC/USD**: `0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c`
+- **USDC/USD**: `0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6`
+- **USDT/USD**: `0x3E7d1eAB13ad0104d068337C0FcF950606b926F6`
+- **DAI/USD**: `0xAed0c38402a5d19df6E4c03F4E2DceD6e29c1ee9`
+
+### DeFi Tokens
+- **LINK/USD**: `0x2c1d072e956AFFC0D435Cb7AC38EF18d24d9127c`
+- **UNI/USD**: `0x553303d460EE0afB37EdFf9bE42922D8FF63220e`
+- **AAVE/USD**: `0x547a514d5e3769680Ce22B2361c10Ea13619e8a9`
+- **MKR/USD**: `0xec1D1B3b0443256cc3860e24a46F108e699484Aa`
+- **SNX/USD**: `0xDC3EA94CD0AC27d9A86C180091e7f78C683d3699`
+
+## Polygon Mainnet
+
+### Major Assets
+- **MATIC/USD**: `0xAB594600376Ec9fD91F8e885dADF0CE036862dE0`
+- **ETH/USD**: `0xF9680D99D6C9589e2a93a78A04A279e509205945`
+- **BTC/USD**: `0xc907E116054Ad103354f2D350FD2514433D57F6f`
+- **USDC/USD**: `0xfE4A8cc5b5B2366C1B58Bea3858e81843581b2F7`
+- **USDT/USD**: `0x0A6513e40db6EB1b165753AD52E80663aeA50545`
+
+## Arbitrum One
+
+### Major Assets
+- **ETH/USD**: `0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612`
+- **BTC/USD**: `0x6ce185860a4963106506C203335A2910413708e9`
+- **LINK/USD**: `0x86E53CF1B870786351Da77A57575e79CB55812CB`
+- **USDC/USD**: `0x50834F3163758fcC1Df9973b6e91f0F0F0434aD3`
+
+## Optimism
+
+### Major Assets
+- **ETH/USD**: `0x13e3Ee699D1909E989722E753853AE30b17e08c5`
+- **BTC/USD**: `0xD702DD976Fb76Fffc2D3963D037dfDae5b04E593`
+- **LINK/USD**: `0xCc232dcFAAE6354cE191Bd574108c1aD03f86450`
+
+## Sepolia Testnet (For Testing)
+
+### Test Assets
+- **ETH/USD**: `0x694AA1769357215DE4FAC081bf1f309aDC325306`
+- **BTC/USD**: `0x1b44F3514812d835EB1BDB0acB33d3fA3351Ee43`
+- **LINK/USD**: `0xc59E3633BAAC79493d908e63626716e204A45EdF`
+- **USDC/USD**: `0xA2F78ab2355fe2f984D808B5CeE7FD0A93D5270E`
+
+## Notes
+
+### Heartbeat Times (Update Frequency)
+- **Major pairs (ETH, BTC)**: 1 hour (3600 seconds)
+- **Stablecoins**: 24 hours (86400 seconds)
+- **Alt coins**: 1-4 hours depending on volatility
+
+### Decimals
+- Most Chainlink feeds return **8 decimals**
+- BancafiPriceOracle normalizes all prices to **18 decimals**
+
+### Circuit Breaker Recommendations
+
+#### ETH/USD
+- Min Price: $500 (500e18)
+- Max Price: $10,000 (10000e18)
+- Heartbeat: 3600 seconds (1 hour)
+
+#### BTC/USD
+- Min Price: $10,000 (10000e18)
+- Max Price: $150,000 (150000e18)
+- Heartbeat: 3600 seconds (1 hour)
+
+#### Stablecoins (USDC, USDT, DAI)
+- Min Price: $0.90 (0.9e18)
+- Max Price: $1.10 (1.1e18)
+- Heartbeat: 86400 seconds (24 hours)
+
+## Usage Example
+
+```javascript
+// Add ETH/USD price feed
+await priceOracle.addChainlinkFeed(
+    WETH_ADDRESS,                                    // Asset
+    "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419", // Chainlink ETH/USD
+    3600,                                            // 1 hour heartbeat
+    ethers.parseEther("500"),                        // Min $500
+    ethers.parseEther("10000")                       // Max $10,000
+);
+
+// Get price
+const ethPrice = await priceOracle.getLatestPrice(WETH_ADDRESS);
+console.log("ETH Price:", ethers.formatEther(ethPrice), "USD");
+```
+
+## Important Links
+
+- **Chainlink Data Feeds**: https://docs.chain.link/data-feeds/price-feeds/addresses
+- **Feed Registry**: https://docs.chain.link/data-feeds/feed-registry
+- **API Reference**: https://docs.chain.link/data-feeds/api-reference
+
+## Security Considerations
+
+1. **Always validate Chainlink data**:
+   - Check `answeredInRound >= roundId`
+   - Check `updatedAt` timestamp
+   - Verify `answer > 0`
+
+2. **Use circuit breakers** to prevent:
+   - Flash crash prices
+   - Oracle manipulation
+   - Invalid price feeds
+
+3. **Have fallback prices** ready for:
+   - Chainlink downtime
+   - Network congestion
+   - Oracle failures
+
+4. **Monitor price staleness**:
+   - Alert if price hasn't updated within heartbeat
+   - Pause liquidations if prices are stale
+   - Use fallback mechanisms
+
+5. **Test thoroughly** on testnets before mainnet deployment

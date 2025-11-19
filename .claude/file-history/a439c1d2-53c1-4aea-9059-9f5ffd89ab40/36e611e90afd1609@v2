@@ -1,0 +1,282 @@
+# Flash Loan Protection Integration
+
+## Overview
+
+Flash loan protection has been integrated into Bancafi Credit contracts to prevent flash loan attacks and exploit patterns.
+
+## Protection Mechanisms
+
+### 1. Action Rate Limiting
+- **Max 3 actions per block per user** (configurable)
+- Prevents rapid borrow-repay cycles
+- Blocks MEV bots and arbitrage exploits
+
+### 2. Same-Block Prevention
+- Prevents completing borrow + repay in same block
+- Blocks classic flash loan patterns
+- Uses unique action IDs for tracking
+
+### 3. Suspicion Scoring
+- Tracks user behavior patterns
+- Calculates risk scores (0-100)
+- Alerts on suspicious activity
+
+### 4. Bot Detection
+- Identifies automated MEV bots
+- Detects abnormal gas price patterns
+- Blocks rapid-fire transactions
+
+### 5. Price Manipulation Protection
+- Validates oracle price changes
+- Circuit breaker for extreme price swings
+- Requires reasonable deviation (configurable)
+
+## Integration Status
+
+### ✅ Protected Contracts
+
+#### BancafiLending.sol
+- `acceptBorrowRequest()` - Protected
+- `acceptLendingOffer()` - Protected
+- `repayLoan()` - Protected
+- Max 3 actions per block
+
+#### Other Contracts (To Be Updated)
+- CollateralManager.sol
+- BancafiPrivateCreditLine.sol
+- BancafiBlockMarket.sol
+- DebtCollection.sol
+
+## Usage Example
+
+```solidity
+// In contract
+import "./libraries/FlashLoanProtection.sol";
+
+contract MyContract is FlashLoanGuard {
+    function initialize() public initializer {
+        // Initialize with max 3 actions per block
+        _initializeFlashLoanProtection(3);
+    }
+
+    // Protected function
+    function criticalFunction() external flashLoanProtected {
+        // This function is protected from flash loans
+        // Users can only call it 3 times per block
+    }
+
+    // Prevent same-block completion
+    function borrowAndRepay(uint256 loanId) external
+        noSameBlockCompletion(keccak256(abi.encodePacked(msg.sender, loanId)))
+    {
+        // Cannot complete borrow + repay in same block
+    }
+}
+```
+
+## Admin Functions
+
+### Enable/Disable Protection
+```solidity
+// Enable
+_enableFlashLoanProtection();
+
+// Disable (emergency only)
+_disableFlashLoanProtection();
+```
+
+### Update Max Actions
+```solidity
+// Change to 5 actions per block
+_updateMaxActionsPerBlock(5);
+```
+
+### Check User Activity
+```solidity
+// Get user's action count in current block
+uint256 count = _getActionCount(userAddress);
+```
+
+## Events
+
+### FlashLoanAttemptBlocked
+```solidity
+event FlashLoanAttemptBlocked(
+    address indexed user,
+    string reason,
+    uint256 blockNumber
+);
+```
+
+### SuspiciousActivity
+```solidity
+event SuspiciousActivity(
+    address indexed user,
+    uint256 actionCount,
+    uint256 blockNumber
+);
+```
+
+## Protection Levels
+
+### Level 1: Basic (Default)
+- Action rate limiting (3 per block)
+- Event logging
+
+### Level 2: Enhanced
+- Same-block completion prevention
+- Suspicion scoring
+- Automated alerts
+
+### Level 3: Maximum
+- Bot detection
+- Price manipulation checks
+- Oracle validation
+- Emergency pause on threats
+
+## Real-World Attack Scenarios Prevented
+
+### Scenario 1: Flash Loan Arbitrage
+**Attack**: Borrow → Manipulate price → Profit → Repay
+**Protection**: Same-block prevention + price validation
+
+### Scenario 2: Liquidation Manipulation
+**Attack**: Flash loan → Force liquidation → Buy cheap → Repay
+**Protection**: Action rate limiting + oracle checks
+
+### Scenario 3: Governance Attack
+**Attack**: Flash loan tokens → Vote → Repay
+**Protection**: Not applicable (use timelock for governance)
+
+### Scenario 4: Re-entrancy with Flash Loans
+**Attack**: Flash loan → Re-enter → Drain funds
+**Protection**: ReentrancyGuard + flash loan protection
+
+## Configuration Recommendations
+
+### High-Value Operations
+```solidity
+_initializeFlashLoanProtection(2); // Max 2 per block
+```
+
+### Standard Operations
+```solidity
+_initializeFlashLoanProtection(3); // Max 3 per block
+```
+
+### Low-Risk Operations
+```solidity
+_initializeFlashLoanProtection(5); // Max 5 per block
+```
+
+## Monitoring & Alerts
+
+### On-Chain Events
+- Monitor `FlashLoanAttemptBlocked` events
+- Track `SuspiciousActivity` patterns
+- Alert on repeated blocks
+
+### Off-Chain Monitoring
+```javascript
+// Listen for suspicious activity
+contract.on("SuspiciousActivity", (user, actionCount, blockNumber) => {
+  console.log(`⚠️  Suspicious activity detected:`);
+  console.log(`User: ${user}`);
+  console.log(`Actions: ${actionCount}`);
+  console.log(`Block: ${blockNumber}`);
+
+  // Trigger alert system
+  if (actionCount >= 3) {
+    sendAlert("High risk flash loan attempt detected");
+  }
+});
+```
+
+## Testing Flash Loan Protection
+
+### Test Case 1: Rate Limiting
+```javascript
+it("Should block user after 3 actions in same block", async () => {
+  await contract.action1();
+  await contract.action2();
+  await contract.action3();
+
+  // 4th action should fail
+  await expect(contract.action4())
+    .to.be.revertedWith("Flash loan protection: action blocked");
+});
+```
+
+### Test Case 2: Same-Block Prevention
+```javascript
+it("Should prevent borrow + repay in same block", async () => {
+  await contract.borrow(loanId);
+
+  // Repay in same block should fail
+  await expect(contract.repay(loanId))
+    .to.be.revertedWith("Flash loan protection: same-block completion blocked");
+});
+```
+
+## Best Practices
+
+1. **Always use on critical functions**
+   - Borrowing
+   - Repayment
+   - Liquidations
+   - Collateral management
+
+2. **Combine with other protections**
+   - ReentrancyGuard
+   - Access control
+   - Pausable
+   - Oracle validation
+
+3. **Monitor continuously**
+   - Set up alerts
+   - Track patterns
+   - Review suspicious activity
+
+4. **Test thoroughly**
+   - Unit tests
+   - Integration tests
+   - Mainnet fork tests
+   - Audit by professionals
+
+## Emergency Response
+
+### If Flash Loan Attack Detected:
+
+1. **Immediate**
+   ```solidity
+   pause(); // Pause all operations
+   ```
+
+2. **Investigate**
+   - Review events
+   - Identify attack vector
+   - Calculate damage
+
+3. **Mitigate**
+   ```solidity
+   _updateMaxActionsPerBlock(1); // Restrict to 1 action
+   ```
+
+4. **Resolve**
+   - Deploy fix
+   - Resume operations
+   - Post-mortem analysis
+
+## Future Enhancements
+
+- [ ] Machine learning-based pattern detection
+- [ ] Cross-contract flash loan detection
+- [ ] Integration with Flashbots for MEV protection
+- [ ] Automated response system
+- [ ] Insurance integration for coverage
+
+## References
+
+- [Flash Loans Explained](https://docs.aave.com/developers/guides/flash-loans)
+- [MEV Protection](https://docs.flashbots.net/)
+- [Smart Contract Security Best Practices](https://consensys.github.io/smart-contract-best-practices/)
