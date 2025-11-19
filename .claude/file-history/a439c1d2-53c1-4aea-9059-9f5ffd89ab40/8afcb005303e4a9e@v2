@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title IDebtCollection
+ * @notice Interface for automated debt collection
+ */
+interface IDebtCollection {
+    // Events
+    event CollectionInitiated(uint256 indexed loanId, address indexed borrower, uint256 amount, uint256 indexed collectionId);
+    event DebtRepaid(uint256 indexed collectionId, address indexed borrower, uint256 amount);
+    event DebtSold(uint256 indexed collectionId, address indexed seller, address indexed buyer, uint256 price);
+    event CollectionClosed(uint256 indexed collectionId, string reason);
+    event CollectionFeeUpdated(uint256 oldFee, uint256 newFee);
+
+    /**
+     * @notice Initiate debt collection process
+     * @param loanId Original loan ID
+     * @param borrower Borrower address
+     * @param amount Outstanding debt amount
+     * @return collectionId Unique collection identifier
+     */
+    function initiateCollection(uint256 loanId, address borrower, uint256 amount) external returns (uint256 collectionId);
+
+    /**
+     * @notice Repay outstanding debt
+     * @param collectionId Collection ID
+     * @param amount Amount to repay
+     */
+    function repayDebt(uint256 collectionId, uint256 amount) external;
+
+    /**
+     * @notice Sell debt to another party (BBM integration)
+     * @param collectionId Collection ID
+     * @param buyer Buyer address
+     * @param price Sale price
+     */
+    function sellDebt(uint256 collectionId, address buyer, uint256 price) external;
+
+    /**
+     * @notice Get collection details
+     * @param collectionId Collection ID
+     * @return loanId Loan ID
+     * @return borrower Borrower address
+     * @return creditor Creditor address
+     * @return originalAmount Original debt amount
+     * @return remainingAmount Remaining debt amount
+     * @return status Collection status
+     */
+    function getCollectionDetails(uint256 collectionId) external view returns (
+        uint256 loanId,
+        address borrower,
+        address creditor,
+        uint256 originalAmount,
+        uint256 remainingAmount,
+        uint8 status
+    );
+
+    /**
+     * @notice Check if debt is in collection
+     * @param loanId Loan ID
+     * @return Whether loan is in collection
+     */
+    function isInCollection(uint256 loanId) external view returns (bool);
+}

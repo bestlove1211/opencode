@@ -1,0 +1,49 @@
+{
+  "name": "bancafi-credit",
+  "version": "1.0.0",
+  "description": "Decentralized lending and borrowing platform on Ethereum",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.js",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network goerli",
+    "verify": "hardhat verify",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "keywords": [
+    "defi",
+    "lending",
+    "blockchain",
+    "ethereum",
+    "smart-contracts"
+  ],
+  "author": "Bancafi Team",
+  "license": "MIT",
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0",
+    "@openzeppelin/contracts-upgradeable": "^5.0.0",
+    "@rainbow-me/rainbowkit": "^2.0.0",
+    "@wagmi/core": "^2.0.0",
+    "ethers": "^6.9.0",
+    "next": "^14.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "viem": "^2.0.0",
+    "wagmi": "^2.0.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@openzeppelin/hardhat-upgrades": "^3.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.2.0",
+    "autoprefixer": "^10.4.16",
+    "hardhat": "^2.19.0",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.3.6",
+    "typescript": "^5.3.0"
+  }
+}

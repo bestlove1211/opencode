@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title MockTimelock
+ * @notice Simplified timelock for testing
+ */
+contract MockTimelock {
+    uint256 public delay;
+    address public admin;
+
+    constructor(uint256 _delay, address[] memory, address[] memory, address _admin) {
+        delay = _delay;
+        admin = _admin;
+    }
+
+    function getMinDelay() external view returns (uint256) {
+        return delay;
+    }
+
+    function updateDelay(uint256 newDelay) external {
+        delay = newDelay;
+    }
+
+    // Mock functions to satisfy DAO interface
+    function hashProposal(
+        address[] memory,
+        uint256[] memory,
+        bytes[] memory,
+        bytes32
+    ) external pure returns (bytes32) {
+        return keccak256("mock");
+    }
+
+    function schedule(
+        address,
+        uint256,
+        bytes memory,
+        bytes32,
+        bytes32,
+        uint256
+    ) external {}
+
+    function execute(
+        address,
+        uint256,
+        bytes memory,
+        bytes32,
+        bytes32
+    ) external payable {}
+
+    function cancel(bytes32) external {}
+}

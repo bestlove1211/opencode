@@ -1,0 +1,829 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+import "./libraries/DataTypes.sol";
+import "./libraries/Errors.sol";
+import "./libraries/Events.sol";
+import "./interfaces/IComplianceManager.sol";
+
+/**
+ * @title ComplianceManager
+ * @notice Upgradeable contract for KYC/AML management and institutional onboarding
+ * @dev Implements multi-tier KYC system with geographic restrictions and compliance tracking
+ */
+contract ComplianceManager is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    IComplianceManager
+{
+    // ============ Roles ============
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant COMPLIANCE_OFFICER_ROLE = keccak256("COMPLIANCE_OFFICER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    // ============ State Variables ============
+
+    // User KYC data
+    mapping(address => DataTypes.KYCData) private _kycData;
+
+    // Institutional profiles
+    mapping(address => DataTypes.InstitutionalProfile) private _institutionalProfiles;
+
+    // Whitelist
+    mapping(address => bool) private _whitelist;
+
+    // Blacklist
+    mapping(address => bool) private _blacklist;
+    mapping(address => string) private _blacklistReasons;
+
+    // Geographic restrictions (ISO country codes)
+    mapping(string => bool) private _restrictedCountries;
+    string[] private _restrictedCountryList;
+
+    // Transaction limits by KYC level (in wei)
+    mapping(DataTypes.KYCLevel => uint256) private _transactionLimits;
+
+    // Daily volume tracking
+    mapping(address => mapping(uint256 => uint256)) private _dailyVolume; // user => day => volume
+
+    // KYC expiration periods by level (in seconds)
+    mapping(DataTypes.KYCLevel => uint256) private _kycExpirationPeriods;
+
+    // Compliance violations
+    mapping(address => uint256) private _violationCount;
+
+    // List of verified institutions
+    address[] private _verifiedInstitutions;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the contract
+     * @param admin_ Admin address
+     */
+    function initialize(address admin_) public initializer {
+        if (admin_ == address(0)) revert Errors.ZeroAddress();
+
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(ADMIN_ROLE, admin_);
+        _grantRole(COMPLIANCE_OFFICER_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, admin_);
+
+        // Set default transaction limits
+        _transactionLimits[DataTypes.KYCLevel.NONE] = 0;
+        _transactionLimits[DataTypes.KYCLevel.BASIC] = 1000 ether;
+        _transactionLimits[DataTypes.KYCLevel.IDENTITY] = 10000 ether;
+        _transactionLimits[DataTypes.KYCLevel.ACCREDITED] = 100000 ether;
+        _transactionLimits[DataTypes.KYCLevel.INSTITUTIONAL] = type(uint256).max;
+
+        // Set default KYC expiration periods
+        _kycExpirationPeriods[DataTypes.KYCLevel.BASIC] = 180 days;
+        _kycExpirationPeriods[DataTypes.KYCLevel.IDENTITY] = 365 days;
+        _kycExpirationPeriods[DataTypes.KYCLevel.ACCREDITED] = 365 days;
+        _kycExpirationPeriods[DataTypes.KYCLevel.INSTITUTIONAL] = 730 days;
+    }
+
+    // ============ KYC Management Functions ============
+
+    /**
+     * @notice Submit KYC verification request
+     * @param user User address
+     * @param level Requested KYC level
+     * @param provider Verification provider
+     * @param verificationHash Hash of verification data
+     */
+    function submitKYCVerification(
+        address user,
+        DataTypes.KYCLevel level,
+        string calldata provider,
+        bytes32 verificationHash
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (level == DataTypes.KYCLevel.NONE) revert Errors.InvalidParameter();
+
+        DataTypes.KYCData storage kycData = _kycData[user];
+
+        kycData.level = level;
+        kycData.status = DataTypes.ComplianceStatus.PENDING;
+        kycData.verificationProvider = provider;
+        kycData.verificationHash = verificationHash;
+
+        emit Events.KYCVerificationSubmitted(user, level, provider);
+    }
+
+    /**
+     * @notice Approve KYC verification
+     * @param user User address
+     * @param level Approved KYC level
+     */
+    function approveKYC(
+        address user,
+        DataTypes.KYCLevel level
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.KYCData storage kycData = _kycData[user];
+        DataTypes.KYCLevel oldLevel = kycData.level;
+
+        kycData.level = level;
+        kycData.status = DataTypes.ComplianceStatus.APPROVED;
+        kycData.verifiedAt = block.timestamp;
+        kycData.expiresAt = block.timestamp + _kycExpirationPeriods[level];
+        kycData.transactionLimit = _transactionLimits[level];
+
+        emit Events.KYCStatusUpdated(
+            user,
+            oldLevel,
+            level,
+            DataTypes.ComplianceStatus.APPROVED
+        );
+    }
+
+    /**
+     * @notice Reject KYC verification
+     * @param user User address
+     */
+    function rejectKYC(address user) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.KYCData storage kycData = _kycData[user];
+        DataTypes.KYCLevel oldLevel = kycData.level;
+
+        kycData.status = DataTypes.ComplianceStatus.REJECTED;
+        kycData.level = DataTypes.KYCLevel.NONE;
+
+        emit Events.KYCStatusUpdated(
+            user,
+            oldLevel,
+            DataTypes.KYCLevel.NONE,
+            DataTypes.ComplianceStatus.REJECTED
+        );
+    }
+
+    /**
+     * @notice Suspend user's compliance status
+     * @param user User address
+     */
+    function suspendCompliance(address user) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.KYCData storage kycData = _kycData[user];
+        kycData.status = DataTypes.ComplianceStatus.SUSPENDED;
+
+        emit Events.KYCStatusUpdated(
+            user,
+            kycData.level,
+            kycData.level,
+            DataTypes.ComplianceStatus.SUSPENDED
+        );
+    }
+
+    /**
+     * @notice Revoke user's compliance status
+     * @param user User address
+     */
+    function revokeCompliance(address user) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.KYCData storage kycData = _kycData[user];
+        DataTypes.KYCLevel oldLevel = kycData.level;
+
+        kycData.status = DataTypes.ComplianceStatus.REVOKED;
+        kycData.level = DataTypes.KYCLevel.NONE;
+
+        emit Events.KYCStatusUpdated(
+            user,
+            oldLevel,
+            DataTypes.KYCLevel.NONE,
+            DataTypes.ComplianceStatus.REVOKED
+        );
+    }
+
+    // ============ Institutional Onboarding Functions ============
+
+    /**
+     * @notice Register an institutional account
+     * @param institution Institution address
+     * @param entityName Legal entity name
+     * @param registrationNumber Business registration number
+     * @param jurisdiction Jurisdiction of registration
+     * @param entityType Type of entity (Bank, Hedge Fund, etc.)
+     */
+    function registerInstitution(
+        address institution,
+        string calldata entityName,
+        string calldata registrationNumber,
+        string calldata jurisdiction,
+        string calldata entityType
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (institution == address(0)) revert Errors.ZeroAddress();
+        if (_institutionalProfiles[institution].verifiedAt != 0) {
+            revert Errors.InvalidParameter();
+        }
+
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        profile.entityName = entityName;
+        profile.registrationNumber = registrationNumber;
+        profile.jurisdiction = jurisdiction;
+        profile.entityType = entityType;
+        profile.isActive = false; // Needs verification
+        profile.tradingLimit = 1000000 ether; // Default 1M
+        profile.minimumInvestment = 100000 ether; // Default 100K
+        profile.otcAccessEnabled = false;
+
+        emit Events.InstitutionalAccountCreated(
+            institution,
+            entityName,
+            registrationNumber,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Verify and activate an institutional account
+     * @param institution Institution address
+     * @param documentsHash IPFS hash of verification documents
+     */
+    function verifyInstitution(
+        address institution,
+        bytes32 documentsHash
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+
+        profile.verifiedAt = block.timestamp;
+        profile.isActive = true;
+        profile.documentsHash = documentsHash;
+
+        // Automatically approve at INSTITUTIONAL KYC level
+        DataTypes.KYCData storage kycData = _kycData[institution];
+        kycData.level = DataTypes.KYCLevel.INSTITUTIONAL;
+        kycData.status = DataTypes.ComplianceStatus.APPROVED;
+        kycData.verifiedAt = block.timestamp;
+        kycData.expiresAt = block.timestamp + _kycExpirationPeriods[DataTypes.KYCLevel.INSTITUTIONAL];
+        kycData.transactionLimit = type(uint256).max;
+
+        _verifiedInstitutions.push(institution);
+
+        emit Events.InstitutionVerified(institution, msg.sender, block.timestamp);
+        emit Events.KYCStatusUpdated(
+            institution,
+            DataTypes.KYCLevel.NONE,
+            DataTypes.KYCLevel.INSTITUTIONAL,
+            DataTypes.ComplianceStatus.APPROVED
+        );
+    }
+
+    /**
+     * @notice Suspend an institutional account
+     * @param institution Institution address
+     * @param reason Suspension reason
+     */
+    function suspendInstitution(
+        address institution,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+
+        profile.isActive = false;
+
+        emit Events.InstitutionSuspended(institution, reason, block.timestamp);
+    }
+
+    /**
+     * @notice Reactivate a suspended institutional account
+     * @param institution Institution address
+     */
+    function reactivateInstitution(
+        address institution
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+        if (profile.verifiedAt == 0) revert Errors.InstitutionNotVerified();
+
+        profile.isActive = true;
+
+        emit Events.InstitutionReactivated(institution, block.timestamp);
+    }
+
+    /**
+     * @notice Add authorized signer to institution
+     * @param institution Institution address
+     * @param signer Signer address
+     */
+    function addAuthorizedSigner(
+        address institution,
+        address signer
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (signer == address(0)) revert Errors.ZeroAddress();
+
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+
+        profile.authorizedSigners.push(signer);
+
+        emit Events.AuthorizedSignerAdded(institution, signer);
+    }
+
+    /**
+     * @notice Remove authorized signer from institution
+     * @param institution Institution address
+     * @param signer Signer address
+     */
+    function removeAuthorizedSigner(
+        address institution,
+        address signer
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+
+        address[] storage signers = profile.authorizedSigners;
+        for (uint256 i = 0; i < signers.length; i++) {
+            if (signers[i] == signer) {
+                signers[i] = signers[signers.length - 1];
+                signers.pop();
+                break;
+            }
+        }
+
+        emit Events.AuthorizedSignerRemoved(institution, signer);
+    }
+
+    /**
+     * @notice Grant OTC desk access to institution
+     * @param institution Institution address
+     */
+    function grantOTCAccess(address institution) external onlyRole(ADMIN_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+        if (!profile.isActive) revert Errors.InstitutionInactive();
+
+        profile.otcAccessEnabled = true;
+
+        emit Events.OTCAccessGranted(institution);
+    }
+
+    /**
+     * @notice Revoke OTC desk access from institution
+     * @param institution Institution address
+     */
+    function revokeOTCAccess(address institution) external onlyRole(ADMIN_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        profile.otcAccessEnabled = false;
+
+        emit Events.OTCAccessRevoked(institution);
+    }
+
+    /**
+     * @notice Update institutional trading limit
+     * @param institution Institution address
+     * @param newLimit New trading limit
+     */
+    function updateInstitutionalTradingLimit(
+        address institution,
+        uint256 newLimit
+    ) external onlyRole(ADMIN_ROLE) {
+        DataTypes.InstitutionalProfile storage profile = _institutionalProfiles[institution];
+
+        if (bytes(profile.entityName).length == 0) revert Errors.NotInstitution();
+
+        uint256 oldLimit = profile.tradingLimit;
+        profile.tradingLimit = newLimit;
+
+        emit Events.InstitutionalTradeLimitUpdated(institution, oldLimit, newLimit);
+    }
+
+    // ============ Whitelist/Blacklist Functions ============
+
+    /**
+     * @notice Add user to whitelist
+     * @param user User address
+     */
+    function addToWhitelist(address user) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (_whitelist[user]) revert Errors.AlreadyWhitelisted();
+
+        _whitelist[user] = true;
+
+        emit Events.UserWhitelisted(user, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Remove user from whitelist
+     * @param user User address
+     */
+    function removeFromWhitelist(address user) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        _whitelist[user] = false;
+    }
+
+    /**
+     * @notice Add user to blacklist
+     * @param user User address
+     * @param reason Blacklist reason
+     */
+    function addToBlacklist(
+        address user,
+        string calldata reason
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (_blacklist[user]) revert Errors.AlreadyBlacklisted();
+
+        _blacklist[user] = true;
+        _blacklistReasons[user] = reason;
+
+        emit Events.UserBlacklisted(user, msg.sender, reason, block.timestamp);
+    }
+
+    /**
+     * @notice Remove user from blacklist
+     * @param user User address
+     */
+    function removeFromBlacklist(address user) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        if (user == address(0)) revert Errors.ZeroAddress();
+        if (!_blacklist[user]) revert Errors.NotBlacklisted();
+
+        _blacklist[user] = false;
+        delete _blacklistReasons[user];
+
+        emit Events.UserRemovedFromBlacklist(user, msg.sender, block.timestamp);
+    }
+
+    // ============ Geographic Restriction Functions ============
+
+    /**
+     * @notice Add country to restricted list
+     * @param countryCode ISO country code
+     */
+    function addGeographicRestriction(
+        string calldata countryCode
+    ) external onlyRole(ADMIN_ROLE) {
+        if (_restrictedCountries[countryCode]) return;
+
+        _restrictedCountries[countryCode] = true;
+        _restrictedCountryList.push(countryCode);
+
+        emit Events.GeographicRestrictionAdded(countryCode, msg.sender);
+    }
+
+    /**
+     * @notice Remove country from restricted list
+     * @param countryCode ISO country code
+     */
+    function removeGeographicRestriction(
+        string calldata countryCode
+    ) external onlyRole(ADMIN_ROLE) {
+        _restrictedCountries[countryCode] = false;
+
+        emit Events.GeographicRestrictionRemoved(countryCode, msg.sender);
+    }
+
+    // ============ Transaction Limit Functions ============
+
+    /**
+     * @notice Update transaction limit for KYC level
+     * @param level KYC level
+     * @param limit New limit
+     */
+    function updateTransactionLimit(
+        DataTypes.KYCLevel level,
+        uint256 limit
+    ) external onlyRole(ADMIN_ROLE) {
+        uint256 oldLimit = _transactionLimits[level];
+        _transactionLimits[level] = limit;
+
+        emit Events.TransactionLimitUpdated(level, oldLimit, limit);
+    }
+
+    /**
+     * @notice Record transaction volume for compliance tracking
+     * @param user User address
+     * @param amount Transaction amount
+     */
+    function recordTransaction(
+        address user,
+        uint256 amount
+    ) external whenNotPaused {
+        // Only authorized contracts can record transactions
+        if (!hasRole(OPERATOR_ROLE, msg.sender) &&
+            !hasRole(ADMIN_ROLE, msg.sender)) {
+            revert Errors.Unauthorized();
+        }
+
+        DataTypes.KYCData storage kycData = _kycData[user];
+
+        uint256 currentDay = block.timestamp / 1 days;
+        _dailyVolume[user][currentDay] += amount;
+
+        // Check if daily limit exceeded
+        if (_dailyVolume[user][currentDay] > kycData.transactionLimit) {
+            _violationCount[user]++;
+
+            emit Events.ComplianceViolation(
+                user,
+                "TRANSACTION_LIMIT_EXCEEDED",
+                block.timestamp
+            );
+        }
+
+        kycData.dailyVolume = _dailyVolume[user][currentDay];
+        kycData.lastTransactionDate = block.timestamp;
+    }
+
+    // ============ View Functions (IComplianceManager) ============
+
+    /**
+     * @notice Check if user is compliant for required KYC level
+     * @param user User address
+     * @param requiredLevel Required KYC level
+     * @return bool True if compliant
+     */
+    function isCompliant(
+        address user,
+        DataTypes.KYCLevel requiredLevel
+    ) external view override returns (bool) {
+        DataTypes.KYCData memory kycData = _kycData[user];
+
+        // Check blacklist
+        if (_blacklist[user]) return false;
+
+        // Whitelisted users bypass KYC
+        if (_whitelist[user]) return true;
+
+        // Check KYC level
+        if (kycData.level < requiredLevel) return false;
+
+        // Check status
+        if (kycData.status != DataTypes.ComplianceStatus.APPROVED) return false;
+
+        // Check expiration
+        if (block.timestamp > kycData.expiresAt) return false;
+
+        return true;
+    }
+
+    /**
+     * @notice Get user's KYC level
+     * @param user User address
+     * @return DataTypes.KYCLevel KYC level
+     */
+    function getUserKYCLevel(address user)
+        external
+        view
+        override
+        returns (DataTypes.KYCLevel)
+    {
+        return _kycData[user].level;
+    }
+
+    /**
+     * @notice Get user's compliance status
+     * @param user User address
+     * @return DataTypes.ComplianceStatus Compliance status
+     */
+    function getComplianceStatus(address user)
+        external
+        view
+        override
+        returns (DataTypes.ComplianceStatus)
+    {
+        return _kycData[user].status;
+    }
+
+    /**
+     * @notice Check if user is whitelisted
+     * @param user User address
+     * @return bool True if whitelisted
+     */
+    function isWhitelisted(address user) external view override returns (bool) {
+        return _whitelist[user];
+    }
+
+    /**
+     * @notice Check if user is blacklisted
+     * @param user User address
+     * @return bool True if blacklisted
+     */
+    function isBlacklisted(address user) external view override returns (bool) {
+        return _blacklist[user];
+    }
+
+    // ============ Additional View Functions ============
+
+    /**
+     * @notice Get full KYC data for user
+     * @param user User address
+     * @return kycData KYC data struct
+     */
+    function getKYCData(address user)
+        external
+        view
+        returns (DataTypes.KYCData memory kycData)
+    {
+        return _kycData[user];
+    }
+
+    /**
+     * @notice Get institutional profile
+     * @param institution Institution address
+     * @return profile Institutional profile
+     */
+    function getInstitutionalProfile(address institution)
+        external
+        view
+        returns (DataTypes.InstitutionalProfile memory profile)
+    {
+        return _institutionalProfiles[institution];
+    }
+
+    /**
+     * @notice Check if address is verified institution
+     * @param institution Institution address
+     * @return bool True if verified institution
+     */
+    function isVerifiedInstitution(address institution)
+        external
+        view
+        returns (bool)
+    {
+        DataTypes.InstitutionalProfile memory profile = _institutionalProfiles[institution];
+        return profile.verifiedAt > 0 && profile.isActive;
+    }
+
+    /**
+     * @notice Check if address is authorized signer for institution
+     * @param institution Institution address
+     * @param signer Signer address
+     * @return bool True if authorized
+     */
+    function isAuthorizedSigner(address institution, address signer)
+        external
+        view
+        returns (bool)
+    {
+        address[] memory signers = _institutionalProfiles[institution].authorizedSigners;
+        for (uint256 i = 0; i < signers.length; i++) {
+            if (signers[i] == signer) return true;
+        }
+        return false;
+    }
+
+    /**
+     * @notice Get all verified institutions
+     * @return institutions Array of institution addresses
+     */
+    function getVerifiedInstitutions()
+        external
+        view
+        returns (address[] memory institutions)
+    {
+        return _verifiedInstitutions;
+    }
+
+    /**
+     * @notice Check if country is restricted
+     * @param countryCode ISO country code
+     * @return bool True if restricted
+     */
+    function isCountryRestricted(string calldata countryCode)
+        external
+        view
+        returns (bool)
+    {
+        return _restrictedCountries[countryCode];
+    }
+
+    /**
+     * @notice Get all restricted countries
+     * @return countries Array of restricted country codes
+     */
+    function getRestrictedCountries()
+        external
+        view
+        returns (string[] memory countries)
+    {
+        return _restrictedCountryList;
+    }
+
+    /**
+     * @notice Get transaction limit for KYC level
+     * @param level KYC level
+     * @return limit Transaction limit
+     */
+    function getTransactionLimit(DataTypes.KYCLevel level)
+        external
+        view
+        returns (uint256 limit)
+    {
+        return _transactionLimits[level];
+    }
+
+    /**
+     * @notice Get user's daily volume
+     * @param user User address
+     * @return volume Daily volume
+     */
+    function getDailyVolume(address user)
+        external
+        view
+        returns (uint256 volume)
+    {
+        uint256 currentDay = block.timestamp / 1 days;
+        return _dailyVolume[user][currentDay];
+    }
+
+    /**
+     * @notice Get violation count for user
+     * @param user User address
+     * @return count Violation count
+     */
+    function getViolationCount(address user)
+        external
+        view
+        returns (uint256 count)
+    {
+        return _violationCount[user];
+    }
+
+    /**
+     * @notice Get blacklist reason
+     * @param user User address
+     * @return reason Blacklist reason
+     */
+    function getBlacklistReason(address user)
+        external
+        view
+        returns (string memory reason)
+    {
+        return _blacklistReasons[user];
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Grant OPERATOR role to contract
+     * @param operator Operator address (typically marketplace or collection contracts)
+     */
+    function grantOperatorRole(address operator) external onlyRole(ADMIN_ROLE) {
+        if (operator == address(0)) revert Errors.ZeroAddress();
+        _grantRole(OPERATOR_ROLE, operator);
+    }
+
+    /**
+     * @notice Revoke OPERATOR role
+     * @param operator Operator address
+     */
+    function revokeOperatorRole(address operator) external onlyRole(ADMIN_ROLE) {
+        _revokeRole(OPERATOR_ROLE, operator);
+    }
+
+    /**
+     * @notice Pause contract
+     */
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+        emit Events.ContractPaused(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Unpause contract
+     */
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+        emit Events.ContractUnpaused(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @dev Authorize upgrade
+     */
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

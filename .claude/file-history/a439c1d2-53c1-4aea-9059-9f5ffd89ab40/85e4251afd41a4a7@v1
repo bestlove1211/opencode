@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IPriceOracle.sol";
+
+// Chainlink Aggregator Interface
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function description() external view returns (string memory);
+    function version() external view returns (uint256);
+
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+
+    function getRoundData(uint80 _roundId)
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
+
+/**
+ * @title BancafiPriceOracle
+ * @notice Chainlink-integrated price oracle for automated liquidations
+ * @dev Uses Chainlink Data Feeds with fallback mechanisms and circuit breaker
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiPriceOracle is
+    Initializable,
+    OwnableUpgradeable,
+    UUPSUpgradeable,
+    IPriceOracle
+{
+    // ============ Structs ============
+
+    struct PriceFeed {
+        AggregatorV3Interface chainlinkAggregator;  // Chainlink price feed
+        uint256 fallbackPrice;                       // Manual fallback price
+        uint256 lastUpdateTime;
+        uint8 feedDecimals;                          // Decimals from Chainlink feed
+        bool isActive;
+        uint256 heartbeat;                           // Max acceptable staleness (seconds)
+        uint256 minPrice;                            // Minimum valid price (circuit breaker)
+        uint256 maxPrice;                            // Maximum valid price (circuit breaker)
+    }
+
+    // ============ State Variables ============
+
+    mapping(address => PriceFeed) public priceFeeds;
+    mapping(address => bool) public supportedAssets;
+
+    uint256 public constant PRICE_DECIMALS = 18;       // Standard output decimals
+    uint256 public constant DEFAULT_HEARTBEAT = 3600;  // 1 hour default
+
+    // Circuit breaker
+    bool public emergencyMode;
+    mapping(address => uint256) public emergencyPrices;
+
+    // Chainlink ETH/USD feed for reference (Mainnet)
+    // 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419
+
+    // ============ Events ============
+
+    event ChainlinkFeedAdded(
+        address indexed asset,
+        address indexed aggregator,
+        uint8 decimals,
+        uint256 heartbeat
+    );
+
+    event ChainlinkFeedUpdated(
+        address indexed asset,
+        address indexed oldAggregator,
+        address indexed newAggregator
+    );
+
+    event FallbackPriceSet(
+        address indexed asset,
+        uint256 price,
+        uint256 timestamp
+    );
+
+    event PriceRetrieved(
+        address indexed asset,
+        uint256 price,
+        uint256 timestamp,
+        string source
+    );
+
+    event EmergencyModeActivated(uint256 timestamp);
+    event EmergencyModeDeactivated(uint256 timestamp);
+
+    event EmergencyPriceSet(
+        address indexed asset,
+        uint256 price
+    );
+
+    event PriceCircuitBreakerTriggered(
+        address indexed asset,
+        uint256 attemptedPrice,
+        uint256 minPrice,
+        uint256 maxPrice
+    );
+
+    event StalePrice(
+        address indexed asset,
+        uint256 lastUpdate,
+        uint256 timeSinceUpdate
+    );
+
+    // ============ Modifiers ============
+
+    modifier supportedAsset(address asset) {
+        require(supportedAssets[asset], "Asset not supported");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize() public initializer {
+        __Ownable_init(msg.sender);
+        __UUPSUpgradeable_init();
+    }
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Get latest price from Chainlink with fallback
+     * @param asset Asset address
+     * @return price Price in USD (18 decimals)
+     */
+    function getLatestPrice(address asset)
+        external
+        view
+        override
+        supportedAsset(asset)
+        returns (uint256 price)
+    {
+        PriceFeed memory feed = priceFeeds[asset];
+
+        // Emergency mode - use emergency prices
+        if (emergencyMode) {
+            require(emergencyPrices[asset] > 0, "Emergency price not set");
+            return emergencyPrices[asset];
+        }
+
+        // Try Chainlink first
+        if (address(feed.chainlinkAggregator) != address(0) && feed.isActive) {
+            (bool success, uint256 chainlinkPrice) = _getChainlinkPrice(asset);
+
+            if (success) {
+                // Validate price against circuit breaker
+                if (_isWithinBounds(chainlinkPrice, feed.minPrice, feed.maxPrice)) {
+                    return chainlinkPrice;
+                }
+            }
+        }
+
+        // Fallback to manual price
+        require(feed.fallbackPrice > 0, "No valid price available");
+        require(
+            block.timestamp - feed.lastUpdateTime <= feed.heartbeat * 2,
+            "Fallback price too stale"
+        );
+
+        return feed.fallbackPrice;
+    }
+
+    /**
+     * @notice Get price with timestamp from Chainlink
+     * @param asset Asset address
+     * @return price Price in USD (18 decimals)
+     * @return timestamp Last update timestamp
+     */
+    function getPriceWithTimestamp(address asset)
+        external
+        view
+        override
+        supportedAsset(asset)
+        returns (uint256 price, uint256 timestamp)
+    {
+        PriceFeed memory feed = priceFeeds[asset];
+
+        if (emergencyMode) {
+            return (emergencyPrices[asset], block.timestamp);
+        }
+
+        if (address(feed.chainlinkAggregator) != address(0) && feed.isActive) {
+            try feed.chainlinkAggregator.latestRoundData() returns (
+                uint80 roundId,
+                int256 answer,
+                uint256 startedAt,
+                uint256 updatedAt,
+                uint80 answeredInRound
+            ) {
+                // Validate Chainlink data
+                require(answer > 0, "Invalid price from Chainlink");
+                require(updatedAt > 0, "Invalid timestamp");
+                require(answeredInRound >= roundId, "Stale round data");
+
+                uint256 normalizedPrice = _normalizePrice(uint256(answer), feed.feedDecimals);
+
+                // Check circuit breaker
+                if (_isWithinBounds(normalizedPrice, feed.minPrice, feed.maxPrice)) {
+                    return (normalizedPrice, updatedAt);
+                }
+            } catch {
+                // Fall through to fallback
+            }
+        }
+
+        return (feed.fallbackPrice, feed.lastUpdateTime);
+    }
+
+    /**
+     * @notice Check if Chainlink price is stale
+     * @param asset Asset address
+     * @return Whether price data is stale
+     */
+    function isPriceStale(address asset)
+        external
+        view
+        override
+        supportedAsset(asset)
+        returns (bool)
+    {
+        if (emergencyMode) {
+            return false;
+        }
+
+        PriceFeed memory feed = priceFeeds[asset];
+
+        if (address(feed.chainlinkAggregator) != address(0) && feed.isActive) {
+            try feed.chainlinkAggregator.latestRoundData() returns (
+                uint80,
+                int256,
+                uint256,
+                uint256 updatedAt,
+                uint80
+            ) {
+                uint256 timeSinceUpdate = block.timestamp - updatedAt;
+                return timeSinceUpdate > feed.heartbeat;
+            } catch {
+                return true;
+            }
+        }
+
+        // Check fallback staleness
+        uint256 timeSinceUpdate = block.timestamp - feed.lastUpdateTime;
+        return timeSinceUpdate > feed.heartbeat;
+    }
+
+    /**
+     * @notice Get asset decimals (always returns 18)
+     * @param asset Asset address
+     * @return Always returns 18 (normalized)
+     */
+    function getAssetDecimals(address asset)
+        external
+        view
+        override
+        supportedAsset(asset)
+        returns (uint8)
+    {
+        return uint8(PRICE_DECIMALS);
+    }
+
+    // ============ Chainlink Integration ============
+
+    /**
+     * @notice Add Chainlink price feed for an asset
+     * @param asset Asset address (e.g., WETH, WBTC, USDC)
+     * @param chainlinkAggregator Chainlink aggregator address
+     * @param heartbeat Maximum staleness in seconds
+     * @param minPrice Minimum valid price (circuit breaker)
+     * @param maxPrice Maximum valid price (circuit breaker)
+     */
+    function addChainlinkFeed(
+        address asset,
+        address chainlinkAggregator,
+        uint256 heartbeat,
+        uint256 minPrice,
+        uint256 maxPrice
+    ) external onlyOwner {
+        require(asset != address(0), "Invalid asset");
+        require(chainlinkAggregator != address(0), "Invalid aggregator");
+        require(!supportedAssets[asset], "Asset already supported");
+        require(minPrice < maxPrice, "Invalid price bounds");
+
+        AggregatorV3Interface aggregator = AggregatorV3Interface(chainlinkAggregator);
+
+        // Test the feed
+        try aggregator.latestRoundData() returns (
+            uint80,
+            int256 answer,
+            uint256,
+            uint256,
+            uint80
+        ) {
+            require(answer > 0, "Invalid feed");
+        } catch {
+            revert("Chainlink feed test failed");
+        }
+
+        uint8 decimals = aggregator.decimals();
+        uint256 _heartbeat = heartbeat > 0 ? heartbeat : DEFAULT_HEARTBEAT;
+
+        priceFeeds[asset] = PriceFeed({
+            chainlinkAggregator: aggregator,
+            fallbackPrice: 0,
+            lastUpdateTime: 0,
+            feedDecimals: decimals,
+            isActive: true,
+            heartbeat: _heartbeat,
+            minPrice: minPrice,
+            maxPrice: maxPrice
+        });
+
+        supportedAssets[asset] = true;
+
+        emit ChainlinkFeedAdded(asset, chainlinkAggregator, decimals, _heartbeat);
+    }
+
+    /**
+     * @notice Update Chainlink aggregator for an asset
+     * @param asset Asset address
+     * @param newAggregator New Chainlink aggregator address
+     */
+    function updateChainlinkFeed(
+        address asset,
+        address newAggregator
+    ) external onlyOwner supportedAsset(asset) {
+        require(newAggregator != address(0), "Invalid aggregator");
+
+        PriceFeed storage feed = priceFeeds[asset];
+        address oldAggregator = address(feed.chainlinkAggregator);
+
+        AggregatorV3Interface aggregator = AggregatorV3Interface(newAggregator);
+
+        // Test new feed
+        try aggregator.latestRoundData() returns (
+            uint80,
+            int256 answer,
+            uint256,
+            uint256,
+            uint80
+        ) {
+            require(answer > 0, "Invalid feed");
+        } catch {
+            revert("New feed test failed");
+        }
+
+        feed.chainlinkAggregator = aggregator;
+        feed.feedDecimals = aggregator.decimals();
+
+        emit ChainlinkFeedUpdated(asset, oldAggregator, newAggregator);
+    }
+
+    /**
+     * @notice Set fallback price manually (for when Chainlink is unavailable)
+     * @param asset Asset address
+     * @param price Price in USD (18 decimals)
+     */
+    function setFallbackPrice(
+        address asset,
+        uint256 price
+    ) external onlyOwner supportedAsset(asset) {
+        require(price > 0, "Invalid price");
+
+        PriceFeed storage feed = priceFeeds[asset];
+
+        // Validate against circuit breaker
+        require(
+            _isWithinBounds(price, feed.minPrice, feed.maxPrice),
+            "Price outside bounds"
+        );
+
+        feed.fallbackPrice = price;
+        feed.lastUpdateTime = block.timestamp;
+
+        emit FallbackPriceSet(asset, price, block.timestamp);
+    }
+
+    /**
+     * @notice Update circuit breaker bounds
+     * @param asset Asset address
+     * @param minPrice New minimum price
+     * @param maxPrice New maximum price
+     */
+    function updatePriceBounds(
+        address asset,
+        uint256 minPrice,
+        uint256 maxPrice
+    ) external onlyOwner supportedAsset(asset) {
+        require(minPrice < maxPrice, "Invalid bounds");
+
+        PriceFeed storage feed = priceFeeds[asset];
+        feed.minPrice = minPrice;
+        feed.maxPrice = maxPrice;
+    }
+
+    /**
+     * @notice Update heartbeat for an asset
+     * @param asset Asset address
+     * @param newHeartbeat New heartbeat in seconds
+     */
+    function updateHeartbeat(
+        address asset,
+        uint256 newHeartbeat
+    ) external onlyOwner supportedAsset(asset) {
+        require(newHeartbeat > 0, "Invalid heartbeat");
+        priceFeeds[asset].heartbeat = newHeartbeat;
+    }
+
+    // ============ Emergency Functions ============
+
+    /**
+     * @notice Activate emergency mode (circuit breaker)
+     */
+    function activateEmergencyMode() external onlyOwner {
+        require(!emergencyMode, "Already in emergency mode");
+        emergencyMode = true;
+        emit EmergencyModeActivated(block.timestamp);
+    }
+
+    /**
+     * @notice Deactivate emergency mode
+     */
+    function deactivateEmergencyMode() external onlyOwner {
+        require(emergencyMode, "Not in emergency mode");
+        emergencyMode = false;
+        emit EmergencyModeDeactivated(block.timestamp);
+    }
+
+    /**
+     * @notice Set emergency price (only in emergency mode)
+     * @param asset Asset address
+     * @param price Emergency price (18 decimals)
+     */
+    function setEmergencyPrice(
+        address asset,
+        uint256 price
+    ) external onlyOwner supportedAsset(asset) {
+        require(emergencyMode, "Not in emergency mode");
+        require(price > 0, "Invalid price");
+
+        emergencyPrices[asset] = price;
+
+        emit EmergencyPriceSet(asset, price);
+    }
+
+    /**
+     * @notice Activate/deactivate a price feed
+     * @param asset Asset address
+     * @param active Whether feed should be active
+     */
+    function setPriceFeedActive(
+        address asset,
+        bool active
+    ) external onlyOwner supportedAsset(asset) {
+        priceFeeds[asset].isActive = active;
+    }
+
+    // ============ Batch Operations ============
+
+    /**
+     * @notice Get multiple prices at once
+     * @param assets Array of asset addresses
+     * @return prices Array of prices (18 decimals)
+     */
+    function getMultiplePrices(address[] calldata assets)
+        external
+        view
+        returns (uint256[] memory prices)
+    {
+        prices = new uint256[](assets.length);
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            if (supportedAssets[assets[i]]) {
+                prices[i] = this.getLatestPrice(assets[i]);
+            }
+        }
+
+        return prices;
+    }
+
+    /**
+     * @notice Batch set fallback prices
+     * @param assets Array of asset addresses
+     * @param prices Array of prices (18 decimals)
+     */
+    function batchSetFallbackPrices(
+        address[] calldata assets,
+        uint256[] calldata prices
+    ) external onlyOwner {
+        require(assets.length == prices.length, "Length mismatch");
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            require(supportedAssets[assets[i]], "Asset not supported");
+            require(prices[i] > 0, "Invalid price");
+
+            PriceFeed storage feed = priceFeeds[assets[i]];
+
+            require(
+                _isWithinBounds(prices[i], feed.minPrice, feed.maxPrice),
+                "Price outside bounds"
+            );
+
+            feed.fallbackPrice = prices[i];
+            feed.lastUpdateTime = block.timestamp;
+
+            emit FallbackPriceSet(assets[i], prices[i], block.timestamp);
+        }
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get full price feed configuration
+     * @param asset Asset address
+     * @return PriceFeed struct
+     */
+    function getPriceFeed(address asset)
+        external
+        view
+        supportedAsset(asset)
+        returns (PriceFeed memory)
+    {
+        return priceFeeds[asset];
+    }
+
+    /**
+     * @notice Get Chainlink aggregator address for an asset
+     * @param asset Asset address
+     * @return Chainlink aggregator address
+     */
+    function getChainlinkAggregator(address asset)
+        external
+        view
+        supportedAsset(asset)
+        returns (address)
+    {
+        return address(priceFeeds[asset].chainlinkAggregator);
+    }
+
+    /**
+     * @notice Check price health for an asset
+     * @param asset Asset address
+     * @return isHealthy Whether price feed is healthy
+     * @return reason Status description
+     */
+    function checkPriceHealth(address asset)
+        external
+        view
+        supportedAsset(asset)
+        returns (bool isHealthy, string memory reason)
+    {
+        if (emergencyMode) {
+            if (emergencyPrices[asset] > 0) {
+                return (true, "Using emergency price");
+            }
+            return (false, "Emergency price not set");
+        }
+
+        PriceFeed memory feed = priceFeeds[asset];
+
+        if (!feed.isActive) {
+            return (false, "Feed inactive");
+        }
+
+        if (address(feed.chainlinkAggregator) != address(0)) {
+            (bool success, uint256 price) = _getChainlinkPrice(asset);
+
+            if (!success) {
+                if (feed.fallbackPrice > 0) {
+                    return (true, "Using fallback - Chainlink unavailable");
+                }
+                return (false, "Chainlink unavailable, no fallback");
+            }
+
+            if (this.isPriceStale(asset)) {
+                return (false, "Price stale");
+            }
+
+            if (!_isWithinBounds(price, feed.minPrice, feed.maxPrice)) {
+                return (false, "Price outside circuit breaker bounds");
+            }
+
+            return (true, "Chainlink feed healthy");
+        }
+
+        if (feed.fallbackPrice > 0) {
+            if (block.timestamp - feed.lastUpdateTime <= feed.heartbeat) {
+                return (true, "Using fallback price");
+            }
+            return (false, "Fallback price stale");
+        }
+
+        return (false, "No price source available");
+    }
+
+    /**
+     * @notice Get detailed Chainlink round data
+     * @param asset Asset address
+     * @return roundId Round ID
+     * @return answer Price from Chainlink
+     * @return startedAt Round start time
+     * @return updatedAt Last update time
+     * @return answeredInRound Answered in round
+     */
+    function getChainlinkRoundData(address asset)
+        external
+        view
+        supportedAsset(asset)
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        )
+    {
+        PriceFeed memory feed = priceFeeds[asset];
+        require(address(feed.chainlinkAggregator) != address(0), "No Chainlink feed");
+
+        return feed.chainlinkAggregator.latestRoundData();
+    }
+
+    // ============ Internal Functions ============
+
+    /**
+     * @notice Get price from Chainlink with validation
+     * @param asset Asset address
+     * @return success Whether price retrieval was successful
+     * @return price Normalized price (18 decimals)
+     */
+    function _getChainlinkPrice(address asset)
+        internal
+        view
+        returns (bool success, uint256 price)
+    {
+        PriceFeed memory feed = priceFeeds[asset];
+
+        try feed.chainlinkAggregator.latestRoundData() returns (
+            uint80 roundId,
+            int256 answer,
+            uint256,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) {
+            // Validate data
+            if (answer <= 0) return (false, 0);
+            if (updatedAt == 0) return (false, 0);
+            if (answeredInRound < roundId) return (false, 0);
+
+            uint256 timeSinceUpdate = block.timestamp - updatedAt;
+            if (timeSinceUpdate > feed.heartbeat) return (false, 0);
+
+            uint256 normalizedPrice = _normalizePrice(uint256(answer), feed.feedDecimals);
+            return (true, normalizedPrice);
+
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    /**
+     * @notice Normalize price to 18 decimals
+     * @param price Raw price from Chainlink
+     * @param decimals Chainlink feed decimals
+     * @return Normalized price (18 decimals)
+     */
+    function _normalizePrice(uint256 price, uint8 decimals)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (decimals == PRICE_DECIMALS) {
+            return price;
+        } else if (decimals < PRICE_DECIMALS) {
+            return price * (10 ** (PRICE_DECIMALS - decimals));
+        } else {
+            return price / (10 ** (decimals - PRICE_DECIMALS));
+        }
+    }
+
+    /**
+     * @notice Check if price is within circuit breaker bounds
+     * @param price Price to check
+     * @param minPrice Minimum bound
+     * @param maxPrice Maximum bound
+     * @return Whether price is within bounds
+     */
+    function _isWithinBounds(
+        uint256 price,
+        uint256 minPrice,
+        uint256 maxPrice
+    ) internal pure returns (bool) {
+        if (minPrice == 0 && maxPrice == 0) return true; // No bounds set
+        if (minPrice > 0 && price < minPrice) return false;
+        if (maxPrice > 0 && price > maxPrice) return false;
+        return true;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    uint256[50] private __gap;
+}

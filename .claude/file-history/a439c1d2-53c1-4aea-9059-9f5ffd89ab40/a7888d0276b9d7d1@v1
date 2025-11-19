@@ -1,0 +1,521 @@
+// Compliance System Documentation
+# Bancafi Compliance System
+
+## Overview
+
+Comprehensive KYC/KYB, blacklisting, and slashing system for regulatory compliance and risk management.
+
+## Components
+
+### 1. BancafiCompliance.sol
+Central compliance hub managing all verification, blacklisting, and slashing.
+
+### 2. ComplianceGuard (Library)
+Easy-to-integrate compliance checks for any contract.
+
+## Verification Levels
+
+### None (0)
+- Not verified
+- Cannot use platform
+
+### Basic (1)
+- Individual KYC
+- Basic identity verification
+- Access to standard features
+- Max loan: $10,000
+
+### Enhanced (2)
+- Enhanced KYC for individuals
+- Additional documentation required
+- Higher transaction limits
+- Max loan: $50,000
+
+### Business (3)
+- Business entity verification (KYB)
+- Corporate documents required
+- Business account features
+- Max loan: $250,000
+
+### Institutional (4)
+- Full institutional verification
+- Regulatory compliance docs
+- Premium features
+- Unlimited (subject to approval)
+
+## KYC/KYB Process
+
+### For Individuals (Basic/Enhanced)
+
+1. **Submit Documents**
+   - Government-issued ID
+   - Proof of address
+   - Selfie verification
+   - (Enhanced) Bank statements, tax returns
+
+2. **Verification Process**
+   ```solidity
+   compliance.verifyUser(
+       userAddress,
+       VerificationLevel.Basic,
+       ipfsHash,  // IPFS hash of encrypted documents
+       "US"       // Country code
+   );
+   ```
+
+3. **Expiry & Renewal**
+   - KYC expires after configured duration (default: 365 days)
+   - Users must renew before expiry
+   - Automatic reminders before expiration
+
+### For Businesses (Business Level)
+
+1. **Required Documents**
+   - Business registration
+   - Articles of incorporation
+   - Tax ID (EIN)
+   - Beneficial ownership info
+   - Financial statements
+
+2. **Verification**
+   ```solidity
+   compliance.verifyUser(
+       businessAddress,
+       VerificationLevel.Business,
+       ipfsHash,
+       "US"
+   );
+   ```
+
+### For Institutions (Institutional Level)
+
+1. **Required Documentation**
+   - All business documents
+   - Regulatory licenses
+   - Audit reports
+   - Compliance certifications
+   - AML/CTF policies
+
+2. **Enhanced Due Diligence**
+   - Background checks
+   - Regulatory verification
+   - Financial health assessment
+   - Ongoing monitoring
+
+## Blacklisting System
+
+### Blacklist Reasons
+
+1. **Fraud** - Fraudulent activities detected
+2. **Money Laundering** - AML violations
+3. **Sanctioned Entity** - OFAC or other sanctions
+4. **Repeated Defaults** - Pattern of loan defaults
+5. **Suspicious Activity** - Unusual transaction patterns
+6. **Regulatory Order** - Court/regulatory mandated
+7. **Other** - Custom reasons
+
+### Adding to Blacklist
+
+```solidity
+// Permanent blacklist
+compliance.addToBlacklist(
+    userAddress,
+    BlacklistReason.Fraud,
+    0,  // 0 = permanent
+    "Fraudulent loan applications"
+);
+
+// Temporary blacklist (30 days)
+compliance.addToBlacklist(
+    userAddress,
+    BlacklistReason.SuspiciousActivity,
+    30 days,
+    "Suspicious trading patterns detected"
+);
+```
+
+### Batch Blacklisting
+
+```solidity
+address[] memory users = [user1, user2, user3];
+compliance.batchBlacklist(
+    users,
+    BlacklistReason.SanctionedEntity,
+    0,  // Permanent
+    "OFAC sanctioned entities"
+);
+```
+
+### Removing from Blacklist
+
+```solidity
+// Compliance officer can remove
+compliance.removeFromBlacklist(userAddress);
+```
+
+## Slashing System
+
+### Slashing Triggers
+
+1. **Default** - Loan default with aggravating factors
+2. **Fraud** - Proven fraudulent behavior
+3. **Market Manipulation** - Price/oracle manipulation attempts
+4. **Oracle Attack** - Attacking price feeds
+5. **Contract Violation** - Terms of service violations
+6. **Other** - Custom violations
+
+### Slashing Process
+
+```solidity
+// Slash user's collateral/stake
+compliance.slashUser(
+    violatorAddress,
+    1000e18,  // Amount to slash
+    SlashingReason.Fraud,
+    "False KYC documents submitted"
+);
+```
+
+### Auto-Blacklist Rules
+
+Certain slashing reasons trigger automatic blacklisting:
+- **Fraud** → Permanent blacklist
+- **Market Manipulation** → Permanent blacklist
+- **Oracle Attack** → Permanent blacklist
+
+### Slashed Funds Management
+
+```solidity
+// Admin withdraws slashed funds to treasury
+compliance.withdrawSlashedFunds(
+    treasuryAddress,
+    amountToWithdraw
+);
+```
+
+## Sanctioned Countries
+
+### Managing Sanctions
+
+```solidity
+// Add sanctioned country
+compliance.addSanctionedCountry("KP");  // North Korea
+compliance.addSanctionedCountry("IR");  // Iran
+
+// Remove from sanctions
+compliance.removeSanctionedCountry("IR");
+
+// Get all sanctioned countries
+string[] memory sanctioned = compliance.getSanctionedCountries();
+```
+
+### Sanctions Impact
+
+- Users from sanctioned countries **cannot be verified**
+- Existing verified users from newly sanctioned countries remain verified until renewal
+- Platform access denied to sanctioned country residents
+
+## Integration with Contracts
+
+### Example: Integrating with Lending Contract
+
+```solidity
+import "./libraries/ComplianceIntegration.sol";
+
+contract BancafiLending is ComplianceGuard {
+    function initialize(address _complianceContract) public initializer {
+        // Initialize compliance
+        _initializeCompliance(_complianceContract);
+    }
+
+    // Protected function - only verified users
+    function borrowLoan(uint256 amount)
+        external
+        onlyVerified
+        notBlacklisted
+    {
+        // Loan logic here
+    }
+
+    // Full compliance check
+    function institutionalBorrow(uint256 amount)
+        external
+        compliant
+    {
+        // Only fully compliant users can access
+    }
+}
+```
+
+### Available Modifiers
+
+- `onlyVerified` - User must have valid KYC
+- `notBlacklisted` - User must not be blacklisted
+- `compliant` - Full compliance check (verified + not blacklisted + minimum level)
+- `userCompliant(address)` - Check specific user
+
+### Manual Checks
+
+```solidity
+// Check if user is verified
+bool verified = _isVerified(userAddress);
+
+// Check if blacklisted
+bool blacklisted = _isBlacklisted(userAddress);
+
+// Full compliance check
+bool compliant = _isCompliant(userAddress);
+
+// Batch check
+bool[] memory results = _batchCheckCompliance(users);
+```
+
+## Admin Roles
+
+### DEFAULT_ADMIN_ROLE
+- Grant/revoke roles
+- Update system parameters
+- Emergency controls
+- Withdraw slashed funds
+
+### COMPLIANCE_OFFICER_ROLE
+- Blacklist/unblacklist users
+- Revoke verifications
+- Upgrade verification levels
+- Manage sanctioned countries
+
+### KYC_VERIFIER_ROLE
+- Verify users
+- Renew verifications
+- Batch verify users
+
+### SLASHING_ADMIN_ROLE
+- Execute slashing
+- Determine slashing amounts
+- Investigate violations
+
+## Monitoring & Analytics
+
+### Compliance Statistics
+
+```solidity
+ComplianceStats memory stats = compliance.getComplianceStats();
+
+console.log("Total Verified:", stats.totalVerified);
+console.log("Total Blacklisted:", stats.totalBlacklisted);
+console.log("Total Slashed:", stats.totalSlashed);
+console.log("Slashed Amount:", stats.totalSlashedAmount);
+```
+
+### User Compliance Info
+
+```solidity
+UserCompliance memory info = compliance.getUserCompliance(user);
+
+console.log("Level:", info.verificationLevel);
+console.log("Verified:", info.isVerified);
+console.log("Country:", info.country);
+console.log("Expires:", info.expiresAt);
+```
+
+### Slashing History
+
+```solidity
+SlashingEvent[] memory slashings = compliance.getUserSlashings(user);
+
+for (uint i = 0; i < slashings.length; i++) {
+    console.log("Amount:", slashings[i].amount);
+    console.log("Reason:", slashings[i].reason);
+    console.log("Details:", slashings[i].details);
+}
+```
+
+## Events for Off-Chain Monitoring
+
+### Verification Events
+```javascript
+// Monitor user verifications
+compliance.on("UserVerified", (user, level, timestamp, expiresAt) => {
+    console.log(`✅ User ${user} verified at level ${level}`);
+    // Update database
+    // Send confirmation email
+});
+
+// Monitor verification expirations
+compliance.on("VerificationExpired", (user, timestamp) => {
+    console.log(`⚠️  Verification expired for ${user}`);
+    // Send renewal reminder
+});
+```
+
+### Blacklist Events
+```javascript
+// Monitor blacklisting
+compliance.on("UserBlacklisted", (user, reason, isPermanent, expiresAt, listedBy) => {
+    console.log(`🚫 User ${user} blacklisted for ${reason}`);
+    // Alert security team
+    // Freeze user accounts
+});
+```
+
+### Slashing Events
+```javascript
+// Monitor slashing
+compliance.on("UserSlashed", (slashingId, user, amount, reason, executedBy) => {
+    console.log(`⚡ User ${user} slashed ${amount} for ${reason}`);
+    // Record in database
+    // Notify legal team
+});
+```
+
+## Best Practices
+
+### 1. Verification
+
+- ✅ Always verify before allowing platform access
+- ✅ Set appropriate expiry durations (365 days recommended)
+- ✅ Require higher levels for higher-value operations
+- ✅ Store KYC documents securely (IPFS with encryption)
+
+### 2. Blacklisting
+
+- ✅ Document reasons clearly
+- ✅ Use temporary blacklists when appropriate
+- ✅ Review blacklist regularly
+- ✅ Provide appeal process (off-chain)
+
+### 3. Slashing
+
+- ✅ Investigate thoroughly before slashing
+- ✅ Slash proportionally to violation severity
+- ✅ Document evidence clearly
+- ✅ Notify user before slashing (when safe)
+
+### 4. Integration
+
+- ✅ Use `compliant` modifier for critical operations
+- ✅ Add compliance checks to all user-facing functions
+- ✅ Handle compliance check failures gracefully
+- ✅ Provide clear error messages
+
+## Regulatory Compliance
+
+### OFAC Sanctions
+```solidity
+// Add OFAC sanctioned countries
+compliance.addSanctionedCountry("KP"); // North Korea
+compliance.addSanctionedCountry("IR"); // Iran
+compliance.addSanctionedCountry("CU"); // Cuba
+compliance.addSanctionedCountry("SY"); // Syria
+// ... etc
+```
+
+### GDPR Compliance
+- Store only hashes on-chain
+- Keep PII off-chain
+- Implement right to erasure (off-chain)
+- Data retention policies
+
+### AML/CTF
+- Enhanced due diligence for high-value users
+- Transaction monitoring (off-chain)
+- Suspicious activity reporting
+- Record keeping (7 years minimum)
+
+## Testing
+
+### Unit Tests
+
+```javascript
+describe("Compliance System", () => {
+    it("Should verify user successfully", async () => {
+        await compliance.verifyUser(
+            user.address,
+            VerificationLevel.Basic,
+            "QmHash123",
+            "US"
+        );
+
+        expect(await compliance.isUserVerified(user.address)).to.be.true;
+    });
+
+    it("Should block blacklisted users", async () => {
+        await compliance.addToBlacklist(
+            user.address,
+            BlacklistReason.Fraud,
+            0,
+            "Test"
+        );
+
+        await expect(
+            lending.connect(user).borrowLoan(1000)
+        ).to.be.revertedWith("User is blacklisted");
+    });
+
+    it("Should slash user correctly", async () => {
+        await compliance.slashUser(
+            user.address,
+            ethers.parseEther("100"),
+            SlashingReason.Fraud,
+            "Test slashing"
+        );
+
+        const slashings = await compliance.getUserSlashings(user.address);
+        expect(slashings.length).to.equal(1);
+        expect(slashings[0].amount).to.equal(ethers.parseEther("100"));
+    });
+});
+```
+
+## Emergency Procedures
+
+### Scenario 1: Mass Blacklisting (Security Breach)
+
+```solidity
+// Quickly blacklist multiple addresses
+address[] memory compromised = getCompromisedAddresses();
+compliance.batchBlacklist(
+    compromised,
+    BlacklistReason.SuspiciousActivity,
+    7 days,  // Temporary during investigation
+    "Security breach investigation"
+);
+```
+
+### Scenario 2: Regulatory Order
+
+```solidity
+// Add country to sanctions
+compliance.addSanctionedCountry("XX");
+
+// Blacklist all users from that country (off-chain script)
+const users = await getUsersFromCountry("XX");
+await compliance.batchBlacklist(users, ...);
+```
+
+### Scenario 3: System Pause
+
+```solidity
+// Pause compliance checks in emergency
+compliance.pause();
+
+// Resume after fix
+compliance.unpause();
+```
+
+## Future Enhancements
+
+- [ ] On-chain proof of verification (ZK proofs)
+- [ ] Automated AML screening integration
+- [ ] Decentralized identity (DID) support
+- [ ] Cross-chain compliance verification
+- [ ] Appeal mechanism (DAO governance)
+- [ ] Automated sanctions screening
+- [ ] Real-time transaction monitoring hooks
+
+## References
+
+- [FATF Guidelines](https://www.fatf-gafi.org/)
+- [OFAC Sanctions](https://home.treasury.gov/policy-issues/office-of-foreign-assets-control-sanctions-programs-and-information)
+- [GDPR](https://gdpr.eu/)
+- [FinCEN Requirements](https://www.fincen.gov/)

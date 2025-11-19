@@ -1,0 +1,304 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Bancafi is a complete DeFi platform for tokenizing real-world assets (RWA) with DAO-governed emergency bailout mechanisms. The system combines asset tokenization, fractionalization, institutional onboarding, rental income distribution, and decentralized governance.
+
+**Token Economics:**
+- Governance Token (BGT): 2,000,000 total supply
+- Maximum Bailout: 10,000,000 BGT tokens
+
+## Essential Commands
+
+```bash
+# Compile contracts (uses IR-based compiler for complex contracts)
+npx hardhat compile
+
+# Run local development node (in background)
+npx hardhat node
+
+# Deploy all contracts to localhost
+npx hardhat run scripts/deploy.js --network localhost
+
+# Run demo scripts (requires node running on localhost:8545)
+npx hardhat run scripts/institutional-demo.js --network localhost
+npx hardhat run scripts/enhanced-features-demo.js --network localhost
+npx hardhat run scripts/real-estate-demo.js --network localhost
+
+# Run tests
+npx hardhat test
+```
+
+## Critical Architecture Patterns
+
+### 1. UUPS Upgradeable Proxy Pattern
+
+**All contracts use UUPS (Universal Upgradeable Proxy Standard):**
+
+- Every contract inherits from `UUPSUpgradeable`
+- Constructor MUST call `_disableInitializers()` to prevent initialization of implementation
+- Use `initialize()` function instead of constructor for setup
+- Deployment uses `upgrades.deployProxy()` from `@openzeppelin/hardhat-upgrades`
+- Only addresses with `UPGRADER_ROLE` can upgrade contracts
+
+**Example pattern:**
+```solidity
+contract MyContract is Initializable, UUPSUpgradeable {
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __UUPSUpgradeable_init();
+        // initialization logic
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+```
+
+### 2. Contract Interdependencies
+
+**Deployment order matters due to these dependencies:**
+
+1. **BancafiGovernanceToken** (standalone)
+2. **BancafiTimelock** (non-upgradeable wrapper, requires deployer address)
+3. **BancafiDAO** (requires: governance token address, timelock address)
+4. **BancafiAssetToken** (standalone)
+5. **BancafiBailout** (integrates with AssetToken for collateral)
+6. **BancafiRentalIncome** (requires: AssetToken address for fractional ownership)
+7. **BancafiInstitutional** (standalone KYB system)
+
+**Post-deployment role configuration required:**
+- Grant DAO the `PROPOSER_ROLE` and `EXECUTOR_ROLE` on Timelock
+- Grant DAO the `BAILOUT_APPROVER_ROLE` on Bailout contract
+- Self-delegate governance tokens for voting (`.delegate(address)`)
+
+### 3. OpenZeppelin 5.0 Specific Changes
+
+**Critical differences from OZ 4.x that were fixed:**
+
+- `Pausable` and `ReentrancyGuard` moved from `security/` to `utils/`
+- `Counters` library deprecated → use plain `uint256` with increment
+- `IVotesUpgradeable` doesn't exist → use `IVotes` from non-upgradeable
+- ERC721 `_beforeTokenTransfer` deprecated → use `_update` hook
+- GovernorSettings requires explicit type casting: `uint48()`, `uint32()`
+- ERC20Votes requires `__EIP712_init(name, "1")` in initialize function
+
+**Import pattern:**
+```solidity
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts/governance/utils/IVotes.sol"; // Non-upgradeable!
+```
+
+### 4. Hardhat Configuration Requirements
+
+**The config MUST include:**
+
+```javascript
+solidity: {
+  version: "0.8.25",
+  settings: {
+    optimizer: { enabled: true, runs: 200 },
+    viaIR: true,  // CRITICAL: Required for complex contracts to avoid stack-too-deep
+    evmVersion: "cancun"
+  }
+}
+```
+
+`viaIR: true` is essential - without it, contracts like BancafiInstitutional will fail with "Stack too deep" errors.
+
+### 5. Asset Tokenization Flow
+
+**BancafiAssetToken supports 5 asset types:**
+```solidity
+enum AssetType {
+    RealEstate,   // 0
+    Minerals,     // 1
+    OilAndEnergy, // 2
+    Gold,         // 3
+    PhysicalAsset // 4
+}
+```
+
+**Standard workflow:**
+1. `tokenizeAsset()` → Creates ERC721 NFT (status: Pending)
+2. `verifyAsset()` → VERIFIER_ROLE approves (status: Verified)
+3. `fractionalizeAsset()` → Split ownership into shares
+4. `transferFractional()` → Distribute shares to investors
+
+**Fractional ownership tracking:**
+- Each token has `totalFractions` and per-user `fractionalOwnership` mapping
+- Used by BancafiRentalIncome for proportional income distribution
+- Cannot transfer base NFT once fractionalized
+
+### 6. Bailout System Complete Workflow
+
+**Full lifecycle (spans 3 contract interactions):**
+
+1. **Request** (Borrower):
+   ```solidity
+   bailout.requestBailout(amount, reason, proof, collateralTokenId, months)
+   ```
+   - Creates request with status: Pending
+   - Locks collateral NFT (AssetToken status → Locked)
+
+2. **Approve** (DAO or BAILOUT_APPROVER_ROLE):
+   ```solidity
+   bailout.approveBailout(requestId, interestRate)
+   ```
+   - Sets interest rate (basis points, e.g., 500 = 5%)
+   - Status: Pending → Approved
+
+3. **Disburse** (TREASURY_MANAGER_ROLE):
+   ```solidity
+   bailout.disburseBailout(requestId, installmentCount)
+   ```
+   - Calculates total with interest
+   - Creates repayment schedule
+   - Transfers ETH from treasury to borrower
+   - Status: Approved → Disbursed
+
+4. **Repay** (Borrower):
+   ```solidity
+   bailout.repayBailout(requestId) // payable
+   ```
+   - Accepts installment payments
+   - Tracks progress in `repaymentSchedules` mapping
+   - Unlocks collateral when fully repaid
+
+5. **Default Handling** (Automatic):
+   - If payment missed beyond grace period
+   - Collateral NFT transferred to treasury
+   - AssetToken status → Defaulted
+
+### 7. Rental Income Distribution System
+
+**Multi-period tracking architecture:**
+
+```solidity
+struct RentalPeriod {
+    uint256 periodId;
+    uint256 startDate;
+    uint256 endDate;
+    uint256 totalIncome;
+    bool distributed;
+}
+```
+
+**Flow:**
+1. `receiveRentalIncome()` → Receive ETH for a period
+2. `distributeIncome()` → Calculate proportional shares based on fractional ownership
+3. `claimIncome()` → Individual shareholders withdraw their share
+
+**Key constraint:** Must query AssetToken's fractional ownership to calculate shares.
+
+### 8. Institutional Onboarding (KYB System)
+
+**10 Institution Types:**
+Bank, InvestmentFund, HedgeFund, PensionFund, InsuranceCompany, FamilyOffice, Corporation, REIT, SovereignWealthFund, EndowmentFund
+
+**4 Investment Tiers (auto-upgrade based on total invested):**
+- **Standard** (<$1M): $1K-$1M limit, $100K daily
+- **Premium** ($1M-$10M): $1M-$10M limit, $1M daily
+- **Elite** ($10M-$100M): $10M-$100M limit, $10M daily
+- **Institutional** (>$100M): Unlimited, $100M daily
+
+**KYB Workflow:**
+1. `registerInstitution()` → Self-registration (status: Pending)
+2. `uploadKYBDocument()` → Upload compliance docs (IPFS hashes)
+3. `verifyKYBDocument()` → VERIFIER_ROLE approves documents
+4. `verifyInstitution()` → VERIFIER_ROLE approves institution, assigns tier
+5. `addAuthorizedSigner()` → Optional multisig setup
+6. `recordInvestment()` → Track investments, auto-tier upgrades
+
+### 9. DAO Governance Integration
+
+**Proposal creation with metadata tracking:**
+```solidity
+function proposeWithMetadata(
+    address[] memory targets,
+    uint256[] memory values,
+    bytes[] memory calldatas,
+    string memory description,
+    string memory title,
+    bool isBailoutProposal
+) returns (uint256 proposalId)
+```
+
+**Voting parameters (from deployment):**
+- Voting delay: 1 block
+- Voting period: 50,400 blocks (~1 week at 12s blocks)
+- Proposal threshold: 1,000 BGT tokens
+- Quorum: 4% of total supply
+- Timelock delay: 2 days
+
+**Critical:** Must delegate tokens before voting: `governanceToken.delegate(voterAddress)`
+
+## Common Patterns and Fixes
+
+### Stack Too Deep Errors
+If you encounter "Stack too deep" during compilation, the contract is too complex. Solution: ensure `viaIR: true` is set in hardhat.config.js.
+
+### BigInt Serialization in Scripts
+When saving deployment addresses to JSON, wrap chainId in `.toString()`:
+```javascript
+chainId: (await ethers.provider.getNetwork()).chainId.toString()
+```
+
+### Demo Script Pattern
+All demo scripts should:
+1. Get contract addresses (hardcoded or from deployment.json)
+2. Get signers: `const [deployer, user1, user2, ...] = await ethers.getSigners()`
+3. Get contract instances: `await ethers.getContractAt("ContractName", address)`
+4. Execute workflow with clear console logging
+5. Show results with formatted ethers output: `ethers.formatEther(value)`
+
+### Role Management
+When granting roles, always check if already granted to avoid revert:
+```javascript
+const role = await contract.ROLE_NAME();
+if (!await contract.hasRole(role, address)) {
+    await contract.grantRole(role, address);
+}
+```
+
+## Testing Strategy
+
+The system has 7 core contracts with interdependencies. When writing tests:
+
+1. **Unit tests** - Test individual contract functions in isolation
+2. **Integration tests** - Test cross-contract flows (bailout + asset token + DAO)
+3. **Upgrade tests** - Verify UUPS upgrade mechanism preserves state
+4. **Role-based tests** - Verify access control works correctly
+5. **Event tests** - Ensure all state changes emit proper events
+
+## Key Files
+
+- `contracts/core/` - All 7 upgradeable smart contracts
+- `scripts/deploy.js` - Master deployment script (deploys all contracts in order)
+- `scripts/*-demo.js` - Demonstration scripts for different features
+- `hardhat.config.js` - Must have viaIR: true and Solidity 0.8.25
+
+## Security Considerations
+
+Every contract implements:
+- Pausable (emergency stop)
+- ReentrancyGuard (protect state-changing functions)
+- AccessControl (role-based permissions)
+- UUPS upgradeability (admin-controlled upgrades)
+- Comprehensive event emission (audit trail)
+
+**Never:**
+- Skip role checks on sensitive functions
+- Allow upgrades without UPGRADER_ROLE
+- Forget to lock collateral when disbursing bailouts
+- Allow fractional transfers exceeding owned amount

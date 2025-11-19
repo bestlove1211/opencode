@@ -1,0 +1,118 @@
+const { ethers } = require('ethers');
+const { provider, contractAddresses, savingsAccountABI } = require('../config/blockchain');
+const { logger } = require('../utils/logger');
+const { Account, Transaction } = require('../models');
+const { Op } = require('sequelize');
+
+/**
+ * Get global contract statistics
+ */
+exports.getGlobalStats = async (req, res, next) => {
+  try {
+    const savingsContract = new ethers.Contract(
+      contractAddresses.savingsAccount,
+      savingsAccountABI,
+      provider
+    );
+
+    // Get on-chain stats
+    const contractStats = await savingsContract.getContractStats();
+
+    // Get database stats
+    const totalUsers = await Account.count({
+      distinct: true,
+      col: 'userId',
+      where: { isActive: true }
+    });
+
+    const totalTransactions = await Transaction.count();
+
+    const recentTransactions = await Transaction.count({
+      where: {
+        timestamp: {
+          [Op.gte]: new Date(Date.now() - 24 * 60 * 60 * 1000) // Last 24 hours
+        }
+      }
+    });
+
+    res.json({
+      onChain: {
+        totalDeposits: contractStats.totalDeposits_.toString(),
+        totalInterestPaid: contractStats.totalInterestPaid_.toString(),
+        totalAccounts: contractStats.totalAccounts_.toString()
+      },
+      offChain: {
+        totalUsers,
+        totalTransactions,
+        recentTransactions24h: recentTransactions
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Error getting global stats:', error);
+    next(error);
+  }
+};
+
+/**
+ * Get current APY rates
+ */
+exports.getCurrentAPY = async (req, res, next) => {
+  try {
+    const savingsContract = new ethers.Contract(
+      contractAddresses.savingsAccount,
+      savingsAccountABI,
+      provider
+    );
+
+    const baseAPY = await savingsContract.baseAPY();
+    const bonusAPY = await savingsContract.bonusAPY();
+    const bonusThreshold = await savingsContract.bonusThreshold();
+
+    res.json({
+      baseAPY: {
+        bps: baseAPY.toString(),
+        percentage: (Number(baseAPY) / 100).toFixed(2) + '%'
+      },
+      bonusAPY: {
+        bps: bonusAPY.toString(),
+        percentage: (Number(bonusAPY) / 100).toFixed(2) + '%'
+      },
+      maxAPY: {
+        bps: (Number(baseAPY) + Number(bonusAPY)).toString(),
+        percentage: ((Number(baseAPY) + Number(bonusAPY)) / 100).toFixed(2) + '%'
+      },
+      bonusThreshold: {
+        seconds: bonusThreshold.toString(),
+        days: Math.floor(Number(bonusThreshold) / (24 * 60 * 60))
+      }
+    });
+  } catch (error) {
+    logger.error('Error getting APY:', error);
+    next(error);
+  }
+};
+
+/**
+ * Get supported tokens list
+ */
+exports.getSupportedTokens = async (req, res, next) => {
+  try {
+    // In a real implementation, you would query the contract for supported tokens
+    // For now, we'll return unique tokens from the database
+    const tokens = await Account.findAll({
+      attributes: ['tokenAddress', 'chainId'],
+      group: ['tokenAddress', 'chainId']
+    });
+
+    res.json({
+      supportedTokens: tokens.map(t => ({
+        tokenAddress: t.tokenAddress,
+        chainId: t.chainId
+      }))
+    });
+  } catch (error) {
+    logger.error('Error getting supported tokens:', error);
+    next(error);
+  }
+};

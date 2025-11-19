@@ -1,0 +1,399 @@
+/**
+ * useWallet Hook
+ * React hook for Bancafi wallet integration
+ */
+
+import { useState, useEffect, useCallback, createContext, useContext } from 'react';
+import { ethers } from 'ethers';
+import {
+  BancafiWalletConnector,
+  WalletProvider,
+  WalletConnection,
+  WalletProfile,
+  WalletType,
+  MultiSigConfig,
+  BatchTransaction,
+} from '../lib/walletConnectors';
+
+interface WalletContextType {
+  connection: WalletConnection | null;
+  isConnected: boolean;
+  isLoading: boolean;
+  error: string | null;
+  profile: WalletProfile | null;
+  multiSigConfig: MultiSigConfig | null;
+  connect: (provider: WalletProvider) => Promise<void>;
+  disconnect: () => void;
+  registerWallet: (walletType: WalletType, metadata: string) => Promise<void>;
+  configureMultiSig: (signers: string[], requiredSignatures: number, timeout: number) => Promise<void>;
+  refreshProfile: () => Promise<void>;
+  createBatch: (targets: string[], calldatas: string[], values: string[], deadline: number) => Promise<number>;
+  approveBatch: (batchId: number) => Promise<void>;
+  executeBatch: (batchId: number) => Promise<void>;
+  cancelBatch: (batchId: number) => Promise<void>;
+  getBatches: () => Promise<number[]>;
+  addDelegate: (delegate: string, canTransact: boolean, canApprove: boolean, duration: number) => Promise<void>;
+  revokeDelegate: (delegate: string) => Promise<void>;
+  getDelegates: () => Promise<string[]>;
+}
+
+const WalletContext = createContext<WalletContextType | undefined>(undefined);
+
+export function WalletProvider({ children, walletIntegrationAddress, walletIntegrationABI }: {
+  children: React.ReactNode;
+  walletIntegrationAddress: string;
+  walletIntegrationABI: any[];
+}) {
+  const [connector] = useState(() => new BancafiWalletConnector(walletIntegrationAddress, walletIntegrationABI));
+  const [connection, setConnection] = useState<WalletConnection | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [profile, setProfile] = useState<WalletProfile | null>(null);
+  const [multiSigConfig, setMultiSigConfig] = useState<MultiSigConfig | null>(null);
+
+  // Check for existing connection on mount
+  useEffect(() => {
+    checkExistingConnection();
+  }, []);
+
+  const checkExistingConnection = async () => {
+    try {
+      if (typeof window !== 'undefined' && (window as any).ethereum) {
+        const accounts = await (window as any).ethereum.request({
+          method: 'eth_accounts'
+        });
+
+        if (accounts.length > 0) {
+          // Auto-connect to MetaMask if already authorized
+          await connect(WalletProvider.METAMASK);
+        }
+      }
+    } catch (err) {
+      console.error('Error checking existing connection:', err);
+    }
+  };
+
+  const connect = useCallback(async (provider: WalletProvider) => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      let newConnection: WalletConnection;
+
+      switch (provider) {
+        case WalletProvider.METAMASK:
+          newConnection = await connector.connectMetaMask();
+          break;
+        case WalletProvider.WALLET_CONNECT:
+          newConnection = await connector.connectWalletConnect();
+          break;
+        case WalletProvider.COINBASE_WALLET:
+          newConnection = await connector.connectCoinbaseWallet();
+          break;
+        case WalletProvider.GNOSIS_SAFE:
+          // Would need Safe address
+          throw new Error('Gnosis Safe requires additional configuration');
+        default:
+          throw new Error('Unsupported provider');
+      }
+
+      setConnection(newConnection);
+
+      // Try to load profile
+      try {
+        const walletProfile = await connector.getWalletProfile();
+        setProfile(walletProfile);
+
+        // Load multi-sig config if applicable
+        if (walletProfile.walletType === WalletType.MULTISIG) {
+          const config = await connector.getMultiSigConfig();
+          setMultiSigConfig(config);
+        }
+      } catch (err) {
+        // Profile doesn't exist yet - that's ok
+        console.log('No profile found - wallet needs registration');
+      }
+
+    } catch (err: any) {
+      setError(err.message || 'Failed to connect wallet');
+      console.error('Wallet connection error:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connector]);
+
+  const disconnect = useCallback(() => {
+    connector.disconnect();
+    setConnection(null);
+    setProfile(null);
+    setMultiSigConfig(null);
+    setError(null);
+  }, [connector]);
+
+  const registerWallet = useCallback(async (walletType: WalletType, metadata: string) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.registerWallet(walletType, metadata);
+      await tx.wait();
+
+      // Refresh profile
+      await refreshProfile();
+    } catch (err: any) {
+      setError(err.message || 'Failed to register wallet');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const configureMultiSig = useCallback(async (
+    signers: string[],
+    requiredSignatures: number,
+    timeout: number
+  ) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.configureMultiSig(signers, requiredSignatures, timeout);
+      await tx.wait();
+
+      // Refresh config
+      const config = await connector.getMultiSigConfig();
+      setMultiSigConfig(config);
+    } catch (err: any) {
+      setError(err.message || 'Failed to configure multi-sig');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const refreshProfile = useCallback(async () => {
+    if (!connection) return;
+
+    try {
+      const walletProfile = await connector.getWalletProfile();
+      setProfile(walletProfile);
+
+      if (walletProfile.walletType === WalletType.MULTISIG) {
+        const config = await connector.getMultiSigConfig();
+        setMultiSigConfig(config);
+      }
+    } catch (err) {
+      console.error('Error refreshing profile:', err);
+    }
+  }, [connection, connector]);
+
+  const createBatch = useCallback(async (
+    targets: string[],
+    calldatas: string[],
+    values: string[],
+    deadline: number
+  ): Promise<number> => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.createBatchTransaction(targets, calldatas, values, deadline);
+      const receipt = await tx.wait();
+
+      // Extract batch ID from event
+      const event = receipt.events?.find(e => e.event === 'BatchTransactionCreated');
+      const batchId = event?.args?.batchId.toNumber();
+
+      return batchId;
+    } catch (err: any) {
+      setError(err.message || 'Failed to create batch');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const approveBatch = useCallback(async (batchId: number) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.approveBatchTransaction(batchId);
+      await tx.wait();
+    } catch (err: any) {
+      setError(err.message || 'Failed to approve batch');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const executeBatch = useCallback(async (batchId: number) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.executeBatchTransaction(batchId);
+      await tx.wait();
+    } catch (err: any) {
+      setError(err.message || 'Failed to execute batch');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const cancelBatch = useCallback(async (batchId: number) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.cancelBatchTransaction(batchId);
+      await tx.wait();
+    } catch (err: any) {
+      setError(err.message || 'Failed to cancel batch');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const getBatches = useCallback(async (): Promise<number[]> => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    return await connector.getWalletBatches();
+  }, [connection, connector]);
+
+  const addDelegate = useCallback(async (
+    delegate: string,
+    canTransact: boolean,
+    canApprove: boolean,
+    duration: number
+  ) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.addDelegate(delegate, canTransact, canApprove, duration);
+      await tx.wait();
+    } catch (err: any) {
+      setError(err.message || 'Failed to add delegate');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const revokeDelegate = useCallback(async (delegate: string) => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const tx = await connector.revokeDelegate(delegate);
+      await tx.wait();
+    } catch (err: any) {
+      setError(err.message || 'Failed to revoke delegate');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [connection, connector]);
+
+  const getDelegates = useCallback(async (): Promise<string[]> => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    return await connector.getWalletDelegates();
+  }, [connection, connector]);
+
+  const value: WalletContextType = {
+    connection,
+    isConnected: connection !== null,
+    isLoading,
+    error,
+    profile,
+    multiSigConfig,
+    connect,
+    disconnect,
+    registerWallet,
+    configureMultiSig,
+    refreshProfile,
+    createBatch,
+    approveBatch,
+    executeBatch,
+    cancelBatch,
+    getBatches,
+    addDelegate,
+    revokeDelegate,
+    getDelegates,
+  };
+
+  return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
+}
+
+export function useWallet() {
+  const context = useContext(WalletContext);
+  if (context === undefined) {
+    throw new Error('useWallet must be used within a WalletProvider');
+  }
+  return context;
+}
+
+// Additional hook for wallet-specific utilities
+export function useWalletUtils() {
+  const { connection } = useWallet();
+
+  const shortenAddress = useCallback((address: string, chars = 4): string => {
+    return `${address.substring(0, chars + 2)}...${address.substring(42 - chars)}`;
+  }, []);
+
+  const formatBalance = useCallback((balance: ethers.BigNumber, decimals = 18, displayDecimals = 4): string => {
+    return parseFloat(ethers.utils.formatUnits(balance, decimals)).toFixed(displayDecimals);
+  }, []);
+
+  const getBalance = useCallback(async (): Promise<ethers.BigNumber> => {
+    if (!connection) throw new Error('Wallet not connected');
+    return await connection.provider.getBalance(connection.address);
+  }, [connection]);
+
+  const getTokenBalance = useCallback(async (tokenAddress: string): Promise<ethers.BigNumber> => {
+    if (!connection) throw new Error('Wallet not connected');
+
+    const tokenABI = ['function balanceOf(address) view returns (uint256)'];
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      tokenABI,
+      connection.provider
+    );
+
+    return await tokenContract.balanceOf(connection.address);
+  }, [connection]);
+
+  const signMessage = useCallback(async (message: string): Promise<string> => {
+    if (!connection) throw new Error('Wallet not connected');
+    return await connection.signer.signMessage(message);
+  }, [connection]);
+
+  return {
+    shortenAddress,
+    formatBalance,
+    getBalance,
+    getTokenBalance,
+    signMessage,
+  };
+}

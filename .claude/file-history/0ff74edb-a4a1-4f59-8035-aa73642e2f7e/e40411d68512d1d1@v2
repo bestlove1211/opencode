@@ -1,0 +1,57 @@
+name: Deploy to Testnet
+
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: 'Network to deploy to'
+        required: true
+        default: 'sepolia'
+        type: choice
+        options:
+          - sepolia
+          - goerli
+          - mumbai
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Compile contracts
+      run: npx hardhat compile
+
+    - name: Run tests
+      run: npx hardhat test
+
+    - name: Deploy to ${{ inputs.network }}
+      env:
+        PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+        SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+        ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+      run: npx hardhat run scripts/deploy.js --network ${{ inputs.network }}
+
+    - name: Archive deployment
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-${{ inputs.network }}
+        path: deployments/
+
+    - name: Create deployment summary
+      run: |
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "Network: ${{ inputs.network }}" >> $GITHUB_STEP_SUMMARY
+        echo "Timestamp: $(date)" >> $GITHUB_STEP_SUMMARY
+        cat deployments/${{ inputs.network }}.json >> $GITHUB_STEP_SUMMARY

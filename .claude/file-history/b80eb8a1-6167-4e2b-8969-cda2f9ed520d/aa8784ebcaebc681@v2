@@ -1,0 +1,865 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Bancafi is a comprehensive DeFi platform for tokenizing real-world assets (RWA) with DAO-governed emergency bailout mechanisms. The system includes **18 interconnected contracts** (15 core + 3 enhancements) providing complete ecosystem functionality:
+
+**Core Features:**
+- Asset tokenization & fractionalization (5 asset types)
+- DAO governance with timelock control
+- Emergency bailout system with collateral
+- Rental income distribution
+- Institutional & individual KYC/KYB onboarding
+- Secondary marketplace with escrow
+- AMM liquidity pools for fractional trading
+- Chainlink oracle integration for price feeds
+- Governance token staking with voting power multipliers
+- Insurance policies for investor protection
+- Token vesting with industry-standard schedules
+- Multi-sig treasury with budget management
+
+**Enhancement Features:**
+- Chainlink Automation for automatic oracle updates
+- Emergency Coordinator for one-click system-wide pause
+- On-chain Analytics for TVL calculation and health scoring
+
+**Token Economics:**
+- Governance Token (BGT): 2,000,000 total supply
+- Maximum Bailout: 10,000,000 BGT tokens
+
+## Essential Commands
+
+```bash
+# Compile contracts (uses IR-based compiler for complex contracts)
+npx hardhat compile
+
+# Run local development node (in background)
+npx hardhat node
+
+# Deploy all 15 core contracts
+npx hardhat run scripts/deploy-all.js --network localhost
+
+# Deploy 3 enhancement contracts (after core deployment)
+npx hardhat run scripts/deploy-enhancements.js --network localhost
+
+# Validate enhancements before deployment
+npx hardhat run scripts/validate-enhancements.js --network localhost
+
+# Deploy to Sepolia testnet (requires .env with PRIVATE_KEY)
+npx hardhat run scripts/deploy-all.js --network sepolia
+npx hardhat run scripts/deploy-enhancements.js --network sepolia
+
+# Deploy only core 7 contracts
+npx hardhat run scripts/deploy.js --network localhost
+
+# Run demo scripts (requires node running on localhost:8545)
+npx hardhat run scripts/institutional-demo.js --network localhost
+npx hardhat run scripts/enhanced-features-demo.js --network localhost
+npx hardhat run scripts/real-estate-demo.js --network localhost
+
+# Grant governance roles to DAO
+npx hardhat run scripts/grant-governance-roles.js --network localhost
+
+# Run tests
+npx hardhat test
+
+# Run specific test suites
+npx hardhat test test/unit/AssetToken.test.js
+npx hardhat test test/integration/BailoutWorkflow.test.js
+npx hardhat test test/economic/AMM.test.js
+```
+
+## Critical Architecture Patterns
+
+### 1. UUPS Upgradeable Proxy Pattern
+
+**All contracts use UUPS (Universal Upgradeable Proxy Standard):**
+
+- Every contract inherits from `UUPSUpgradeable`
+- Constructor MUST call `_disableInitializers()` to prevent initialization of implementation
+- Use `initialize()` function instead of constructor for setup
+- Deployment uses `upgrades.deployProxy()` from `@openzeppelin/hardhat-upgrades`
+- Only addresses with `UPGRADER_ROLE` can upgrade contracts
+
+**Example pattern:**
+```solidity
+contract MyContract is Initializable, UUPSUpgradeable {
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __UUPSUpgradeable_init();
+        // initialization logic
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+```
+
+### 2. Contract Interdependencies
+
+**Deployment order (15 contracts total):**
+
+**CORE CONTRACTS (7):**
+1. **BancafiGovernanceToken** (standalone, BGT token)
+2. **BancafiTimelock** (non-upgradeable wrapper, requires deployer address)
+3. **BancafiDAO** (requires: governance token, timelock)
+4. **BancafiAssetToken** (standalone, ERC721 for RWA)
+5. **BancafiBailout** (integrates with AssetToken for collateral)
+6. **BancafiRentalIncome** (requires: AssetToken for fractional ownership)
+7. **BancafiInstitutional** (standalone KYB system)
+
+**ADVANCED CONTRACTS (8):**
+8. **BancafiKYC** (standalone, individual investor verification)
+9. **BancafiMarketplace** (requires: AssetToken for trading)
+10. **BancafiLiquidityPool** (requires: AssetToken for AMM)
+11. **BancafiOracle** (standalone, Chainlink integration)
+12. **BancafiStaking** (requires: GovernanceToken for staking & rewards)
+13. **BancafiInsurance** (standalone, policy & claim management)
+14. **BancafiVesting** (requires: GovernanceToken for vesting schedules)
+15. **BancafiTreasury** (standalone, multi-sig treasury)
+
+**Post-deployment role configuration required:**
+- Grant DAO the `PROPOSER_ROLE` and `EXECUTOR_ROLE` on Timelock
+- Grant DAO the `BAILOUT_APPROVER_ROLE` on Bailout contract
+- Self-delegate governance tokens for voting (`.delegate(address)`)
+
+### 3. OpenZeppelin 5.0 Specific Changes
+
+**Critical differences from OZ 4.x that were fixed:**
+
+- `Pausable` and `ReentrancyGuard` moved from `security/` to `utils/`
+- `Counters` library deprecated → use plain `uint256` with increment
+- `IVotesUpgradeable` doesn't exist → use `IVotes` from non-upgradeable
+- ERC721 `_beforeTokenTransfer` deprecated → use `_update` hook
+- GovernorSettings requires explicit type casting: `uint48()`, `uint32()`
+- ERC20Votes requires `__EIP712_init(name, "1")` in initialize function
+
+**Import pattern:**
+```solidity
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts/governance/utils/IVotes.sol"; // Non-upgradeable!
+```
+
+### 4. Hardhat Configuration Requirements
+
+**The config MUST include:**
+
+```javascript
+solidity: {
+  version: "0.8.25",
+  settings: {
+    optimizer: { enabled: true, runs: 200 },
+    viaIR: true,  // CRITICAL: Required for complex contracts to avoid stack-too-deep
+    evmVersion: "cancun"
+  }
+}
+```
+
+`viaIR: true` is essential - without it, contracts like BancafiInstitutional will fail with "Stack too deep" errors.
+
+### 5. Asset Tokenization Flow
+
+**BancafiAssetToken supports 5 asset types:**
+```solidity
+enum AssetType {
+    RealEstate,   // 0
+    Minerals,     // 1
+    OilAndEnergy, // 2
+    Gold,         // 3
+    PhysicalAsset // 4
+}
+```
+
+**Standard workflow:**
+1. `tokenizeAsset()` → Creates ERC721 NFT (status: Pending)
+2. `verifyAsset()` → VERIFIER_ROLE approves (status: Verified)
+3. `fractionalizeAsset()` → Split ownership into shares
+4. `transferFractional()` → Distribute shares to investors
+
+**Fractional ownership tracking:**
+- Each token has `totalFractions` and per-user `fractionalOwnership` mapping
+- Used by BancafiRentalIncome for proportional income distribution
+- Cannot transfer base NFT once fractionalized
+
+### 6. Bailout System Complete Workflow
+
+**Full lifecycle (spans 3 contract interactions):**
+
+1. **Request** (Borrower):
+   ```solidity
+   bailout.requestBailout(amount, reason, proof, collateralTokenId, months)
+   ```
+   - Creates request with status: Pending
+   - Locks collateral NFT (AssetToken status → Locked)
+
+2. **Approve** (DAO or BAILOUT_APPROVER_ROLE):
+   ```solidity
+   bailout.approveBailout(requestId, interestRate)
+   ```
+   - Sets interest rate (basis points, e.g., 500 = 5%)
+   - Status: Pending → Approved
+
+3. **Disburse** (TREASURY_MANAGER_ROLE):
+   ```solidity
+   bailout.disburseBailout(requestId, installmentCount)
+   ```
+   - Calculates total with interest
+   - Creates repayment schedule
+   - Transfers ETH from treasury to borrower
+   - Status: Approved → Disbursed
+
+4. **Repay** (Borrower):
+   ```solidity
+   bailout.repayBailout(requestId) // payable
+   ```
+   - Accepts installment payments
+   - Tracks progress in `repaymentSchedules` mapping
+   - Unlocks collateral when fully repaid
+
+5. **Default Handling** (Automatic):
+   - If payment missed beyond grace period
+   - Collateral NFT transferred to treasury
+   - AssetToken status → Defaulted
+
+### 7. Rental Income Distribution System
+
+**Multi-period tracking architecture:**
+
+```solidity
+struct RentalPeriod {
+    uint256 periodId;
+    uint256 startDate;
+    uint256 endDate;
+    uint256 totalIncome;
+    bool distributed;
+}
+```
+
+**Flow:**
+1. `receiveRentalIncome()` → Receive ETH for a period
+2. `distributeIncome()` → Calculate proportional shares based on fractional ownership
+3. `claimIncome()` → Individual shareholders withdraw their share
+
+**Key constraint:** Must query AssetToken's fractional ownership to calculate shares.
+
+### 8. Institutional Onboarding (KYB System)
+
+**10 Institution Types:**
+Bank, InvestmentFund, HedgeFund, PensionFund, InsuranceCompany, FamilyOffice, Corporation, REIT, SovereignWealthFund, EndowmentFund
+
+**4 Investment Tiers (auto-upgrade based on total invested):**
+- **Standard** (<$1M): $1K-$1M limit, $100K daily
+- **Premium** ($1M-$10M): $1M-$10M limit, $1M daily
+- **Elite** ($10M-$100M): $10M-$100M limit, $10M daily
+- **Institutional** (>$100M): Unlimited, $100M daily
+
+**KYB Workflow:**
+1. `registerInstitution()` → Self-registration (status: Pending)
+2. `uploadKYBDocument()` → Upload compliance docs (IPFS hashes)
+3. `verifyKYBDocument()` → VERIFIER_ROLE approves documents
+4. `verifyInstitution()` → VERIFIER_ROLE approves institution, assigns tier
+5. `addAuthorizedSigner()` → Optional multisig setup
+6. `recordInvestment()` → Track investments, auto-tier upgrades
+
+### 9. DAO Governance Integration
+
+**Proposal creation with metadata tracking:**
+```solidity
+function proposeWithMetadata(
+    address[] memory targets,
+    uint256[] memory values,
+    bytes[] memory calldatas,
+    string memory description,
+    string memory title,
+    bool isBailoutProposal
+) returns (uint256 proposalId)
+```
+
+**Voting parameters (from deployment):**
+- Voting delay: 1 block
+- Voting period: 50,400 blocks (~1 week at 12s blocks)
+- Proposal threshold: 1,000 BGT tokens
+- Quorum: 4% of total supply
+- Timelock delay: 2 days
+
+**Critical:** Must delegate tokens before voting: `governanceToken.delegate(voterAddress)`
+
+### 10. Individual KYC System (BancafiKYC)
+
+**4 Investment Tiers (auto-upgrade based on total invested):**
+- **Basic** (<$10K): $10K max, $1K daily limit
+- **Standard** ($10K-$50K): $50K max, $10K daily limit
+- **Premium** ($50K-$250K): $250K max, $50K daily limit
+- **Accredited** (>$250K): Unlimited, $1M daily limit
+
+**KYC Workflow:**
+```solidity
+1. registerUser() → Self-registration (status: Pending)
+2. uploadDocument() → Submit KYC documents (IPFS hashes)
+3. verifyDocument() → VERIFIER_ROLE approves documents
+4. verifyUser() → VERIFIER_ROLE approves user, assigns tier
+5. recordInvestment() → Track investments, auto-tier upgrades
+6. checkInvestmentLimits() → Validate against daily/total limits
+```
+
+**Key Features:**
+- Document upload with IPFS hash storage
+- Individual document verification
+- Automatic tier upgrades when investment thresholds reached
+- Daily and total investment limit enforcement
+- Rejection tracking with reasons
+
+### 11. Secondary Marketplace (BancafiMarketplace)
+
+**Trading fractionalized asset shares:**
+
+```solidity
+enum ListingType { Sale, Auction }
+enum ListingStatus { Active, Sold, Cancelled, Expired }
+```
+
+**Complete workflow:**
+1. `createListing(tokenId, fractions, price, duration, type)` → List fractions for sale/auction
+2. `buyListing(listingId)` → Direct purchase (Sale type)
+3. `makeOffer(listingId, fractions, price, duration)` → Submit offer (Auction type)
+4. `acceptOffer(listingId, offerId)` → Seller accepts offer
+5. `cancelListing(listingId)` → Seller cancels listing
+
+**Escrow System:**
+- Platform fee: 250 basis points (2.5%)
+- Automatic fractional ownership transfer via AssetToken
+- ETH held in escrow during active listings/offers
+- Refunds on cancellation
+
+**Key constraint:** Must have sufficient fractional ownership in AssetToken
+
+### 12. AMM Liquidity Pools (BancafiLiquidityPool)
+
+**Constant product AMM (x * y = k) for fractional shares:**
+
+```solidity
+struct Pool {
+    uint256 tokenId;
+    uint256 fractionsReserve;
+    uint256 ethReserve;
+    uint256 totalLPTokens;
+    bool active;
+}
+```
+
+**Complete workflow:**
+1. `createPool(tokenId, fractionsAmount)` → payable, creates new pool
+2. `addLiquidity(poolId, fractionsAmount)` → payable, mint LP tokens
+3. `swapETHForFractions(poolId, minFractionsOut)` → payable, buy fractions
+4. `swapFractionsForETH(poolId, fractionsIn, minETHOut)` → sell fractions
+5. `removeLiquidity(poolId, lpTokensAmount)` → burn LP tokens, withdraw
+
+**AMM Formula:**
+```solidity
+amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
+// 0.3% fee built into formula
+```
+
+**LP Token Tracking:**
+- Per-user LP token balance stored in `userLPTokens[poolId][user]`
+- Proportional share of pool reserves
+- Fee accumulation benefits all LP holders
+
+### 13. Chainlink Oracle Integration (BancafiOracle)
+
+**Price feeds for 5 asset types with staleness detection:**
+
+```solidity
+enum AssetType {
+    RealEstate,   // 30 day staleness threshold
+    Minerals,     // 7 day threshold
+    OilAndEnergy, // 1 day threshold
+    Gold,         // 1 day threshold
+    PhysicalAsset // 14 day threshold
+}
+
+enum PriceSource { Chainlink, Manual, Aggregated }
+```
+
+**Complete workflow:**
+1. `initializeAssetWithChainlink(tokenId, assetType, chainlinkFeed, threshold)` → Setup Chainlink feed
+2. `initializeAssetManual(tokenId, assetType, initialPrice, threshold)` → Manual price setup
+3. `updatePriceFromChainlink(tokenId)` → Fetch latest Chainlink price
+4. `updatePriceManual(tokenId, newPrice)` → ORACLE_ROLE updates manually
+5. `checkStaleness(tokenId)` → Mark price as stale if threshold exceeded
+6. `getPrice(tokenId)` → Get current price (reverts if stale)
+
+**Chainlink Integration:**
+```solidity
+interface AggregatorV3Interface {
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+}
+```
+
+**Price normalization:** All prices normalized to 18 decimals regardless of Chainlink feed decimals
+
+**Staleness protection:**
+- Default thresholds per asset type
+- Custom thresholds per token
+- Max price age: 24 hours for Chainlink data
+
+### 14. Governance Token Staking (BancafiStaking)
+
+**5 lock periods with voting power multipliers:**
+
+```solidity
+enum LockPeriod {
+    None,        // No lock - 1x multiplier (10000 basis points)
+    ThreeMonths, // 90 days - 1.5x multiplier (15000 bp)
+    SixMonths,   // 180 days - 2x multiplier (20000 bp)
+    OneYear,     // 365 days - 3x multiplier (30000 bp)
+    TwoYears     // 730 days - 5x multiplier (50000 bp)
+}
+```
+
+**Reward system (MasterChef-style):**
+```solidity
+struct StakeInfo {
+    uint256 amount;           // BGT staked
+    uint256 stakedAt;         // Timestamp
+    uint256 unlockTime;       // When lock expires
+    LockPeriod lockPeriod;    // Lock tier
+    uint256 rewardDebt;       // Reward tracking
+    uint256 votingPower;      // amount * multiplier
+    uint256 totalRewardsClaimed;
+    bool active;
+}
+```
+
+**Complete workflow:**
+1. `stake(amount, lockPeriod)` → Lock BGT tokens, get voting power
+2. `claimRewards(stakeId)` → Claim accumulated rewards for specific stake
+3. `claimAllRewards()` → Claim from all active stakes
+4. `unstake(stakeId)` → Withdraw stake (penalty if before unlock)
+5. `emergencyWithdraw(stakeId)` → Forfeit rewards, withdraw immediately
+
+**Reward calculation:**
+- `rewardsPerSecond` configurable by REWARD_MANAGER_ROLE
+- Proportional distribution based on voting power
+- Early unstake penalty: 20% (configurable, max 50%)
+
+**Voting power integration:** Longer locks = higher governance influence
+
+### 15. Insurance System (BancafiInsurance)
+
+**Policy & claim management for investor protection:**
+
+```solidity
+enum ClaimType {
+    BailoutDefault,    // Borrower defaulted on bailout
+    AssetDevaluation,  // Asset value dropped significantly
+    Fraud,             // Fraudulent asset representation
+    Other
+}
+
+enum ClaimStatus {
+    Submitted,  // Initial state
+    UnderReview,
+    Approved,
+    Rejected,
+    Paid
+}
+```
+
+**Complete workflow:**
+1. `createPolicy(tokenId, coverageAmount, duration)` → payable, buy insurance
+   - Premium: `(coverageAmount * 5% annually * duration) / 365 days`
+   - Max coverage: 100,000 ETH per asset
+   - Min duration: 30 days
+2. `submitClaim(policyId, claimType, claimAmount)` → File claim
+3. `processClaim(claimId, approve, approvedAmount)` → CLAIMS_MANAGER_ROLE decides
+4. `payClaim(claimId)` → Transfer approved amount to claimant
+
+**Pool management:**
+```solidity
+struct PoolStats {
+    uint256 totalPremiums;     // All-time premiums collected
+    uint256 totalClaims;       // All-time claims paid
+    uint256 activeBalance;     // Current pool balance
+    uint256 activePolicies;    // Count of active policies
+}
+```
+
+**Key features:**
+- Premium rate: 500 basis points (5% annually)
+- Pool contributions from premiums
+- Partial claim approval support
+- Policy expiration tracking
+
+### 16. Token Vesting (BancafiVesting)
+
+**Industry-standard vesting schedules with 8 predefined categories:**
+
+```solidity
+enum VestingCategory {
+    Team,           // 4 years, 1 year cliff, monthly
+    Advisors,       // 3 years, 6 months cliff, monthly
+    SeedInvestors,  // 2 years, 12 months cliff, monthly
+    PrivateSale,    // 18 months, 6 months cliff, monthly
+    PublicSale,     // 12 months, 3 months cliff, monthly
+    Strategic,      // 3 years, 9 months cliff, quarterly
+    Ecosystem,      // 5 years, no cliff, monthly
+    Custom          // Custom parameters
+}
+```
+
+**Vesting schedule details:**
+```solidity
+struct VestingSchedule {
+    address beneficiary;
+    uint256 totalAmount;        // Total BGT tokens
+    uint256 startTime;          // Vesting start
+    uint256 cliffDuration;      // Time before first release
+    uint256 vestingDuration;    // Total vesting period
+    uint256 releaseInterval;    // Monthly/quarterly
+    uint256 releasedAmount;     // Amount claimed so far
+    VestingCategory category;
+    bool revocable;             // Can admin revoke?
+    bool revoked;
+}
+```
+
+**Complete workflow:**
+1. `createVestingSchedule(beneficiary, amount, category)` → Create schedule (predefined params)
+2. `createCustomVestingSchedule(...)` → Custom parameters
+3. `releaseTokens(scheduleId)` → Beneficiary claims vested tokens
+4. `revokeVestingSchedule(scheduleId)` → ADMIN revokes if revocable
+5. `getVestedAmount(scheduleId)` → Calculate currently vested amount
+
+**Release calculation:**
+```solidity
+If before cliff: 0
+If after vesting end: totalAmount - releasedAmount
+Otherwise: (totalAmount * elapsedIntervals) / totalIntervals - releasedAmount
+```
+
+**Key features:**
+- Linear vesting within intervals
+- Cliff period before any release
+- Revocable vs non-revocable schedules
+- Multiple schedules per beneficiary supported
+
+### 17. Multi-Sig Treasury (BancafiTreasury)
+
+**Budget-based spending with multi-signature approval:**
+
+```solidity
+enum BudgetCategory {
+    Development,   // Engineering, audits
+    Marketing,     // Community, PR
+    Operations,    // Infrastructure, legal
+    Partnerships,  // Integrations
+    Grants,        // Ecosystem funding
+    Bailouts,      // Emergency funds
+    Insurance,     // Reserve pool
+    Reserves,      // Long-term holdings
+    Other
+}
+```
+
+**Spending proposal system:**
+```solidity
+struct SpendingProposal {
+    uint256 proposalId;
+    address proposer;          // TREASURER_ROLE member
+    address recipient;
+    uint256 amount;
+    address token;             // address(0) for ETH
+    BudgetCategory category;
+    string description;
+    ProposalStatus status;     // Pending/Approved/Rejected/Executed
+    uint256 approvalCount;
+    mapping(address => bool) approvals;
+}
+```
+
+**Complete workflow:**
+1. `allocateBudget(category, amount)` → BUDGET_MANAGER_ROLE sets budget
+2. `createProposal(recipient, amount, token, category, description)` → TREASURER creates proposal
+3. `approveProposal(proposalId)` → TREASURER members approve (requires threshold)
+4. Auto-executes when `approvalCount >= requiredApprovals` (default: 2)
+5. Budget automatically deducted on execution
+
+**Configuration:**
+- Required approvals: 2 (configurable)
+- Proposal expiry: 7 days
+- Max single spend: 100,000 ETH (configurable)
+
+**Emergency functions:**
+- `emergencyWithdraw(recipient, amount)` → DEFAULT_ADMIN_ROLE only
+- `withdrawToken(token, recipient, amount)` → ERC20 withdrawal
+
+**Treasury stats tracking:**
+```solidity
+struct TreasuryStats {
+    uint256 totalETHReceived;
+    uint256 totalETHSpent;
+    uint256 totalProposals;
+    uint256 executedProposals;
+    uint256 currentETHBalance;
+}
+```
+
+### 18. Chainlink Automation (BancafiAutomation)
+
+**Automatic oracle price updates using Chainlink Keepers:**
+
+```solidity
+enum AutomationStatus { Active, Paused, Inactive }
+```
+
+**Complete workflow:**
+1. `addTrackedAsset(tokenId)` → Add asset to automation monitoring
+2. `checkUpkeep()` → Chainlink calls this to check if update needed
+3. `performUpkeep(performData)` → Chainlink calls this to execute updates
+4. `removeTrackedAsset(tokenId)` → Stop monitoring an asset
+
+**Automation configuration:**
+- `updateInterval`: Minimum time between updates (default: 3600s / 1 hour)
+- `maxAssetsPerUpkeep`: Batch size limit (default: 10)
+- `stalenessBuffer`: Extra time before marking stale (default: 300s)
+
+**Keeper integration:**
+```solidity
+function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory performData) {
+    // Returns assets that need updating
+}
+
+function performUpkeep(bytes calldata performData) external {
+    // Updates prices for assets via Oracle
+}
+```
+
+**Key features:**
+- Compatible with Chainlink Automation/Keepers
+- Batch processing for gas efficiency
+- Automatic staleness detection
+- Configurable update intervals per asset
+
+### 19. Emergency Coordinator (BancafiEmergencyCoordinator)
+
+**System-wide emergency pause/unpause coordinator:**
+
+```solidity
+enum ContractType {
+    AssetToken, Bailout, RentalIncome, Institutional,
+    KYC, Marketplace, LiquidityPool, Oracle,
+    Staking, Insurance, Vesting, Treasury
+}
+
+struct ManagedContract {
+    address contractAddress;
+    ContractType contractType;
+    string name;
+    bool isActive;
+    uint256 addedAt;
+}
+```
+
+**Complete workflow:**
+1. `registerContract(contractAddress, contractType, name)` → Add contract to emergency management
+2. `pauseAll()` → Pause all registered contracts at once (EMERGENCY_ROLE)
+3. `unpauseAll()` → Unpause all contracts (EMERGENCY_ROLE)
+4. `pauseContract(contractAddress)` → Pause single contract
+5. `unpauseContract(contractAddress)` → Unpause single contract
+6. `getSystemStatus()` → Get pause status of all contracts
+
+**Emergency events:**
+```solidity
+event EmergencyPauseActivated(address indexed triggeredBy, uint256 timestamp);
+event SystemResumed(address indexed triggeredBy, uint256 timestamp);
+event ContractRegistered(address indexed contractAddress, ContractType contractType);
+```
+
+**Use cases:**
+- Security incident response (pause entire system)
+- Coordinated maintenance windows
+- Individual contract emergency stops
+- System-wide health monitoring
+
+**Key constraint:** Registered contracts must implement IPausable interface
+
+### 20. On-Chain Analytics (BancafiAnalytics)
+
+**Ecosystem-wide metrics aggregation and reporting:**
+
+```solidity
+struct SystemMetrics {
+    uint256 totalValueLocked;           // Total TVL across all contracts
+    uint256 totalAssets;                // Total tokenized assets
+    uint256 totalFractionalizedAssets;
+    uint256 totalActiveBailouts;
+    uint256 totalStakers;
+    uint256 totalMarketplaceVolume;
+    uint256 totalInsurancePremiums;
+    uint256 lastUpdated;
+}
+
+struct DailyMetrics {
+    uint256 date;
+    uint256 newAssets;
+    uint256 bailoutsRequested;
+    uint256 bailoutsDisbursed;
+    uint256 marketplaceVolume;
+    uint256 liquidityAdded;
+    uint256 stakingRewards;
+    uint256 insuranceClaims;
+}
+
+struct HealthScore {
+    uint256 score;                      // 0-100 health score
+    uint256 collateralRatio;
+    uint256 liquidityRatio;
+    uint256 activeUserCount;
+    uint256 calculatedAt;
+}
+```
+
+**Complete workflow:**
+1. `setContractAddresses(...)` → Configure contract addresses to track
+2. `updateSystemMetrics()` → Refresh TVL and system-wide metrics (REPORTER_ROLE)
+3. `recordDailyMetrics(...)` → Log daily statistics (REPORTER_ROLE)
+4. `calculateHealthScore()` → Compute ecosystem health score (REPORTER_ROLE)
+5. `getSystemMetrics()` → Query current TVL and system state
+6. `getDailyMetrics(date)` → Get historical daily metrics
+7. `getHealthScore()` → Get current health score
+
+**Health score calculation factors:**
+- Collateral ratio (bailout collateral vs. disbursed)
+- Liquidity ratio (available liquidity vs. demand)
+- Active user count and engagement
+- Insurance pool adequacy
+- Asset verification rate
+
+**Key features:**
+- On-chain data aggregation (no oracle needed)
+- Historical metrics storage
+- System health scoring
+- TVL calculation across all contracts
+- Daily metrics tracking
+
+**Gas optimization:** Use view functions for reads, minimize storage writes
+
+## Common Patterns and Fixes
+
+### Stack Too Deep Errors
+If you encounter "Stack too deep" during compilation, the contract is too complex. Solution: ensure `viaIR: true` is set in hardhat.config.js.
+
+### BigInt Serialization in Scripts
+When saving deployment addresses to JSON, wrap chainId in `.toString()`:
+```javascript
+chainId: (await ethers.provider.getNetwork()).chainId.toString()
+```
+
+### Demo Script Pattern
+All demo scripts should:
+1. Get contract addresses (hardcoded or from deployment.json)
+2. Get signers: `const [deployer, user1, user2, ...] = await ethers.getSigners()`
+3. Get contract instances: `await ethers.getContractAt("ContractName", address)`
+4. Execute workflow with clear console logging
+5. Show results with formatted ethers output: `ethers.formatEther(value)`
+
+### Role Management
+When granting roles, always check if already granted to avoid revert:
+```javascript
+const role = await contract.ROLE_NAME();
+if (!await contract.hasRole(role, address)) {
+    await contract.grantRole(role, address);
+}
+```
+
+## Testing Strategy
+
+The system has 18 contracts (15 core + 3 enhancements) with interdependencies. When writing tests:
+
+1. **Unit tests** - Test individual contract functions in isolation
+2. **Integration tests** - Test cross-contract flows:
+   - Bailout + AssetToken + DAO + Insurance
+   - Marketplace + LiquidityPool + Oracle + AssetToken
+   - Staking + Vesting + Treasury + GovernanceToken
+   - KYC + Institutional + AssetToken (onboarding)
+3. **Upgrade tests** - Verify UUPS upgrade mechanism preserves state
+4. **Role-based tests** - Verify access control works correctly
+5. **Event tests** - Ensure all state changes emit proper events
+6. **Economic tests** - Verify AMM formulas, vesting calculations, reward distribution
+7. **Oracle tests** - Test Chainlink integration and staleness detection
+8. **Enhancement tests** - Test advanced features:
+   - Automation + Oracle (Chainlink Keeper simulation)
+   - EmergencyCoordinator (multi-contract pause coordination)
+   - Analytics (TVL calculation, health score accuracy)
+
+## Key Files
+
+**Core Contracts (7):**
+- `contracts/core/BancafiGovernanceToken.sol` - ERC20Votes governance token
+- `contracts/core/BancafiTimelock.sol` - Timelock for DAO proposals
+- `contracts/core/BancafiDAO.sol` - Governor with metadata tracking
+- `contracts/core/BancafiAssetToken.sol` - ERC721 RWA tokenization
+- `contracts/core/BancafiBailout.sol` - Emergency bailout system
+- `contracts/core/BancafiRentalIncome.sol` - Rental distribution
+- `contracts/core/BancafiInstitutional.sol` - KYB for institutions
+
+**Advanced Contracts (8):**
+- `contracts/core/BancafiKYC.sol` - Individual investor KYC
+- `contracts/core/BancafiMarketplace.sol` - Secondary market with escrow
+- `contracts/core/BancafiLiquidityPool.sol` - AMM for fractional trading
+- `contracts/core/BancafiOracle.sol` - Chainlink price feeds
+- `contracts/core/BancafiStaking.sol` - Staking with voting power
+- `contracts/core/BancafiInsurance.sol` - Policy & claim management
+- `contracts/core/BancafiVesting.sol` - Token vesting schedules
+- `contracts/core/BancafiTreasury.sol` - Multi-sig treasury
+
+**Enhancement Contracts (3):**
+- `contracts/advanced/BancafiAutomation.sol` - Chainlink Keeper integration for oracle updates
+- `contracts/advanced/BancafiEmergencyCoordinator.sol` - System-wide pause coordinator
+- `contracts/advanced/BancafiAnalytics.sol` - On-chain metrics and health scoring
+
+**Scripts:**
+- `scripts/deploy-all.js` - Deploy all 15 core contracts
+- `scripts/deploy-enhancements.js` - Deploy 3 enhancement contracts (requires deployment-complete.json)
+- `scripts/validate-enhancements.js` - Validate enhancement contracts before deployment
+- `scripts/deploy.js` - Deploy core 7 contracts only
+- `scripts/grant-governance-roles.js` - Configure DAO roles
+- `scripts/institutional-demo.js` - Demo institutional KYB workflow
+- `scripts/enhanced-features-demo.js` - Demo enhancement features (Automation, Coordinator, Analytics)
+- `scripts/real-estate-demo.js` - Demo real estate tokenization workflow
+- `scripts/comprehensive-integration-demo.js` - Full system integration demo
+
+**Configuration:**
+- `hardhat.config.js` - Must have viaIR: true and Solidity 0.8.25
+
+## Security Considerations
+
+Every contract implements:
+- Pausable (emergency stop)
+- ReentrancyGuard (protect state-changing functions)
+- AccessControl (role-based permissions)
+- UUPS upgradeability (admin-controlled upgrades)
+- Comprehensive event emission (audit trail)
+
+**Never:**
+- Skip role checks on sensitive functions
+- Allow upgrades without UPGRADER_ROLE
+- Forget to lock collateral when disbursing bailouts
+- Allow fractional transfers exceeding owned amount

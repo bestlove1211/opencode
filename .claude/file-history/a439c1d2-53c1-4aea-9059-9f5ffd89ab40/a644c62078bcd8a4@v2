@@ -1,0 +1,782 @@
+# Bancafi Wallet Integration Guide
+
+## Overview
+
+The Bancafi Wallet Integration layer provides a unified, production-ready solution for connecting various wallet types to the Bancafi Credit platform. It supports personal wallets, multi-signature wallets, smart contract wallets, and institutional custody solutions.
+
+## Supported Wallet Providers
+
+1. **MetaMask** - Most popular browser extension wallet
+2. **WalletConnect** - Mobile wallet connection via QR code
+3. **Coinbase Wallet** - Coinbase's non-custodial wallet
+4. **Gnosis Safe** - Multi-signature smart contract wallet
+5. **Ledger** - Hardware wallet (via MetaMask/WalletConnect)
+6. **Trezor** - Hardware wallet (via MetaMask/WalletConnect)
+
+## Architecture
+
+### Smart Contract Layer
+
+**BancafiWalletIntegration.sol** - On-chain wallet management
+- Wallet registration and verification
+- Multi-signature configuration
+- Batch transaction management
+- Delegated access control
+- Session management
+
+### Frontend Layer
+
+**walletConnectors.ts** - TypeScript connector library
+- Unified wallet connection interface
+- Provider-specific implementations
+- Contract interaction methods
+
+**useWallet.ts** - React hook
+- React context for wallet state
+- Easy integration in components
+- Automatic connection management
+
+## Quick Start
+
+### 1. Install Dependencies
+
+```bash
+npm install ethers @walletconnect/ethereum-provider @coinbase/wallet-sdk @safe-global/safe-apps-sdk
+```
+
+### 2. Configure Environment Variables
+
+Create `.env.local`:
+
+```env
+NEXT_PUBLIC_WALLET_INTEGRATION_ADDRESS=0x...
+NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID=your_project_id
+NEXT_PUBLIC_RPC_URL=https://mainnet.infura.io/v3/YOUR_KEY
+NEXT_PUBLIC_CHAIN_ID=1
+NEXT_PUBLIC_LOGO_URL=https://your-app.com/logo.png
+```
+
+### 3. Wrap Your App
+
+```typescript
+// pages/_app.tsx
+import { WalletProvider } from '../hooks/useWallet';
+import WalletIntegrationABI from '../abis/BancafiWalletIntegration.json';
+
+function MyApp({ Component, pageProps }) {
+  return (
+    <WalletProvider
+      walletIntegrationAddress={process.env.NEXT_PUBLIC_WALLET_INTEGRATION_ADDRESS!}
+      walletIntegrationABI={WalletIntegrationABI.abi}
+    >
+      <Component {...pageProps} />
+    </WalletProvider>
+  );
+}
+```
+
+### 4. Use in Components
+
+```typescript
+import { useWallet, useWalletUtils } from '../hooks/useWallet';
+import { WalletProvider, WalletType } from '../lib/walletConnectors';
+
+function ConnectButton() {
+  const { connection, isConnected, isLoading, connect, disconnect } = useWallet();
+  const { shortenAddress } = useWalletUtils();
+
+  if (isConnected && connection) {
+    return (
+      <div>
+        <span>{shortenAddress(connection.address)}</span>
+        <button onClick={disconnect}>Disconnect</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <button onClick={() => connect(WalletProvider.METAMASK)} disabled={isLoading}>
+        {isLoading ? 'Connecting...' : 'Connect MetaMask'}
+      </button>
+      <button onClick={() => connect(WalletProvider.WALLET_CONNECT)} disabled={isLoading}>
+        Connect WalletConnect
+      </button>
+    </div>
+  );
+}
+```
+
+## Features
+
+### 1. Wallet Registration
+
+Register your wallet with the platform to access all features.
+
+```typescript
+import { WalletType } from '../lib/walletConnectors';
+
+function RegisterWallet() {
+  const { registerWallet, isLoading } = useWallet();
+
+  const handleRegister = async () => {
+    try {
+      await registerWallet(
+        WalletType.EOA,
+        "QmIPFSHash..." // IPFS hash with additional metadata
+      );
+      alert('Wallet registered successfully!');
+    } catch (error) {
+      console.error('Registration failed:', error);
+    }
+  };
+
+  return (
+    <button onClick={handleRegister} disabled={isLoading}>
+      Register Wallet
+    </button>
+  );
+}
+```
+
+### 2. Multi-Signature Configuration
+
+Set up multi-signature requirements for institutional accounts.
+
+```typescript
+function ConfigureMultiSig() {
+  const { configureMultiSig, multiSigConfig } = useWallet();
+
+  const handleConfigure = async () => {
+    const signers = [
+      '0x1111111111111111111111111111111111111111',
+      '0x2222222222222222222222222222222222222222',
+      '0x3333333333333333333333333333333333333333',
+    ];
+
+    try {
+      await configureMultiSig(
+        signers,
+        2, // Require 2 of 3 signatures
+        86400 // 24 hour signature timeout
+      );
+      alert('Multi-sig configured!');
+    } catch (error) {
+      console.error('Configuration failed:', error);
+    }
+  };
+
+  if (multiSigConfig?.isActive) {
+    return (
+      <div>
+        <p>Multi-sig enabled: {multiSigConfig.requiredSignatures} of {multiSigConfig.signers.length}</p>
+      </div>
+    );
+  }
+
+  return (
+    <button onClick={handleConfigure}>
+      Configure Multi-Signature
+    </button>
+  );
+}
+```
+
+### 3. Batch Transactions
+
+Execute multiple transactions atomically.
+
+```typescript
+function BatchTransactionExample() {
+  const { createBatch, approveBatch, executeBatch } = useWallet();
+
+  const handleCreateBatch = async () => {
+    const targets = [
+      lendingContract.address,
+      collateralContract.address,
+      tokenContract.address,
+    ];
+
+    const calldatas = [
+      lendingContract.interface.encodeFunctionData('repayLoan', [loanId, amount]),
+      collateralContract.interface.encodeFunctionData('releaseCollateral', [collateralId]),
+      tokenContract.interface.encodeFunctionData('transfer', [recipient, amount]),
+    ];
+
+    const values = ['0', '0', '0']; // No ETH sent
+
+    const deadline = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+
+    try {
+      const batchId = await createBatch(targets, calldatas, values, deadline);
+      console.log('Batch created:', batchId);
+      return batchId;
+    } catch (error) {
+      console.error('Batch creation failed:', error);
+    }
+  };
+
+  const handleApproveBatch = async (batchId: number) => {
+    try {
+      await approveBatch(batchId);
+      console.log('Batch approved');
+    } catch (error) {
+      console.error('Approval failed:', error);
+    }
+  };
+
+  const handleExecuteBatch = async (batchId: number) => {
+    try {
+      await executeBatch(batchId);
+      console.log('Batch executed');
+    } catch (error) {
+      console.error('Execution failed:', error);
+    }
+  };
+
+  return (
+    <div>
+      <button onClick={handleCreateBatch}>Create Batch Transaction</button>
+    </div>
+  );
+}
+```
+
+### 4. Delegated Access
+
+Grant temporary access to other addresses.
+
+```typescript
+function DelegateManagement() {
+  const { addDelegate, revokeDelegate, getDelegates } = useWallet();
+  const [delegates, setDelegates] = useState<string[]>([]);
+
+  useEffect(() => {
+    loadDelegates();
+  }, []);
+
+  const loadDelegates = async () => {
+    const delegateList = await getDelegates();
+    setDelegates(delegateList);
+  };
+
+  const handleAddDelegate = async (delegateAddress: string) => {
+    try {
+      await addDelegate(
+        delegateAddress,
+        true,  // Can initiate transactions
+        true,  // Can approve transactions
+        86400 * 7 // 7 days
+      );
+      await loadDelegates();
+    } catch (error) {
+      console.error('Failed to add delegate:', error);
+    }
+  };
+
+  const handleRevokeDelegate = async (delegateAddress: string) => {
+    try {
+      await revokeDelegate(delegateAddress);
+      await loadDelegates();
+    } catch (error) {
+      console.error('Failed to revoke delegate:', error);
+    }
+  };
+
+  return (
+    <div>
+      <h3>Active Delegates</h3>
+      {delegates.map(delegate => (
+        <div key={delegate}>
+          <span>{delegate}</span>
+          <button onClick={() => handleRevokeDelegate(delegate)}>Revoke</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+### 5. Session Management
+
+Create temporary sessions for enhanced security.
+
+```typescript
+function SessionExample() {
+  const { connection } = useWallet();
+  const [sessionActive, setSessionActive] = useState(false);
+
+  const createUserSession = async () => {
+    if (!connection) return;
+
+    const connector = new BancafiWalletConnector(
+      process.env.NEXT_PUBLIC_WALLET_INTEGRATION_ADDRESS!,
+      WalletIntegrationABI.abi
+    );
+
+    // Generate unique session hash
+    const sessionData = {
+      address: connection.address,
+      timestamp: Date.now(),
+      nonce: Math.random(),
+    };
+
+    const sessionHash = ethers.utils.id(JSON.stringify(sessionData));
+
+    try {
+      await connector.createSession(sessionHash, 3600); // 1 hour session
+      localStorage.setItem('sessionHash', sessionHash);
+      setSessionActive(true);
+    } catch (error) {
+      console.error('Session creation failed:', error);
+    }
+  };
+
+  return (
+    <div>
+      {sessionActive ? (
+        <span>Session Active ✓</span>
+      ) : (
+        <button onClick={createUserSession}>Create Session</button>
+      )}
+    </div>
+  );
+}
+```
+
+## Wallet Types
+
+### EOA (Externally Owned Account)
+
+Standard personal wallets like MetaMask.
+
+```typescript
+await registerWallet(WalletType.EOA, ipfsMetadataHash);
+```
+
+**Use Cases:**
+- Individual borrowers
+- Personal lending
+- Small transactions
+
+**Features:**
+- Single-signature transactions
+- Immediate execution
+- Low overhead
+
+### Multi-Signature Wallet
+
+Requires multiple approvals for transactions.
+
+```typescript
+// Register as multi-sig
+await registerWallet(WalletType.MULTISIG, ipfsMetadataHash);
+
+// Configure signers
+await configureMultiSig(
+  [signer1, signer2, signer3],
+  2, // Require 2 of 3
+  86400 // 24h timeout
+);
+```
+
+**Use Cases:**
+- Small business accounts
+- Shared treasury management
+- Partnership funds
+
+**Features:**
+- Multiple required signatures
+- Time-based expiry
+- Configurable thresholds
+
+### Smart Contract Wallet
+
+Gnosis Safe or similar contract wallets.
+
+```typescript
+await registerWallet(WalletType.SMART_CONTRACT, ipfsMetadataHash);
+```
+
+**Use Cases:**
+- Advanced security features
+- Programmable conditions
+- Recovery mechanisms
+
+**Features:**
+- On-chain logic
+- Module extensions
+- Social recovery
+
+### Institutional Wallet
+
+Enterprise-grade custody solutions.
+
+```typescript
+await registerWallet(WalletType.INSTITUTIONAL, ipfsMetadataHash);
+```
+
+**Use Cases:**
+- Banks and financial institutions
+- Hedge funds
+- Large corporations
+
+**Features:**
+- Compliance integration
+- Audit trails
+- Policy enforcement
+- Cold storage integration
+
+## Batch Transaction Workflow
+
+### Single-Signer Workflow
+
+```mermaid
+graph LR
+    A[Create Batch] --> B[Auto-Approve]
+    B --> C[Execute]
+    C --> D[Complete]
+```
+
+1. User creates batch
+2. Automatically approved by creator
+3. Executes immediately
+4. All transactions complete atomically
+
+### Multi-Sig Workflow
+
+```mermaid
+graph LR
+    A[Create Batch] --> B[Signer 1 Approves]
+    B --> C[Signer 2 Approves]
+    C --> D[Execute]
+    D --> E[Complete]
+```
+
+1. User creates batch
+2. Required signers approve
+3. Once threshold met, can execute
+4. Any signer can execute
+
+### Example: Loan Repayment + Collateral Release
+
+```typescript
+async function repayLoanAndReleaseCollateral(loanId: number) {
+  const { createBatch } = useWallet();
+
+  // Get contracts
+  const lending = new ethers.Contract(LENDING_ADDRESS, LENDING_ABI, signer);
+  const collateral = new ethers.Contract(COLLATERAL_ADDRESS, COLLATERAL_ABI, signer);
+
+  // Prepare batch
+  const targets = [lending.address, collateral.address];
+
+  const calldatas = [
+    lending.interface.encodeFunctionData('repayLoan', [loanId, repayAmount]),
+    collateral.interface.encodeFunctionData('releaseCollateral', [collateralId]),
+  ];
+
+  const values = ['0', '0'];
+  const deadline = Math.floor(Date.now() / 1000) + 3600;
+
+  // Execute
+  const batchId = await createBatch(targets, calldatas, values, deadline);
+  console.log(`Batch ${batchId} created - awaiting approvals`);
+}
+```
+
+## Security Best Practices
+
+### 1. Verify Contracts
+
+Always verify you're interacting with the correct contracts:
+
+```typescript
+const TRUSTED_CONTRACTS = {
+  lending: '0x...',
+  collateral: '0x...',
+  wallet: '0x...',
+};
+
+function verifyContract(address: string, type: keyof typeof TRUSTED_CONTRACTS): boolean {
+  return address.toLowerCase() === TRUSTED_CONTRACTS[type].toLowerCase();
+}
+```
+
+### 2. Transaction Simulation
+
+Simulate transactions before execution:
+
+```typescript
+async function simulateTransaction(target: string, calldata: string) {
+  try {
+    await provider.call({
+      to: target,
+      data: calldata,
+    });
+    return { success: true };
+  } catch (error) {
+    return { success: false, error };
+  }
+}
+```
+
+### 3. Deadline Management
+
+Always set reasonable deadlines:
+
+```typescript
+const ONE_HOUR = 3600;
+const ONE_DAY = 86400;
+const ONE_WEEK = 604800;
+
+// For urgent transactions
+const urgentDeadline = Math.floor(Date.now() / 1000) + ONE_HOUR;
+
+// For multi-sig approvals
+const normalDeadline = Math.floor(Date.now() / 1000) + ONE_DAY;
+
+// For institutional processes
+const institutionalDeadline = Math.floor(Date.now() / 1000) + ONE_WEEK;
+```
+
+### 4. Delegate Permissions
+
+Be careful with delegate permissions:
+
+```typescript
+// ✅ Good: Limited scope, short duration
+await addDelegate(
+  delegateAddress,
+  false, // Cannot initiate transactions
+  true,  // Can only approve
+  86400  // 1 day only
+);
+
+// ❌ Bad: Too permissive
+await addDelegate(
+  delegateAddress,
+  true,  // Can do anything
+  true,  // Full access
+  86400 * 365 // 1 year!
+);
+```
+
+### 5. Session Expiry
+
+Use appropriate session durations:
+
+```typescript
+// ✅ Short sessions for sensitive operations
+await createSession(sessionHash, 3600); // 1 hour
+
+// ✅ Longer for routine operations
+await createSession(sessionHash, 86400); // 1 day
+
+// ❌ Too long
+await createSession(sessionHash, 86400 * 30); // 30 days
+```
+
+## Advanced Features
+
+### Custom Wallet Connector
+
+Extend the base connector for custom wallet types:
+
+```typescript
+class CustomWalletConnector extends BancafiWalletConnector {
+  async connectCustomWallet(): Promise<WalletConnection> {
+    // Your custom connection logic
+    const provider = await this.initializeCustomProvider();
+    const signer = provider.getSigner();
+    const address = await signer.getAddress();
+
+    this.connection = {
+      address,
+      provider,
+      signer,
+      chainId: await provider.getNetwork().chainId,
+      providerType: WalletProvider.CUSTOM,
+      isConnected: true,
+    };
+
+    return this.connection;
+  }
+}
+```
+
+### Transaction Monitoring
+
+Monitor pending batches:
+
+```typescript
+function useBatchMonitoring() {
+  const { getBatches, connection } = useWallet();
+  const [pendingBatches, setPendingBatches] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (!connection) return;
+
+    const checkBatches = async () => {
+      const batches = await getBatches();
+      const pending = [];
+
+      for (const batchId of batches) {
+        const details = await getBatchDetails(batchId);
+        if (details.status === TransactionStatus.Pending) {
+          pending.push(batchId);
+        }
+      }
+
+      setPendingBatches(pending);
+    };
+
+    checkBatches();
+    const interval = setInterval(checkBatches, 30000); // Check every 30s
+
+    return () => clearInterval(interval);
+  }, [connection]);
+
+  return pendingBatches;
+}
+```
+
+### Gas Estimation
+
+Estimate gas for batch transactions:
+
+```typescript
+async function estimateBatchGas(
+  targets: string[],
+  calldatas: string[],
+  values: string[]
+): Promise<ethers.BigNumber> {
+  let totalGas = ethers.BigNumber.from(0);
+
+  for (let i = 0; i < targets.length; i++) {
+    const estimate = await provider.estimateGas({
+      to: targets[i],
+      data: calldatas[i],
+      value: values[i],
+    });
+
+    totalGas = totalGas.add(estimate);
+  }
+
+  // Add overhead for batch execution
+  const overhead = ethers.BigNumber.from(50000);
+  return totalGas.add(overhead);
+}
+```
+
+## Testing
+
+### Unit Tests
+
+```typescript
+describe('BancafiWalletIntegration', () => {
+  it('should register wallet', async () => {
+    await walletIntegration.registerWallet(WalletType.EOA, 'metadata');
+    const profile = await walletIntegration.getWalletProfile(user.address);
+    expect(profile.isRegistered).to.be.true;
+  });
+
+  it('should configure multi-sig', async () => {
+    await walletIntegration.configureMultiSig([signer1, signer2], 2, 86400);
+    const config = await walletIntegration.getMultiSigConfig(user.address);
+    expect(config.requiredSignatures).to.equal(2);
+  });
+
+  it('should execute batch when approved', async () => {
+    const batchId = await walletIntegration.createBatchTransaction(
+      [target],
+      [calldata],
+      ['0'],
+      deadline
+    );
+
+    await walletIntegration.approveBatchTransaction(batchId);
+    await walletIntegration.executeBatchTransaction(batchId);
+
+    const batch = await walletIntegration.batchTransactions(batchId);
+    expect(batch.status).to.equal(TransactionStatus.Executed);
+  });
+});
+```
+
+## Troubleshooting
+
+### Connection Issues
+
+```typescript
+// Check if wallet is installed
+if (typeof window.ethereum === 'undefined') {
+  console.error('No Ethereum wallet detected');
+  // Show install prompt
+}
+
+// Check if on correct network
+const chainId = await provider.getNetwork().then(n => n.chainId);
+if (chainId !== expectedChainId) {
+  // Prompt network switch
+  await switchNetwork(expectedChainId);
+}
+```
+
+### Transaction Failures
+
+```typescript
+try {
+  await executeBatch(batchId);
+} catch (error) {
+  if (error.code === 'INSUFFICIENT_FUNDS') {
+    console.error('Not enough gas');
+  } else if (error.code === 'UNPREDICTABLE_GAS_LIMIT') {
+    console.error('Transaction will likely fail');
+  } else {
+    console.error('Unknown error:', error);
+  }
+}
+```
+
+### Multi-Sig Coordination
+
+```typescript
+// Check approval status
+const details = await getBatchDetails(batchId);
+console.log(`${details.approvalCount} / ${multiSigConfig.requiredSignatures} approvals`);
+
+// Check who has approved
+const hasApproved = await batchTransactions[batchId].hasApproved(signerAddress);
+
+// Check if ready to execute
+const ready = await isReadyToExecute(batchId);
+```
+
+## Deployment
+
+### Deploy Contract
+
+```bash
+npx hardhat run scripts/deploy-wallet-integration.ts --network mainnet
+```
+
+### Verify on Etherscan
+
+```bash
+npx hardhat verify --network mainnet DEPLOYED_ADDRESS
+```
+
+### Configure Frontend
+
+Update environment variables with deployed address:
+
+```env
+NEXT_PUBLIC_WALLET_INTEGRATION_ADDRESS=0xDeployedAddress
+```
+
+## Conclusion
+
+The Bancafi Wallet Integration layer provides enterprise-grade wallet management with support for multiple wallet types, batch transactions, multi-signature workflows, and delegated access control. It's designed for production use with comprehensive security features and flexible integration options.
+
+For additional support or questions, refer to the full API documentation or contact the development team.

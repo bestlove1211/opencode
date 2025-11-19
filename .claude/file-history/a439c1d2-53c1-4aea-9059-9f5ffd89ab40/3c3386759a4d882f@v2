@@ -1,0 +1,271 @@
+const { ethers, upgrades } = require("hardhat");
+
+/**
+ * Local Development Deployment Script
+ *
+ * Simplified deployment for local testing with mock data
+ */
+
+async function main() {
+  console.log("Starting Local Development Deployment...\n");
+
+  const [deployer, user1, user2] = await ethers.getSigners();
+  console.log("Deployer:", deployer.address);
+  console.log("Test User 1:", user1.address);
+  console.log("Test User 2:", user2.address);
+  console.log();
+
+  const deployed = {};
+
+  // Deploy Price Oracle
+  console.log("Deploying Price Oracle...");
+  const PriceOracle = await ethers.getContractFactory("BancafiPriceOracle");
+  const oracle = await upgrades.deployProxy(PriceOracle, [], {
+    initializer: "initialize",
+    kind: "uups"
+  });
+  await oracle.waitForDeployment();
+  deployed.oracle = await oracle.getAddress();
+  console.log("✓ Price Oracle:", deployed.oracle);
+
+  // Deploy Compliance
+  console.log("\nDeploying Compliance...");
+  const Compliance = await ethers.getContractFactory("BancafiCompliance");
+  const compliance = await upgrades.deployProxy(Compliance, [], {
+    initializer: "initialize",
+    kind: "uups"
+  });
+  await compliance.waitForDeployment();
+  deployed.compliance = await compliance.getAddress();
+  console.log("✓ Compliance:", deployed.compliance);
+
+  // Deploy Credit Score
+  console.log("\nDeploying Credit Score...");
+  const CreditScore = await ethers.getContractFactory("CreditScore");
+  const creditScore = await upgrades.deployProxy(CreditScore, [], {
+    initializer: "initialize",
+    kind: "uups"
+  });
+  await creditScore.waitForDeployment();
+  deployed.creditScore = await creditScore.getAddress();
+  console.log("✓ Credit Score:", deployed.creditScore);
+
+  // Deploy Collateral Manager
+  console.log("\nDeploying Collateral Manager...");
+  const CollateralManager = await ethers.getContractFactory("CollateralManager");
+  const collateralManager = await upgrades.deployProxy(
+    CollateralManager,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await collateralManager.waitForDeployment();
+  deployed.collateralManager = await collateralManager.getAddress();
+  console.log("✓ Collateral Manager:", deployed.collateralManager);
+
+  // Deploy Multi-Asset Collateral Manager
+  console.log("\nDeploying Multi-Asset Collateral Manager...");
+  const MultiAssetCollateralManager = await ethers.getContractFactory(
+    "MultiAssetCollateralManager"
+  );
+  const multiCollateral = await upgrades.deployProxy(
+    MultiAssetCollateralManager,
+    [deployed.oracle],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await multiCollateral.waitForDeployment();
+  deployed.multiCollateral = await multiCollateral.getAddress();
+  console.log("✓ Multi-Asset Collateral:", deployed.multiCollateral);
+
+  // Deploy Lending
+  console.log("\nDeploying Lending...");
+  const Lending = await ethers.getContractFactory("BancafiLending");
+  const lending = await upgrades.deployProxy(
+    Lending,
+    [deployed.collateralManager, deployed.creditScore, deployed.oracle],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await lending.waitForDeployment();
+  deployed.lending = await lending.getAddress();
+  console.log("✓ Lending:", deployed.lending);
+
+  // Deploy Debt Collection
+  console.log("\nDeploying Debt Collection...");
+  const DebtCollection = await ethers.getContractFactory("DebtCollection");
+  const debtCollection = await upgrades.deployProxy(
+    DebtCollection,
+    [deployed.lending, deployed.collateralManager, deployed.creditScore],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await debtCollection.waitForDeployment();
+  deployed.debtCollection = await debtCollection.getAddress();
+  console.log("✓ Debt Collection:", deployed.debtCollection);
+
+  // Deploy Block Market
+  console.log("\nDeploying Block Market...");
+  const BlockMarket = await ethers.getContractFactory("BancafiBlockMarket");
+  const blockMarket = await upgrades.deployProxy(
+    BlockMarket,
+    [deployed.debtCollection],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await blockMarket.waitForDeployment();
+  deployed.blockMarket = await blockMarket.getAddress();
+  console.log("✓ Block Market:", deployed.blockMarket);
+
+  // Deploy Private Credit Line
+  console.log("\nDeploying Private Credit Line...");
+  const PrivateCreditLine = await ethers.getContractFactory(
+    "BancafiPrivateCreditLine"
+  );
+  const privateCreditLine = await upgrades.deployProxy(
+    PrivateCreditLine,
+    [deployed.creditScore, deployed.oracle, deployed.compliance],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await privateCreditLine.waitForDeployment();
+  deployed.privateCreditLine = await privateCreditLine.getAddress();
+  console.log("✓ Private Credit Line:", deployed.privateCreditLine);
+
+  // Deploy Insurance
+  console.log("\nDeploying Insurance...");
+  const Insurance = await ethers.getContractFactory("BancafiInsurance");
+  const insurance = await upgrades.deployProxy(
+    Insurance,
+    [deployed.lending, deployed.oracle],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await insurance.waitForDeployment();
+  deployed.insurance = await insurance.getAddress();
+  console.log("✓ Insurance:", deployed.insurance);
+
+  // Deploy Institutional Onboarding
+  console.log("\nDeploying Institutional Onboarding...");
+  const InstitutionalOnboarding = await ethers.getContractFactory(
+    "InstitutionalOnboarding"
+  );
+  const institutional = await upgrades.deployProxy(
+    InstitutionalOnboarding,
+    [deployed.compliance],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await institutional.waitForDeployment();
+  deployed.institutional = await institutional.getAddress();
+  console.log("✓ Institutional Onboarding:", deployed.institutional);
+
+  // Deploy Portfolio Manager
+  console.log("\nDeploying Portfolio Manager...");
+  const PortfolioManager = await ethers.getContractFactory(
+    "BancafiPortfolioManager"
+  );
+  const portfolio = await upgrades.deployProxy(
+    PortfolioManager,
+    [deployed.debtCollection],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await portfolio.waitForDeployment();
+  deployed.portfolio = await portfolio.getAddress();
+  console.log("✓ Portfolio Manager:", deployed.portfolio);
+
+  // Deploy Wallet Integration
+  console.log("\nDeploying Wallet Integration...");
+  const WalletIntegration = await ethers.getContractFactory(
+    "BancafiWalletIntegration"
+  );
+  const wallet = await upgrades.deployProxy(WalletIntegration, [], {
+    initializer: "initialize",
+    kind: "uups"
+  });
+  await wallet.waitForDeployment();
+  deployed.wallet = await wallet.getAddress();
+  console.log("✓ Wallet Integration:", deployed.wallet);
+
+  console.log("\n" + "=".repeat(60));
+  console.log("Setting up permissions...");
+  console.log("=".repeat(60));
+
+  // Set permissions
+  await collateralManager.setAuthorizedCaller(deployed.lending, true);
+  await collateralManager.setAuthorizedCaller(deployed.debtCollection, true);
+  await creditScore.setAuthorizedCaller(deployed.lending, true);
+  await creditScore.setAuthorizedCaller(deployed.debtCollection, true);
+  await creditScore.setAuthorizedCaller(deployed.privateCreditLine, true);
+
+  const MANAGER_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MANAGER_ROLE"));
+  const LIQUIDATOR_ROLE = ethers.keccak256(
+    ethers.toUtf8Bytes("LIQUIDATOR_ROLE")
+  );
+  await multiCollateral.grantRole(MANAGER_ROLE, deployed.lending);
+  await multiCollateral.grantRole(LIQUIDATOR_ROLE, deployed.debtCollection);
+
+  console.log("✓ Permissions configured");
+
+  console.log("\n" + "=".repeat(60));
+  console.log("Setting up mock data for testing...");
+  console.log("=".repeat(60));
+
+  // Set mock prices (in USD with 18 decimals)
+  await oracle.updatePrice("ETH", ethers.parseEther("2000")); // $2,000
+  await oracle.updatePrice("BTC", ethers.parseEther("40000")); // $40,000
+  await oracle.updatePrice("USDC", ethers.parseEther("1")); // $1
+  console.log("✓ Mock prices set");
+
+  // Configure mock asset (using WETH as example)
+  const mockWETH = ethers.ZeroAddress; // In real test, deploy mock ERC20
+  await collateralManager.configureAsset(
+    mockWETH,
+    true,
+    8000, // 80% liquidation threshold
+    15000, // 150% min collateral ratio
+    ethers.ZeroAddress
+  );
+  console.log("✓ Mock asset configured");
+
+  // Set initial credit scores for test users
+  await creditScore.setAuthorizedCaller(deployer.address, true);
+  await creditScore.updateCreditScore(user1.address, 750, "Initial score");
+  await creditScore.updateCreditScore(user2.address, 650, "Initial score");
+  console.log("✓ Test user credit scores set");
+
+  console.log("\n" + "=".repeat(60));
+  console.log("LOCAL DEPLOYMENT COMPLETE");
+  console.log("=".repeat(60));
+  console.log("\nDeployed Contracts:");
+  Object.entries(deployed).forEach(([name, address]) => {
+    console.log(`  ${name.padEnd(25)} ${address}`);
+  });
+
+  console.log("\nTest Accounts:");
+  console.log(`  Deployer:  ${deployer.address}`);
+  console.log(`  User 1:    ${user1.address} (Credit Score: 750)`);
+  console.log(`  User 2:    ${user2.address} (Credit Score: 650)`);
+  console.log("\n" + "=".repeat(60));
+
+  // Save to file
+  const fs = require("fs");
+  fs.writeFileSync(
+    "./deployment-local.json",
+    JSON.stringify(
+      {
+        network: "localhost",
+        timestamp: new Date().toISOString(),
+        contracts: deployed,
+        testAccounts: {
+          deployer: deployer.address,
+          user1: user1.address,
+          user2: user2.address
+        }
+      },
+      null,
+      2
+    )
+  );
+
+  console.log("✓ Deployment info saved to deployment-local.json\n");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

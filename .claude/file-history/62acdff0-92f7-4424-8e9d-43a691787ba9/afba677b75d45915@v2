@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IBancafiAssetToken {
+    function fractionalOwnership(uint256 tokenId, address owner) external view returns (uint256);
+    function transferFractional(uint256 tokenId, address to, uint256 amount) external;
+    function totalFractions(uint256 tokenId) external view returns (uint256);
+}
+
+/**
+ * @title BancafiMarketplace
+ * @notice Secondary market for trading fractionalized asset tokens
+ * @dev Supports listings, offers, and escrow for secure trading
+ */
+contract BancafiMarketplace is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant FEE_MANAGER_ROLE = keccak256("FEE_MANAGER_ROLE");
+
+    enum ListingStatus {
+        Active,
+        Sold,
+        Cancelled,
+        Expired
+    }
+
+    enum OfferStatus {
+        Pending,
+        Accepted,
+        Rejected,
+        Cancelled,
+        Expired
+    }
+
+    struct Listing {
+        uint256 listingId;
+        uint256 tokenId;
+        address seller;
+        uint256 fractionsForSale;
+        uint256 pricePerFraction;
+        uint256 totalPrice;
+        ListingStatus status;
+        uint256 listedAt;
+        uint256 expiresAt;
+        uint256 soldAt;
+        address buyer;
+    }
+
+    struct Offer {
+        uint256 offerId;
+        uint256 listingId;
+        uint256 tokenId;
+        address buyer;
+        uint256 fractionsOffered;
+        uint256 pricePerFraction;
+        uint256 totalOffer;
+        OfferStatus status;
+        uint256 createdAt;
+        uint256 expiresAt;
+    }
+
+    struct MarketStats {
+        uint256 totalListings;
+        uint256 totalSales;
+        uint256 totalVolume;
+        uint256 totalFees;
+    }
+
+    IBancafiAssetToken public assetToken;
+
+    uint256 private _listingIds;
+    uint256 private _offerIds;
+
+    mapping(uint256 => Listing) public listings;
+    mapping(uint256 => Offer) public offers;
+    mapping(uint256 => uint256[]) public tokenListings; // tokenId => listingIds
+    mapping(uint256 => uint256[]) public listingOffers; // listingId => offerIds
+    mapping(address => uint256[]) public userListings;
+    mapping(address => uint256[]) public userOffers;
+
+    uint256 public tradingFeePercent; // in basis points (100 = 1%)
+    address public feeRecipient;
+    MarketStats public marketStats;
+
+    // Events
+    event ListingCreated(
+        uint256 indexed listingId,
+        uint256 indexed tokenId,
+        address indexed seller,
+        uint256 fractions,
+        uint256 pricePerFraction,
+        uint256 timestamp
+    );
+
+    event ListingSold(
+        uint256 indexed listingId,
+        address indexed buyer,
+        uint256 fractions,
+        uint256 totalPrice,
+        uint256 fee,
+        uint256 timestamp
+    );
+
+    event ListingCancelled(
+        uint256 indexed listingId,
+        uint256 timestamp
+    );
+
+    event OfferCreated(
+        uint256 indexed offerId,
+        uint256 indexed listingId,
+        address indexed buyer,
+        uint256 pricePerFraction,
+        uint256 timestamp
+    );
+
+    event OfferAccepted(
+        uint256 indexed offerId,
+        uint256 indexed listingId,
+        uint256 timestamp
+    );
+
+    event OfferRejected(
+        uint256 indexed offerId,
+        uint256 timestamp
+    );
+
+    event OfferCancelled(
+        uint256 indexed offerId,
+        uint256 timestamp
+    );
+
+    event TradingFeeUpdated(
+        uint256 oldFee,
+        uint256 newFee,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address assetTokenAddress_) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(FEE_MANAGER_ROLE, msg.sender);
+
+        assetToken = IBancafiAssetToken(assetTokenAddress_);
+        tradingFeePercent = 250; // 2.5% default fee
+        feeRecipient = msg.sender;
+    }
+
+    /**
+     * @notice Create a new listing
+     */
+    function createListing(
+        uint256 tokenId_,
+        uint256 fractionsForSale_,
+        uint256 pricePerFraction_,
+        uint256 duration_
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        require(fractionsForSale_ > 0, "Invalid fractions amount");
+        require(pricePerFraction_ > 0, "Invalid price");
+        require(
+            assetToken.fractionalOwnership(tokenId_, msg.sender) >= fractionsForSale_,
+            "Insufficient fractions"
+        );
+
+        _listingIds++;
+        uint256 newListingId = _listingIds;
+
+        uint256 totalPrice = fractionsForSale_ * pricePerFraction_;
+
+        listings[newListingId] = Listing({
+            listingId: newListingId,
+            tokenId: tokenId_,
+            seller: msg.sender,
+            fractionsForSale: fractionsForSale_,
+            pricePerFraction: pricePerFraction_,
+            totalPrice: totalPrice,
+            status: ListingStatus.Active,
+            listedAt: block.timestamp,
+            expiresAt: block.timestamp + duration_,
+            soldAt: 0,
+            buyer: address(0)
+        });
+
+        tokenListings[tokenId_].push(newListingId);
+        userListings[msg.sender].push(newListingId);
+        marketStats.totalListings++;
+
+        emit ListingCreated(
+            newListingId,
+            tokenId_,
+            msg.sender,
+            fractionsForSale_,
+            pricePerFraction_,
+            block.timestamp
+        );
+
+        return newListingId;
+    }
+
+    /**
+     * @notice Buy a listing directly
+     */
+    function buyListing(uint256 listingId_) external payable whenNotPaused nonReentrant {
+        Listing storage listing = listings[listingId_];
+
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(block.timestamp <= listing.expiresAt, "Listing expired");
+        require(msg.sender != listing.seller, "Cannot buy own listing");
+        require(msg.value >= listing.totalPrice, "Insufficient payment");
+
+        uint256 fee = (listing.totalPrice * tradingFeePercent) / 10000;
+        uint256 sellerAmount = listing.totalPrice - fee;
+
+        // Update listing status
+        listing.status = ListingStatus.Sold;
+        listing.soldAt = block.timestamp;
+        listing.buyer = msg.sender;
+
+        // Transfer fractions
+        assetToken.transferFractional(listing.tokenId, msg.sender, listing.fractionsForSale);
+
+        // Transfer payments
+        payable(listing.seller).transfer(sellerAmount);
+        payable(feeRecipient).transfer(fee);
+
+        // Refund excess
+        if (msg.value > listing.totalPrice) {
+            payable(msg.sender).transfer(msg.value - listing.totalPrice);
+        }
+
+        // Update stats
+        marketStats.totalSales++;
+        marketStats.totalVolume += listing.totalPrice;
+        marketStats.totalFees += fee;
+
+        emit ListingSold(
+            listingId_,
+            msg.sender,
+            listing.fractionsForSale,
+            listing.totalPrice,
+            fee,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Cancel a listing
+     */
+    function cancelListing(uint256 listingId_) external {
+        Listing storage listing = listings[listingId_];
+
+        require(listing.seller == msg.sender, "Not seller");
+        require(listing.status == ListingStatus.Active, "Listing not active");
+
+        listing.status = ListingStatus.Cancelled;
+
+        emit ListingCancelled(listingId_, block.timestamp);
+    }
+
+    /**
+     * @notice Make an offer on a listing
+     */
+    function makeOffer(
+        uint256 listingId_,
+        uint256 fractionsOffered_,
+        uint256 pricePerFraction_,
+        uint256 duration_
+    ) external payable whenNotPaused nonReentrant returns (uint256) {
+        Listing storage listing = listings[listingId_];
+
+        require(listing.status == ListingStatus.Active, "Listing not active");
+        require(fractionsOffered_ <= listing.fractionsForSale, "Exceeds available fractions");
+        require(msg.sender != listing.seller, "Cannot offer on own listing");
+
+        uint256 totalOffer = fractionsOffered_ * pricePerFraction_;
+        require(msg.value >= totalOffer, "Insufficient escrow");
+
+        _offerIds++;
+        uint256 newOfferId = _offerIds;
+
+        offers[newOfferId] = Offer({
+            offerId: newOfferId,
+            listingId: listingId_,
+            tokenId: listing.tokenId,
+            buyer: msg.sender,
+            fractionsOffered: fractionsOffered_,
+            pricePerFraction: pricePerFraction_,
+            totalOffer: totalOffer,
+            status: OfferStatus.Pending,
+            createdAt: block.timestamp,
+            expiresAt: block.timestamp + duration_
+        });
+
+        listingOffers[listingId_].push(newOfferId);
+        userOffers[msg.sender].push(newOfferId);
+
+        emit OfferCreated(
+            newOfferId,
+            listingId_,
+            msg.sender,
+            pricePerFraction_,
+            block.timestamp
+        );
+
+        return newOfferId;
+    }
+
+    /**
+     * @notice Accept an offer
+     */
+    function acceptOffer(uint256 offerId_) external nonReentrant {
+        Offer storage offer = offers[offerId_];
+        Listing storage listing = listings[offer.listingId];
+
+        require(listing.seller == msg.sender, "Not seller");
+        require(offer.status == OfferStatus.Pending, "Offer not pending");
+        require(block.timestamp <= offer.expiresAt, "Offer expired");
+
+        uint256 fee = (offer.totalOffer * tradingFeePercent) / 10000;
+        uint256 sellerAmount = offer.totalOffer - fee;
+
+        // Update statuses
+        offer.status = OfferStatus.Accepted;
+        listing.status = ListingStatus.Sold;
+        listing.soldAt = block.timestamp;
+        listing.buyer = offer.buyer;
+
+        // Transfer fractions
+        assetToken.transferFractional(offer.tokenId, offer.buyer, offer.fractionsOffered);
+
+        // Transfer payments
+        payable(listing.seller).transfer(sellerAmount);
+        payable(feeRecipient).transfer(fee);
+
+        // Update stats
+        marketStats.totalSales++;
+        marketStats.totalVolume += offer.totalOffer;
+        marketStats.totalFees += fee;
+
+        emit OfferAccepted(offerId_, offer.listingId, block.timestamp);
+        emit ListingSold(
+            offer.listingId,
+            offer.buyer,
+            offer.fractionsOffered,
+            offer.totalOffer,
+            fee,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Reject an offer
+     */
+    function rejectOffer(uint256 offerId_) external {
+        Offer storage offer = offers[offerId_];
+        Listing storage listing = listings[offer.listingId];
+
+        require(listing.seller == msg.sender, "Not seller");
+        require(offer.status == OfferStatus.Pending, "Offer not pending");
+
+        offer.status = OfferStatus.Rejected;
+
+        // Refund buyer
+        payable(offer.buyer).transfer(offer.totalOffer);
+
+        emit OfferRejected(offerId_, block.timestamp);
+    }
+
+    /**
+     * @notice Cancel an offer
+     */
+    function cancelOffer(uint256 offerId_) external {
+        Offer storage offer = offers[offerId_];
+
+        require(offer.buyer == msg.sender, "Not buyer");
+        require(offer.status == OfferStatus.Pending, "Offer not pending");
+
+        offer.status = OfferStatus.Cancelled;
+
+        // Refund buyer
+        payable(msg.sender).transfer(offer.totalOffer);
+
+        emit OfferCancelled(offerId_, block.timestamp);
+    }
+
+    /**
+     * @notice Update trading fee
+     */
+    function updateTradingFee(uint256 newFeePercent_) external onlyRole(FEE_MANAGER_ROLE) {
+        require(newFeePercent_ <= 1000, "Fee too high"); // Max 10%
+
+        uint256 oldFee = tradingFeePercent;
+        tradingFeePercent = newFeePercent_;
+
+        emit TradingFeeUpdated(oldFee, newFeePercent_, block.timestamp);
+    }
+
+    /**
+     * @notice Update fee recipient
+     */
+    function updateFeeRecipient(address newRecipient_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newRecipient_ != address(0), "Invalid address");
+        feeRecipient = newRecipient_;
+    }
+
+    /**
+     * @notice Get listings for a token
+     */
+    function getTokenListings(uint256 tokenId_) external view returns (uint256[] memory) {
+        return tokenListings[tokenId_];
+    }
+
+    /**
+     * @notice Get user's listings
+     */
+    function getUserListings(address user_) external view returns (uint256[] memory) {
+        return userListings[user_];
+    }
+
+    /**
+     * @notice Get offers for a listing
+     */
+    function getListingOffers(uint256 listingId_) external view returns (uint256[] memory) {
+        return listingOffers[listingId_];
+    }
+
+    /**
+     * @notice Get market statistics
+     */
+    function getMarketStats() external view returns (MarketStats memory) {
+        return marketStats;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

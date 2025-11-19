@@ -1,0 +1,171 @@
+const { Transaction, Account, User } = require('../models');
+const { logger } = require('../utils/logger');
+const { Op } = require('sequelize');
+
+/**
+ * Get transaction history for a wallet address
+ */
+exports.getTransactionHistory = async (req, res, next) => {
+  try {
+    const { walletAddress } = req.params;
+    const { page = 1, limit = 20, type } = req.query;
+
+    const user = await User.findOne({ where: { walletAddress: walletAddress.toLowerCase() } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const accounts = await Account.findAll({ where: { userId: user.id } });
+    const accountIds = accounts.map(acc => acc.id);
+
+    const whereClause = { accountId: { [Op.in]: accountIds } };
+
+    if (type) {
+      whereClause.type = type;
+    }
+
+    const offset = (page - 1) * limit;
+
+    const { count, rows: transactions } = await Transaction.findAndCountAll({
+      where: whereClause,
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+      order: [['timestamp', 'DESC']],
+      include: [
+        {
+          model: Account,
+          as: 'Account',
+          attributes: ['tokenAddress', 'chainId']
+        }
+      ]
+    });
+
+    res.json({
+      walletAddress: user.walletAddress,
+      total: count,
+      page: parseInt(page),
+      totalPages: Math.ceil(count / limit),
+      transactions: transactions.map(tx => ({
+        id: tx.id,
+        txHash: tx.txHash,
+        type: tx.type,
+        amount: tx.amount.toString(),
+        status: tx.status,
+        timestamp: tx.timestamp,
+        tokenAddress: tx.Account?.tokenAddress,
+        chainId: tx.Account?.chainId,
+        blockNumber: tx.blockNumber
+      }))
+    });
+  } catch (error) {
+    logger.error('Error getting transaction history:', error);
+    next(error);
+  }
+};
+
+/**
+ * Get transaction details by hash
+ */
+exports.getTransactionByHash = async (req, res, next) => {
+  try {
+    const { txHash } = req.params;
+
+    const transaction = await Transaction.findOne({
+      where: { txHash: txHash.toLowerCase() },
+      include: [
+        {
+          model: Account,
+          as: 'Account',
+          attributes: ['tokenAddress', 'chainId'],
+          include: [
+            {
+              model: User,
+              attributes: ['walletAddress']
+            }
+          ]
+        }
+      ]
+    });
+
+    if (!transaction) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    res.json({
+      id: transaction.id,
+      txHash: transaction.txHash,
+      type: transaction.type,
+      amount: transaction.amount.toString(),
+      status: transaction.status,
+      timestamp: transaction.timestamp,
+      blockNumber: transaction.blockNumber,
+      gasUsed: transaction.gasUsed,
+      tokenAddress: transaction.Account?.tokenAddress,
+      chainId: transaction.Account?.chainId,
+      walletAddress: transaction.Account?.User?.walletAddress,
+      metadata: transaction.metadata
+    });
+  } catch (error) {
+    logger.error('Error getting transaction by hash:', error);
+    next(error);
+  }
+};
+
+/**
+ * Track a new transaction
+ */
+exports.trackTransaction = async (req, res, next) => {
+  try {
+    const { walletAddress, tokenAddress, txHash, type, amount, chainId } = req.body;
+
+    // Find user
+    const user = await User.findOne({ where: { walletAddress: walletAddress.toLowerCase() } });
+
+    if (!user) {
+      return res.status(400).json({ error: 'User not found' });
+    }
+
+    // Find account
+    const account = await Account.findOne({
+      where: {
+        userId: user.id,
+        tokenAddress: tokenAddress.toLowerCase(),
+        chainId: chainId
+      }
+    });
+
+    if (!account) {
+      return res.status(400).json({ error: 'Account not found' });
+    }
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      accountId: account.id,
+      txHash: txHash.toLowerCase(),
+      type: type,
+      amount: amount,
+      status: 'PENDING',
+      timestamp: new Date()
+    });
+
+    logger.info(`Transaction tracked: ${txHash}`);
+
+    res.status(201).json({
+      message: 'Transaction tracked successfully',
+      transaction: {
+        id: transaction.id,
+        txHash: transaction.txHash,
+        type: transaction.type,
+        status: transaction.status
+      }
+    });
+  } catch (error) {
+    if (error.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({ error: 'Transaction already tracked' });
+    }
+
+    logger.error('Error tracking transaction:', error);
+    next(error);
+  }
+};

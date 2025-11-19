@@ -1,0 +1,770 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IPriceOracle.sol";
+import "./libraries/FlashLoanProtection.sol";
+
+/**
+ * @title MultiAssetCollateralManager
+ * @notice Enhanced collateral manager supporting multiple assets per loan
+ * @dev Allows borrowers to provide mixed collateral baskets for better flexibility and risk management
+ */
+contract MultiAssetCollateralManager is
+    Initializable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    FlashLoanGuard
+{
+    using SafeERC20 for IERC20;
+
+    // ============ Constants ============
+
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+    bytes32 public constant LIQUIDATOR_ROLE = keccak256("LIQUIDATOR_ROLE");
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MAX_ASSETS_PER_BASKET = 10; // Maximum assets in one collateral basket
+
+    // ============ Structs ============
+
+    struct CollateralAsset {
+        address asset;
+        uint256 amount;
+        uint256 lockedAt;
+        uint256 valueAtLock; // USD value when locked (for tracking)
+    }
+
+    struct CollateralBasket {
+        uint256 id;
+        address owner;
+        uint256 loanId; // Associated loan ID
+        CollateralAsset[] assets;
+        uint256 totalValueUSD; // Total value in USD (18 decimals)
+        uint256 createdAt;
+        bool isActive;
+        bool isLiquidated;
+    }
+
+    struct AssetConfig {
+        bool isSupported;
+        uint256 liquidationThreshold; // in basis points (8000 = 80%)
+        uint256 minCollateralRatio; // in basis points (15000 = 150%)
+        uint256 liquidationBonus; // in basis points (500 = 5% bonus for liquidators)
+        uint256 maxAllocation; // Max % of basket this asset can represent (7000 = 70%)
+        uint8 decimals;
+    }
+
+    struct LiquidationInfo {
+        uint256 basketId;
+        address liquidator;
+        uint256 liquidatedValueUSD;
+        uint256 timestamp;
+        address[] assetsLiquidated;
+        uint256[] amountsLiquidated;
+    }
+
+    // ============ State Variables ============
+
+    uint256 public nextBasketId;
+    IPriceOracle public priceOracle;
+
+    mapping(uint256 => CollateralBasket) public collateralBaskets;
+    mapping(address => uint256[]) public userBaskets;
+    mapping(uint256 => uint256) public loanToBasket; // loanId => basketId
+    mapping(address => AssetConfig) public assetConfigs;
+
+    // Liquidation history
+    mapping(uint256 => LiquidationInfo) public liquidationHistory;
+    uint256 public nextLiquidationId;
+
+    // Statistics
+    uint256 public totalBasketsCreated;
+    uint256 public totalActiveBasks;
+    uint256 public totalLiquidations;
+    uint256 public totalValueLockedUSD;
+
+    // ============ Events ============
+
+    event BasketCreated(
+        uint256 indexed basketId,
+        address indexed owner,
+        uint256 indexed loanId,
+        uint256 totalValueUSD
+    );
+
+    event AssetAddedToBasket(
+        uint256 indexed basketId,
+        address indexed asset,
+        uint256 amount,
+        uint256 valueUSD
+    );
+
+    event AssetRemovedFromBasket(
+        uint256 indexed basketId,
+        address indexed asset,
+        uint256 amount
+    );
+
+    event BasketReleased(
+        uint256 indexed basketId,
+        address indexed owner,
+        uint256 totalValueReleased
+    );
+
+    event BasketLiquidated(
+        uint256 indexed basketId,
+        uint256 indexed liquidationId,
+        address indexed liquidator,
+        uint256 totalValueLiquidated
+    );
+
+    event BasketValueUpdated(
+        uint256 indexed basketId,
+        uint256 oldValue,
+        uint256 newValue
+    );
+
+    event AssetConfigured(
+        address indexed asset,
+        bool isSupported,
+        uint256 liquidationThreshold,
+        uint256 minCollateralRatio
+    );
+
+    event PriceOracleUpdated(address indexed oldOracle, address indexed newOracle);
+
+    event EmergencyWithdrawal(
+        address indexed asset,
+        uint256 amount,
+        address indexed recipient
+    );
+
+    // ============ Modifiers ============
+
+    modifier validBasket(uint256 basketId) {
+        require(basketId > 0 && basketId < nextBasketId, "Invalid basket ID");
+        require(collateralBaskets[basketId].isActive, "Basket not active");
+        _;
+    }
+
+    modifier onlyBasketOwner(uint256 basketId) {
+        require(collateralBaskets[basketId].owner == msg.sender, "Not basket owner");
+        _;
+    }
+
+    modifier validAsset(address asset) {
+        require(assetConfigs[asset].isSupported, "Asset not supported");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(address _priceOracle) public initializer {
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MANAGER_ROLE, msg.sender);
+        _grantRole(LIQUIDATOR_ROLE, msg.sender);
+
+        require(_priceOracle != address(0), "Invalid oracle");
+        priceOracle = IPriceOracle(_priceOracle);
+
+        nextBasketId = 1;
+        nextLiquidationId = 1;
+
+        _initializeFlashLoanProtection(3);
+    }
+
+    // ============ Core Functions ============
+
+    /**
+     * @notice Create a new collateral basket for a loan
+     * @param loanId Associated loan ID
+     * @return basketId New basket identifier
+     */
+    function createBasket(uint256 loanId)
+        external
+        nonReentrant
+        whenNotPaused
+        flashLoanProtected
+        returns (uint256)
+    {
+        require(loanToBasket[loanId] == 0, "Basket already exists for loan");
+
+        uint256 basketId = nextBasketId++;
+
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        basket.id = basketId;
+        basket.owner = msg.sender;
+        basket.loanId = loanId;
+        basket.createdAt = block.timestamp;
+        basket.isActive = true;
+
+        loanToBasket[loanId] = basketId;
+        userBaskets[msg.sender].push(basketId);
+
+        totalBasketsCreated++;
+        totalActiveBasks++;
+
+        emit BasketCreated(basketId, msg.sender, loanId, 0);
+
+        return basketId;
+    }
+
+    /**
+     * @notice Add collateral asset to a basket
+     * @param basketId Basket identifier
+     * @param asset Asset address
+     * @param amount Amount to add
+     */
+    function addCollateral(
+        uint256 basketId,
+        address asset,
+        uint256 amount
+    )
+        external
+        nonReentrant
+        whenNotPaused
+        validBasket(basketId)
+        onlyBasketOwner(basketId)
+        validAsset(asset)
+        flashLoanProtected
+    {
+        require(amount > 0, "Amount must be positive");
+
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        require(basket.assets.length < MAX_ASSETS_PER_BASKET, "Max assets reached");
+
+        // Transfer asset to contract
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+
+        // Get current value
+        uint256 assetValueUSD = _getAssetValueUSD(asset, amount);
+
+        // Check allocation limits
+        uint256 newTotalValue = basket.totalValueUSD + assetValueUSD;
+        uint256 assetAllocationBPS = (assetValueUSD * BASIS_POINTS) / newTotalValue;
+        require(
+            assetAllocationBPS <= assetConfigs[asset].maxAllocation,
+            "Exceeds max allocation"
+        );
+
+        // Add to basket
+        basket.assets.push(
+            CollateralAsset({
+                asset: asset,
+                amount: amount,
+                lockedAt: block.timestamp,
+                valueAtLock: assetValueUSD
+            })
+        );
+
+        uint256 oldValue = basket.totalValueUSD;
+        basket.totalValueUSD = newTotalValue;
+        totalValueLockedUSD += assetValueUSD;
+
+        emit AssetAddedToBasket(basketId, asset, amount, assetValueUSD);
+        emit BasketValueUpdated(basketId, oldValue, newTotalValue);
+    }
+
+    /**
+     * @notice Add multiple collateral assets at once
+     * @param basketId Basket identifier
+     * @param assets Array of asset addresses
+     * @param amounts Array of amounts
+     */
+    function batchAddCollateral(
+        uint256 basketId,
+        address[] calldata assets,
+        uint256[] calldata amounts
+    )
+        external
+        nonReentrant
+        whenNotPaused
+        validBasket(basketId)
+        onlyBasketOwner(basketId)
+        flashLoanProtected
+    {
+        require(assets.length == amounts.length, "Array length mismatch");
+        require(assets.length > 0, "Empty arrays");
+
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        require(
+            basket.assets.length + assets.length <= MAX_ASSETS_PER_BASKET,
+            "Max assets exceeded"
+        );
+
+        uint256 totalAddedValue;
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            address asset = assets[i];
+            uint256 amount = amounts[i];
+
+            require(assetConfigs[asset].isSupported, "Asset not supported");
+            require(amount > 0, "Invalid amount");
+
+            // Transfer asset
+            IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+
+            // Get value
+            uint256 assetValueUSD = _getAssetValueUSD(asset, amount);
+            totalAddedValue += assetValueUSD;
+
+            // Add to basket
+            basket.assets.push(
+                CollateralAsset({
+                    asset: asset,
+                    amount: amount,
+                    lockedAt: block.timestamp,
+                    valueAtLock: assetValueUSD
+                })
+            );
+
+            emit AssetAddedToBasket(basketId, asset, amount, assetValueUSD);
+        }
+
+        // Update basket value
+        uint256 oldValue = basket.totalValueUSD;
+        basket.totalValueUSD += totalAddedValue;
+        totalValueLockedUSD += totalAddedValue;
+
+        emit BasketValueUpdated(basketId, oldValue, basket.totalValueUSD);
+    }
+
+    /**
+     * @notice Release entire collateral basket
+     * @param basketId Basket identifier
+     */
+    function releaseBasket(uint256 basketId)
+        external
+        nonReentrant
+        validBasket(basketId)
+        onlyRole(MANAGER_ROLE)
+    {
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        require(!basket.isLiquidated, "Basket already liquidated");
+
+        address owner = basket.owner;
+        uint256 totalReleased = basket.totalValueUSD;
+
+        // Release all assets
+        for (uint256 i = 0; i < basket.assets.length; i++) {
+            CollateralAsset memory collateral = basket.assets[i];
+            IERC20(collateral.asset).safeTransfer(owner, collateral.amount);
+
+            emit AssetRemovedFromBasket(basketId, collateral.asset, collateral.amount);
+        }
+
+        basket.isActive = false;
+        totalActiveBasks--;
+        totalValueLockedUSD -= totalReleased;
+
+        emit BasketReleased(basketId, owner, totalReleased);
+    }
+
+    /**
+     * @notice Liquidate collateral basket
+     * @param basketId Basket identifier
+     * @param recipient Liquidation recipient
+     * @return liquidationId Liquidation record ID
+     */
+    function liquidateBasket(uint256 basketId, address recipient)
+        external
+        nonReentrant
+        validBasket(basketId)
+        onlyRole(LIQUIDATOR_ROLE)
+        returns (uint256)
+    {
+        require(recipient != address(0), "Invalid recipient");
+
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        require(!basket.isLiquidated, "Already liquidated");
+
+        uint256 liquidationId = nextLiquidationId++;
+        uint256 totalLiquidatedValue;
+
+        address[] memory liquidatedAssets = new address[](basket.assets.length);
+        uint256[] memory liquidatedAmounts = new uint256[](basket.assets.length);
+
+        // Liquidate all assets in basket
+        for (uint256 i = 0; i < basket.assets.length; i++) {
+            CollateralAsset memory collateral = basket.assets[i];
+
+            // Calculate liquidation bonus
+            uint256 bonus = assetConfigs[collateral.asset].liquidationBonus;
+            uint256 liquidationAmount = collateral.amount + (collateral.amount * bonus) / BASIS_POINTS;
+
+            // Cap at available amount
+            uint256 contractBalance = IERC20(collateral.asset).balanceOf(address(this));
+            if (liquidationAmount > contractBalance) {
+                liquidationAmount = contractBalance;
+            }
+
+            // Transfer to liquidator
+            IERC20(collateral.asset).safeTransfer(recipient, liquidationAmount);
+
+            uint256 liquidatedValue = _getAssetValueUSD(collateral.asset, liquidationAmount);
+            totalLiquidatedValue += liquidatedValue;
+
+            liquidatedAssets[i] = collateral.asset;
+            liquidatedAmounts[i] = liquidationAmount;
+        }
+
+        // Record liquidation
+        liquidationHistory[liquidationId] = LiquidationInfo({
+            basketId: basketId,
+            liquidator: msg.sender,
+            liquidatedValueUSD: totalLiquidatedValue,
+            timestamp: block.timestamp,
+            assetsLiquidated: liquidatedAssets,
+            amountsLiquidated: liquidatedAmounts
+        });
+
+        basket.isActive = false;
+        basket.isLiquidated = true;
+        totalActiveBasks--;
+        totalLiquidations++;
+        totalValueLockedUSD -= basket.totalValueUSD;
+
+        emit BasketLiquidated(basketId, liquidationId, msg.sender, totalLiquidatedValue);
+
+        return liquidationId;
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get current value of a basket in USD
+     * @param basketId Basket identifier
+     * @return totalValueUSD Current total value
+     */
+    function getBasketValue(uint256 basketId) external view returns (uint256 totalValueUSD) {
+        CollateralBasket storage basket = collateralBaskets[basketId];
+
+        for (uint256 i = 0; i < basket.assets.length; i++) {
+            CollateralAsset memory collateral = basket.assets[i];
+            totalValueUSD += _getAssetValueUSD(collateral.asset, collateral.amount);
+        }
+
+        return totalValueUSD;
+    }
+
+    /**
+     * @notice Get basket assets breakdown
+     * @param basketId Basket identifier
+     * @return assets Array of collateral assets
+     */
+    function getBasketAssets(uint256 basketId)
+        external
+        view
+        returns (CollateralAsset[] memory)
+    {
+        return collateralBaskets[basketId].assets;
+    }
+
+    /**
+     * @notice Get user's basket IDs
+     * @param user User address
+     * @return Array of basket IDs
+     */
+    function getUserBaskets(address user) external view returns (uint256[] memory) {
+        return userBaskets[user];
+    }
+
+    /**
+     * @notice Get basket for a loan
+     * @param loanId Loan identifier
+     * @return basketId Basket ID
+     */
+    function getLoanBasket(uint256 loanId) external view returns (uint256) {
+        return loanToBasket[loanId];
+    }
+
+    /**
+     * @notice Check if basket meets minimum collateral requirements
+     * @param basketId Basket identifier
+     * @param loanValueUSD Loan value in USD
+     * @return isHealthy Whether basket is healthy
+     */
+    function isBasketHealthy(uint256 basketId, uint256 loanValueUSD)
+        external
+        view
+        returns (bool)
+    {
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        uint256 currentValue = this.getBasketValue(basketId);
+
+        // Calculate weighted minimum ratio
+        uint256 weightedMinRatio = _calculateWeightedMinRatio(basket);
+
+        uint256 requiredCollateral = (loanValueUSD * weightedMinRatio) / BASIS_POINTS;
+
+        return currentValue >= requiredCollateral;
+    }
+
+    /**
+     * @notice Get liquidation threshold for basket
+     * @param basketId Basket identifier
+     * @return threshold Weighted liquidation threshold in basis points
+     */
+    function getBasketLiquidationThreshold(uint256 basketId)
+        external
+        view
+        returns (uint256)
+    {
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        return _calculateWeightedLiquidationThreshold(basket);
+    }
+
+    /**
+     * @notice Get detailed basket information
+     * @param basketId Basket identifier
+     * @return basket Full basket details
+     */
+    function getBasketDetails(uint256 basketId)
+        external
+        view
+        returns (CollateralBasket memory)
+    {
+        return collateralBaskets[basketId];
+    }
+
+    /**
+     * @notice Get liquidation info
+     * @param liquidationId Liquidation identifier
+     * @return info Liquidation details
+     */
+    function getLiquidationInfo(uint256 liquidationId)
+        external
+        view
+        returns (LiquidationInfo memory)
+    {
+        return liquidationHistory[liquidationId];
+    }
+
+    /**
+     * @notice Calculate basket diversification score
+     * @param basketId Basket identifier
+     * @return score Diversification score (0-10000 basis points)
+     */
+    function getBasketDiversification(uint256 basketId)
+        external
+        view
+        returns (uint256 score)
+    {
+        CollateralBasket storage basket = collateralBaskets[basketId];
+        uint256 assetCount = basket.assets.length;
+
+        if (assetCount == 0) return 0;
+        if (assetCount == 1) return 0;
+
+        // Calculate Herfindahl-Hirschman Index (HHI) for concentration
+        uint256 totalValue = this.getBasketValue(basketId);
+        uint256 hhi;
+
+        for (uint256 i = 0; i < assetCount; i++) {
+            uint256 assetValue = _getAssetValueUSD(
+                basket.assets[i].asset,
+                basket.assets[i].amount
+            );
+            uint256 share = (assetValue * BASIS_POINTS) / totalValue;
+            hhi += (share * share) / BASIS_POINTS;
+        }
+
+        // Convert HHI to diversification score (10000 - HHI)
+        // Lower HHI = more diversified
+        score = BASIS_POINTS - hhi;
+
+        return score;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Configure asset parameters
+     * @param asset Asset address
+     * @param isSupported Whether asset is supported
+     * @param liquidationThreshold Liquidation threshold in basis points
+     * @param minCollateralRatio Minimum collateral ratio in basis points
+     * @param liquidationBonus Liquidation bonus in basis points
+     * @param maxAllocation Maximum allocation percentage in basis points
+     * @param decimals Asset decimals
+     */
+    function configureAsset(
+        address asset,
+        bool isSupported,
+        uint256 liquidationThreshold,
+        uint256 minCollateralRatio,
+        uint256 liquidationBonus,
+        uint256 maxAllocation,
+        uint8 decimals
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(asset != address(0), "Invalid asset");
+        require(liquidationThreshold <= BASIS_POINTS, "Invalid threshold");
+        require(minCollateralRatio >= BASIS_POINTS, "Ratio must be >= 100%");
+        require(liquidationBonus <= 2000, "Bonus too high"); // Max 20%
+        require(maxAllocation <= BASIS_POINTS, "Invalid max allocation");
+
+        assetConfigs[asset] = AssetConfig({
+            isSupported: isSupported,
+            liquidationThreshold: liquidationThreshold,
+            minCollateralRatio: minCollateralRatio,
+            liquidationBonus: liquidationBonus,
+            maxAllocation: maxAllocation,
+            decimals: decimals
+        });
+
+        emit AssetConfigured(asset, isSupported, liquidationThreshold, minCollateralRatio);
+    }
+
+    /**
+     * @notice Update price oracle
+     * @param newOracle New oracle address
+     */
+    function updatePriceOracle(address newOracle)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(newOracle != address(0), "Invalid oracle");
+        address oldOracle = address(priceOracle);
+        priceOracle = IPriceOracle(newOracle);
+        emit PriceOracleUpdated(oldOracle, newOracle);
+    }
+
+    /**
+     * @notice Pause the contract
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Emergency withdrawal
+     * @param asset Asset address
+     * @param amount Amount to withdraw
+     * @param recipient Recipient address
+     */
+    function emergencyWithdraw(
+        address asset,
+        uint256 amount,
+        address recipient
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(recipient != address(0), "Invalid recipient");
+        IERC20(asset).safeTransfer(recipient, amount);
+        emit EmergencyWithdrawal(asset, amount, recipient);
+    }
+
+    // ============ Internal Functions ============
+
+    /**
+     * @notice Get asset value in USD
+     * @param asset Asset address
+     * @param amount Asset amount
+     * @return valueUSD Value in USD (18 decimals)
+     */
+    function _getAssetValueUSD(address asset, uint256 amount)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 price = priceOracle.getLatestPrice(asset);
+        uint8 decimals = assetConfigs[asset].decimals;
+
+        // Normalize to 18 decimals
+        if (decimals < 18) {
+            amount = amount * (10 ** (18 - decimals));
+        } else if (decimals > 18) {
+            amount = amount / (10 ** (decimals - 18));
+        }
+
+        return (amount * price) / 1e18;
+    }
+
+    /**
+     * @notice Calculate weighted minimum collateral ratio
+     * @param basket Collateral basket
+     * @return weightedRatio Weighted ratio in basis points
+     */
+    function _calculateWeightedMinRatio(CollateralBasket storage basket)
+        internal
+        view
+        returns (uint256)
+    {
+        if (basket.assets.length == 0) return 0;
+
+        uint256 totalValue = this.getBasketValue(basket.id);
+        uint256 weightedSum;
+
+        for (uint256 i = 0; i < basket.assets.length; i++) {
+            CollateralAsset memory collateral = basket.assets[i];
+            uint256 assetValue = _getAssetValueUSD(collateral.asset, collateral.amount);
+            uint256 weight = (assetValue * BASIS_POINTS) / totalValue;
+            uint256 minRatio = assetConfigs[collateral.asset].minCollateralRatio;
+
+            weightedSum += (weight * minRatio) / BASIS_POINTS;
+        }
+
+        return weightedSum;
+    }
+
+    /**
+     * @notice Calculate weighted liquidation threshold
+     * @param basket Collateral basket
+     * @return weightedThreshold Weighted threshold in basis points
+     */
+    function _calculateWeightedLiquidationThreshold(CollateralBasket storage basket)
+        internal
+        view
+        returns (uint256)
+    {
+        if (basket.assets.length == 0) return 0;
+
+        uint256 totalValue = this.getBasketValue(basket.id);
+        uint256 weightedSum;
+
+        for (uint256 i = 0; i < basket.assets.length; i++) {
+            CollateralAsset memory collateral = basket.assets[i];
+            uint256 assetValue = _getAssetValueUSD(collateral.asset, collateral.amount);
+            uint256 weight = (assetValue * BASIS_POINTS) / totalValue;
+            uint256 threshold = assetConfigs[collateral.asset].liquidationThreshold;
+
+            weightedSum += (weight * threshold) / BASIS_POINTS;
+        }
+
+        return weightedSum;
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {}
+
+    /**
+     * @dev Reserved storage space for future versions
+     */
+    uint256[50] private __gap;
+}

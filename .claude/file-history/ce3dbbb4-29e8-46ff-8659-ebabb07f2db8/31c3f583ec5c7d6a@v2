@@ -1,0 +1,801 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "../interfaces/IBTTBInterfaces.sol";
+
+/**
+ * @title ComplianceEngine
+ * @dev Advanced compliance checks beyond basic ERC-3643
+ * @notice Provides automated compliance enforcement including transfer limits,
+ * geographic restrictions, investor accreditation, and regulatory reporting
+ * @custom:security-contact security@bancafi.io
+ */
+contract ComplianceEngine is AccessControl, Pausable {
+
+    bytes32 public constant COMPLIANCE_OFFICER_ROLE = keccak256("COMPLIANCE_OFFICER_ROLE");
+    bytes32 public constant KYC_PROVIDER_ROLE = keccak256("KYC_PROVIDER_ROLE");
+    bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
+
+    struct InvestorProfile {
+        address investor;
+        KYCStatus kycStatus;
+        AccreditationLevel accreditationLevel;
+        string jurisdiction;            // ISO country code
+        uint256 kycExpiryDate;
+        uint256 lastUpdateTime;
+        bool isBlacklisted;
+        bool isWhitelisted;
+        uint256 riskScore;              // 0-100
+        bytes32 kycHash;                // Hash of KYC documents
+    }
+
+    struct TransferRestriction {
+        uint256 dailyLimit;             // Max transfer per day
+        uint256 monthlyLimit;           // Max transfer per month
+        uint256 minHoldingPeriod;       // Min time before transfer (seconds)
+        uint256 maxHoldersCount;        // Max number of token holders
+        bool requiresWhitelist;
+        bool requiresAccreditation;
+        uint256 minInvestmentAmount;
+        uint256 maxInvestmentAmount;
+    }
+
+    struct TransferRecord {
+        address from;
+        address to;
+        uint256 amount;
+        uint256 timestamp;
+        bytes32 complianceHash;
+    }
+
+    struct ComplianceRule {
+        uint256 ruleId;
+        string ruleName;
+        RuleType ruleType;
+        bool isActive;
+        bytes ruleData;                 // Encoded rule parameters
+        uint256 createdAt;
+        uint256 lastModified;
+    }
+
+    enum KYCStatus {
+        NOT_VERIFIED,
+        PENDING,
+        VERIFIED,
+        EXPIRED,
+        REJECTED,
+        SUSPENDED
+    }
+
+    enum AccreditationLevel {
+        RETAIL,                         // Retail investor
+        ACCREDITED,                     // Accredited investor
+        QUALIFIED_INSTITUTIONAL,        // Qualified institutional buyer
+        PROFESSIONAL                    // Professional investor (EU)
+    }
+
+    enum RuleType {
+        GEOGRAPHIC_RESTRICTION,
+        TRANSFER_LIMIT,
+        HOLDING_PERIOD,
+        ACCREDITATION_REQUIREMENT,
+        RISK_ASSESSMENT,
+        CUSTOM
+    }
+
+    // State variables
+    mapping(address => InvestorProfile) public investorProfiles;
+    mapping(address => mapping(address => TransferRestriction)) public bondRestrictions; // bondToken => investor => restrictions
+    mapping(address => uint256) public investorCount; // bondToken => count
+
+    // Transfer tracking for limits
+    mapping(address => mapping(address => mapping(uint256 => uint256))) public dailyTransfers; // investor => bondToken => day => amount
+    mapping(address => mapping(address => mapping(uint256 => uint256))) public monthlyTransfers; // investor => bondToken => month => amount
+    mapping(address => mapping(address => uint256)) public lastTransferTime; // investor => bondToken => timestamp
+    mapping(address => mapping(address => uint256)) public acquisitionTime; // investor => bondToken => timestamp
+
+    // Compliance rules
+    uint256 public nextRuleId;
+    mapping(uint256 => ComplianceRule) public complianceRules;
+    mapping(address => uint256[]) public bondRules; // bondToken => ruleIds
+
+    // Blacklisted/Whitelisted jurisdictions
+    mapping(string => bool) public blacklistedJurisdictions;
+    mapping(string => bool) public whitelistedJurisdictions;
+    bool public useWhitelistMode = false;
+
+    // Global restrictions
+    mapping(address => TransferRestriction) public globalRestrictions; // bondToken => global restrictions
+
+    // Transfer records for audit
+    mapping(address => TransferRecord[]) public transferHistory; // investor => records
+    uint256 public maxTransferHistoryLength = 1000; // ✅ NEW: Prevent unlimited growth
+
+    // Events
+    event InvestorProfileUpdated(
+        address indexed investor,
+        KYCStatus kycStatus,
+        AccreditationLevel accreditationLevel
+    );
+    event InvestorBlacklisted(address indexed investor);
+    event InvestorWhitelisted(address indexed investor);
+    event TransferApproved(
+        address indexed from,
+        address indexed to,
+        address indexed bondToken,
+        uint256 amount
+    );
+    event TransferRejected(
+        address indexed from,
+        address indexed to,
+        address indexed bondToken,
+        uint256 amount,
+        string reason
+    );
+    event ComplianceRuleAdded(uint256 indexed ruleId, string ruleName, RuleType ruleType);
+    event ComplianceRuleUpdated(uint256 indexed ruleId);
+    event JurisdictionBlacklisted(string jurisdiction);
+    event JurisdictionWhitelisted(string jurisdiction);
+    event RestrictionUpdated(address indexed bondToken, address indexed investor);
+
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(COMPLIANCE_OFFICER_ROLE, msg.sender);
+    }
+
+    /**
+     * @dev Update investor KYC profile
+     * @param investor Investor address
+     * @param kycStatus KYC status
+     * @param accreditationLevel Accreditation level
+     * @param jurisdiction ISO country code
+     * @param kycExpiryDate Expiry timestamp
+     * @param riskScore Risk score (0-100)
+     * @param kycHash Hash of KYC documents
+     */
+    function updateInvestorProfile(
+        address investor,
+        KYCStatus kycStatus,
+        AccreditationLevel accreditationLevel,
+        string memory jurisdiction,
+        uint256 kycExpiryDate,
+        uint256 riskScore,
+        bytes32 kycHash
+    ) external onlyRole(KYC_PROVIDER_ROLE) {
+        require(investor != address(0), "Invalid investor");
+        require(riskScore <= 100, "Invalid risk score");
+
+        investorProfiles[investor] = InvestorProfile({
+            investor: investor,
+            kycStatus: kycStatus,
+            accreditationLevel: accreditationLevel,
+            jurisdiction: jurisdiction,
+            kycExpiryDate: kycExpiryDate,
+            lastUpdateTime: block.timestamp,
+            isBlacklisted: investorProfiles[investor].isBlacklisted,
+            isWhitelisted: investorProfiles[investor].isWhitelisted,
+            riskScore: riskScore,
+            kycHash: kycHash
+        });
+
+        emit InvestorProfileUpdated(investor, kycStatus, accreditationLevel);
+    }
+
+    /**
+     * @dev Blacklist investor
+     * @param investor Investor address
+     */
+    function blacklistInvestor(address investor)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        investorProfiles[investor].isBlacklisted = true;
+        investorProfiles[investor].isWhitelisted = false;
+        emit InvestorBlacklisted(investor);
+    }
+
+    /**
+     * @dev Whitelist investor
+     * @param investor Investor address
+     */
+    function whitelistInvestor(address investor)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        investorProfiles[investor].isWhitelisted = true;
+        investorProfiles[investor].isBlacklisted = false;
+        emit InvestorWhitelisted(investor);
+    }
+
+    /**
+     * @dev Remove investor from blacklist
+     * @param investor Investor address
+     */
+    function removeFromBlacklist(address investor)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        investorProfiles[investor].isBlacklisted = false;
+    }
+
+    /**
+     * @dev Set global transfer restrictions for bond token
+     * @param bondToken Bond token address
+     * @param dailyLimit Daily transfer limit
+     * @param monthlyLimit Monthly transfer limit
+     * @param minHoldingPeriod Minimum holding period in seconds
+     * @param maxHoldersCount Maximum holder count
+     * @param requiresWhitelist Whitelist requirement
+     * @param requiresAccreditation Accreditation requirement
+     * @param minInvestmentAmount Minimum investment
+     * @param maxInvestmentAmount Maximum investment
+     */
+    function setGlobalRestrictions(
+        address bondToken,
+        uint256 dailyLimit,
+        uint256 monthlyLimit,
+        uint256 minHoldingPeriod,
+        uint256 maxHoldersCount,
+        bool requiresWhitelist,
+        bool requiresAccreditation,
+        uint256 minInvestmentAmount,
+        uint256 maxInvestmentAmount
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        globalRestrictions[bondToken] = TransferRestriction({
+            dailyLimit: dailyLimit,
+            monthlyLimit: monthlyLimit,
+            minHoldingPeriod: minHoldingPeriod,
+            maxHoldersCount: maxHoldersCount,
+            requiresWhitelist: requiresWhitelist,
+            requiresAccreditation: requiresAccreditation,
+            minInvestmentAmount: minInvestmentAmount,
+            maxInvestmentAmount: maxInvestmentAmount
+        });
+    }
+
+    /**
+     * @dev Set investor-specific restrictions
+     * @param bondToken Bond token address
+     * @param investor Investor address
+     * @param restrictions Transfer restrictions
+     */
+    function setInvestorRestrictions(
+        address bondToken,
+        address investor,
+        TransferRestriction memory restrictions
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        bondRestrictions[bondToken][investor] = restrictions;
+        emit RestrictionUpdated(bondToken, investor);
+    }
+
+    /**
+     * @dev Check if transfer is compliant
+     * @param from Sender address
+     * @param to Recipient address
+     * @param bondToken Bond token address
+     * @param amount Transfer amount
+     * @return bool True if compliant
+     * @return string Reason if not compliant
+     */
+    function canTransfer(
+        address from,
+        address to,
+        address bondToken,
+        uint256 amount
+    ) external view returns (bool, string memory) {
+        // Check if paused (cheapest check first)
+        if (paused()) {
+            return (false, "System paused");
+        }
+
+        // ✅ OPTIMIZED: Cache profiles in memory to avoid multiple storage reads
+        InvestorProfile memory fromProfile = investorProfiles[from];
+        InvestorProfile memory toProfile = investorProfiles[to];
+        TransferRestriction memory globalRestr = globalRestrictions[bondToken];
+
+        // Check blacklist (early exit for most restrictive)
+        (bool blacklistPass, string memory blacklistReason) = _checkBlacklist(fromProfile, toProfile);
+        if (!blacklistPass) return (false, blacklistReason);
+
+        // Check whitelist requirement
+        (bool whitelistPass, string memory whitelistReason) = _checkWhitelist(fromProfile, toProfile, globalRestr);
+        if (!whitelistPass) return (false, whitelistReason);
+
+        // Check accreditation
+        (bool accreditPass, string memory accreditReason) = _checkAccreditation(toProfile, globalRestr);
+        if (!accreditPass) return (false, accreditReason);
+
+        // Check KYC status and expiry
+        (bool kycPass, string memory kycReason) = _checkKYC(fromProfile, toProfile);
+        if (!kycPass) return (false, kycReason);
+
+        // Check jurisdiction restrictions
+        (bool jurisdictionPass, string memory jurisdictionReason) = _checkJurisdiction(fromProfile, toProfile);
+        if (!jurisdictionPass) return (false, jurisdictionReason);
+
+        // Check holding period
+        (bool holdingPass, string memory holdingReason) = _checkHoldingPeriod(from, bondToken, globalRestr);
+        if (!holdingPass) return (false, holdingReason);
+
+        // Check transfer limits
+        (bool limitsPass, string memory limitsReason) = _checkTransferLimits(
+            from,
+            bondToken,
+            amount,
+            globalRestr,
+            bondRestrictions[bondToken][from]
+        );
+        if (!limitsPass) return (false, limitsReason);
+
+        // Check investment amount limits
+        (bool amountPass, string memory amountReason) = _checkAmountLimits(amount, globalRestr);
+        if (!amountPass) return (false, amountReason);
+
+        // Check max holders
+        (bool holdersPass, string memory holdersReason) = _checkMaxHolders(to, bondToken, globalRestr);
+        if (!holdersPass) return (false, holdersReason);
+
+        return (true, "Transfer approved");
+    }
+
+    // ✅ OPTIMIZED: Split into helper functions for readability and gas efficiency
+
+    /**
+     * @dev Check blacklist status
+     */
+    function _checkBlacklist(
+        InvestorProfile memory fromProfile,
+        InvestorProfile memory toProfile
+    ) internal pure returns (bool, string memory) {
+        if (fromProfile.isBlacklisted) {
+            return (false, "Sender blacklisted");
+        }
+        if (toProfile.isBlacklisted) {
+            return (false, "Recipient blacklisted");
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Check whitelist requirements
+     */
+    function _checkWhitelist(
+        InvestorProfile memory fromProfile,
+        InvestorProfile memory toProfile,
+        TransferRestriction memory globalRestr
+    ) internal pure returns (bool, string memory) {
+        if (globalRestr.requiresWhitelist) {
+            if (!fromProfile.isWhitelisted) {
+                return (false, "Sender not whitelisted");
+            }
+            if (!toProfile.isWhitelisted) {
+                return (false, "Recipient not whitelisted");
+            }
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Check accreditation requirements
+     */
+    function _checkAccreditation(
+        InvestorProfile memory toProfile,
+        TransferRestriction memory globalRestr
+    ) internal pure returns (bool, string memory) {
+        if (globalRestr.requiresAccreditation) {
+            if (toProfile.accreditationLevel == AccreditationLevel.RETAIL) {
+                return (false, "Recipient not accredited");
+            }
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Check KYC status and expiry
+     */
+    function _checkKYC(
+        InvestorProfile memory fromProfile,
+        InvestorProfile memory toProfile
+    ) internal view returns (bool, string memory) {
+        if (fromProfile.kycStatus != KYCStatus.VERIFIED) {
+            return (false, "Sender KYC not verified");
+        }
+        if (toProfile.kycStatus != KYCStatus.VERIFIED) {
+            return (false, "Recipient KYC not verified");
+        }
+        if (fromProfile.kycExpiryDate < block.timestamp) {
+            return (false, "Sender KYC expired");
+        }
+        if (toProfile.kycExpiryDate < block.timestamp) {
+            return (false, "Recipient KYC expired");
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Check jurisdiction restrictions
+     */
+    function _checkJurisdiction(
+        InvestorProfile memory fromProfile,
+        InvestorProfile memory toProfile
+    ) internal view returns (bool, string memory) {
+        if (useWhitelistMode) {
+            if (!whitelistedJurisdictions[fromProfile.jurisdiction]) {
+                return (false, "Sender jurisdiction not whitelisted");
+            }
+            if (!whitelistedJurisdictions[toProfile.jurisdiction]) {
+                return (false, "Recipient jurisdiction not whitelisted");
+            }
+        } else {
+            if (blacklistedJurisdictions[fromProfile.jurisdiction]) {
+                return (false, "Sender jurisdiction blacklisted");
+            }
+            if (blacklistedJurisdictions[toProfile.jurisdiction]) {
+                return (false, "Recipient jurisdiction blacklisted");
+            }
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Check holding period requirements
+     */
+    function _checkHoldingPeriod(
+        address from,
+        address bondToken,
+        TransferRestriction memory globalRestr
+    ) internal view returns (bool, string memory) {
+        if (globalRestr.minHoldingPeriod > 0) {
+            uint256 holdingSince = acquisitionTime[from][bondToken];
+            if (holdingSince > 0 && block.timestamp < holdingSince + globalRestr.minHoldingPeriod) {
+                return (false, "Minimum holding period not met");
+            }
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Check daily and monthly transfer limits
+     */
+    function _checkTransferLimits(
+        address from,
+        address bondToken,
+        uint256 amount,
+        TransferRestriction memory globalRestr,
+        TransferRestriction memory investorRestr
+    ) internal view returns (bool, string memory) {
+        // Convert timestamp to day number (days since Unix epoch)
+        // Each day gets a unique identifier for tracking daily limits
+        uint256 currentDay = block.timestamp / 1 days;
+        uint256 dailyUsed = dailyTransfers[from][bondToken][currentDay];
+
+        uint256 effectiveDailyLimit = investorRestr.dailyLimit > 0
+            ? investorRestr.dailyLimit
+            : globalRestr.dailyLimit;
+
+        if (effectiveDailyLimit > 0 && dailyUsed + amount > effectiveDailyLimit) {
+            return (false, "Daily transfer limit exceeded");
+        }
+
+        // Convert timestamp to month number (30-day periods)
+        // Provides approximate monthly tracking for transfer limits
+        uint256 currentMonth = block.timestamp / 30 days;
+        uint256 monthlyUsed = monthlyTransfers[from][bondToken][currentMonth];
+
+        uint256 effectiveMonthlyLimit = investorRestr.monthlyLimit > 0
+            ? investorRestr.monthlyLimit
+            : globalRestr.monthlyLimit;
+
+        if (effectiveMonthlyLimit > 0 && monthlyUsed + amount > effectiveMonthlyLimit) {
+            return (false, "Monthly transfer limit exceeded");
+        }
+
+        return (true, "");
+    }
+
+    /**
+     * @dev Check investment amount limits
+     */
+    function _checkAmountLimits(
+        uint256 amount,
+        TransferRestriction memory globalRestr
+    ) internal pure returns (bool, string memory) {
+        if (globalRestr.minInvestmentAmount > 0 && amount < globalRestr.minInvestmentAmount) {
+            return (false, "Below minimum investment amount");
+        }
+
+        if (globalRestr.maxInvestmentAmount > 0 && amount > globalRestr.maxInvestmentAmount) {
+            return (false, "Above maximum investment amount");
+        }
+
+        return (true, "");
+    }
+
+    /**
+     * @dev Check maximum holders count
+     */
+    function _checkMaxHolders(
+        address to,
+        address bondToken,
+        TransferRestriction memory globalRestr
+    ) internal view returns (bool, string memory) {
+        if (globalRestr.maxHoldersCount > 0) {
+            if (acquisitionTime[to][bondToken] == 0) { // New holder
+                if (investorCount[bondToken] >= globalRestr.maxHoldersCount) {
+                    return (false, "Max holders count reached");
+                }
+            }
+        }
+        return (true, "");
+    }
+
+    /**
+     * @dev Record transfer for compliance tracking
+     * @param from Sender address
+     * @param to Recipient address
+     * @param bondToken Bond token address
+     * @param amount Transfer amount
+     */
+    function recordTransfer(
+        address from,
+        address to,
+        address bondToken,
+        uint256 amount
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) {
+        // Update daily transfers
+        uint256 currentDay = block.timestamp / 1 days;
+        dailyTransfers[from][bondToken][currentDay] += amount;
+
+        // Update monthly transfers
+        uint256 currentMonth = block.timestamp / 30 days;
+        monthlyTransfers[from][bondToken][currentMonth] += amount;
+
+        // Update last transfer time
+        lastTransferTime[from][bondToken] = block.timestamp;
+
+        // Set acquisition time for new holder
+        if (acquisitionTime[to][bondToken] == 0) {
+            acquisitionTime[to][bondToken] = block.timestamp;
+            investorCount[bondToken]++;
+        }
+
+        // Record transfer for audit (with history limit)
+        if (transferHistory[from].length < maxTransferHistoryLength) {
+            bytes32 complianceHash = keccak256(
+                abi.encodePacked(from, to, bondToken, amount, block.timestamp)
+            );
+
+            transferHistory[from].push(TransferRecord({
+                from: from,
+                to: to,
+                amount: amount,
+                timestamp: block.timestamp,
+                complianceHash: complianceHash
+            }));
+        }
+
+        emit TransferApproved(from, to, bondToken, amount);
+    }
+
+    /**
+     * @dev Add compliance rule
+     * @param ruleName Name of the rule
+     * @param ruleType Type of the rule
+     * @param ruleData Encoded rule parameters
+     * @return ruleId ID of created rule
+     */
+    function addComplianceRule(
+        string memory ruleName,
+        RuleType ruleType,
+        bytes memory ruleData
+    ) external onlyRole(COMPLIANCE_OFFICER_ROLE) returns (uint256) {
+        uint256 ruleId = nextRuleId++;
+
+        complianceRules[ruleId] = ComplianceRule({
+            ruleId: ruleId,
+            ruleName: ruleName,
+            ruleType: ruleType,
+            isActive: true,
+            ruleData: ruleData,
+            createdAt: block.timestamp,
+            lastModified: block.timestamp
+        });
+
+        emit ComplianceRuleAdded(ruleId, ruleName, ruleType);
+
+        return ruleId;
+    }
+
+    /**
+     * @dev Assign rule to bond token
+     * @param bondToken Bond token address
+     * @param ruleId Rule ID to assign
+     */
+    function assignRuleToBond(address bondToken, uint256 ruleId)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        require(complianceRules[ruleId].isActive, "Rule not active");
+        bondRules[bondToken].push(ruleId);
+    }
+
+    /**
+     * @dev Blacklist jurisdiction
+     * @param jurisdiction ISO country code
+     */
+    function blacklistJurisdiction(string memory jurisdiction)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        blacklistedJurisdictions[jurisdiction] = true;
+        emit JurisdictionBlacklisted(jurisdiction);
+    }
+
+    /**
+     * @dev Whitelist jurisdiction
+     * @param jurisdiction ISO country code
+     */
+    function whitelistJurisdiction(string memory jurisdiction)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        whitelistedJurisdictions[jurisdiction] = true;
+        emit JurisdictionWhitelisted(jurisdiction);
+    }
+
+    /**
+     * @dev Toggle whitelist mode
+     * @param enabled Enable whitelist mode
+     */
+    function setWhitelistMode(bool enabled)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        useWhitelistMode = enabled;
+    }
+
+    /**
+     * @dev Batch update KYC status
+     * @param investors Array of investor addresses
+     * @param statuses Array of KYC statuses
+     * @param expiryDates Array of expiry dates
+     */
+    function batchUpdateKYC(
+        address[] memory investors,
+        KYCStatus[] memory statuses,
+        uint256[] memory expiryDates
+    ) external onlyRole(KYC_PROVIDER_ROLE) {
+        require(
+            investors.length == statuses.length &&
+            investors.length == expiryDates.length,
+            "Length mismatch"
+        );
+        require(investors.length <= 100, "Batch too large"); // ✅ NEW: Added limit
+
+        uint256 length = investors.length;
+        for (uint256 i = 0; i < length; ) {
+            investorProfiles[investors[i]].kycStatus = statuses[i];
+            investorProfiles[investors[i]].kycExpiryDate = expiryDates[i];
+            investorProfiles[investors[i]].lastUpdateTime = block.timestamp;
+
+            emit InvestorProfileUpdated(
+                investors[i],
+                statuses[i],
+                investorProfiles[investors[i]].accreditationLevel
+            );
+
+            unchecked { ++i; } // ✅ Gas optimization
+        }
+    }
+
+    /**
+     * @dev Get investor transfer history
+     * @param investor Investor address
+     * @return Array of transfer records
+     */
+    function getTransferHistory(address investor)
+        external
+        view
+        returns (TransferRecord[] memory)
+    {
+        return transferHistory[investor];
+    }
+
+    /**
+     * @dev Get bond compliance rules
+     * @param bondToken Bond token address
+     * @return Array of rule IDs
+     */
+    function getBondRules(address bondToken)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        return bondRules[bondToken];
+    }
+
+    /**
+     * @dev Get investor daily transfer usage
+     * @param investor Investor address
+     * @param bondToken Bond token address
+     * @return Daily transfer amount used
+     */
+    function getDailyTransferUsage(address investor, address bondToken)
+        external
+        view
+        returns (uint256)
+    {
+        uint256 currentDay = block.timestamp / 1 days;
+        return dailyTransfers[investor][bondToken][currentDay];
+    }
+
+    /**
+     * @dev Get investor monthly transfer usage
+     * @param investor Investor address
+     * @param bondToken Bond token address
+     * @return Monthly transfer amount used
+     */
+    function getMonthlyTransferUsage(address investor, address bondToken)
+        external
+        view
+        returns (uint256)
+    {
+        uint256 currentMonth = block.timestamp / 30 days;
+        return monthlyTransfers[investor][bondToken][currentMonth];
+    }
+
+    /**
+     * @dev Check if investor is compliant
+     * @param investor Investor address
+     * @return True if investor is compliant
+     */
+    function isInvestorCompliant(address investor)
+        external
+        view
+        returns (bool)
+    {
+        InvestorProfile memory profile = investorProfiles[investor];
+
+        if (profile.isBlacklisted) return false;
+        if (profile.kycStatus != KYCStatus.VERIFIED) return false;
+        if (profile.kycExpiryDate < block.timestamp) return false;
+
+        if (useWhitelistMode && !whitelistedJurisdictions[profile.jurisdiction]) {
+            return false;
+        }
+
+        if (!useWhitelistMode && blacklistedJurisdictions[profile.jurisdiction]) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Update max transfer history length
+     * @param _maxLength New maximum length
+     */
+    function updateMaxTransferHistoryLength(uint256 _maxLength)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(_maxLength >= 100 && _maxLength <= 10000, "Invalid length");
+        maxTransferHistoryLength = _maxLength;
+    }
+
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause contract
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+}

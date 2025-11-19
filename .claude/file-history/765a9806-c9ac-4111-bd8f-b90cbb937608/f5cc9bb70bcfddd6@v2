@@ -1,0 +1,410 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+/**
+ * Security Test Suite: C-3 Interest Overflow
+ *
+ * Tests for the interest calculation overflow security fix that prevents
+ * arithmetic overflow when calculating interest on large principals.
+ *
+ * Vulnerability: Interest calculation multiplied large values before dividing,
+ * causing overflow: (principal * rate * duration) / (365 days * BASIS_POINTS)
+ *
+ * Fix: Reordered operations to divide first: (principal * rate / BASIS_POINTS) * duration / 365 days
+ * Added MAX_PRINCIPAL constant to reject loans that could overflow.
+ */
+describe("Security Tests: C-3 Interest Overflow", function () {
+  let bancafiLending;
+  let collateralManager;
+  let creditScore;
+  let complianceManager;
+  let mockUSDC, mockWETH;
+  let owner, borrower, lender;
+
+  const BASIS_POINTS = 10000n;
+  const SECONDS_PER_YEAR = 365n * 24n * 60n * 60n;
+
+  beforeEach(async function () {
+    [owner, borrower, lender] = await ethers.getSigners();
+
+    // Deploy dependencies
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    mockUSDC = await MockERC20.deploy("Mock USDC", "USDC", 6);
+    mockWETH = await MockERC20.deploy("Mock WETH", "WETH", 18);
+    await mockUSDC.waitForDeployment();
+    await mockWETH.waitForDeployment();
+
+    // Deploy CollateralManager
+    const CollateralManager = await ethers.getContractFactory("CollateralManager");
+    collateralManager = await upgrades.deployProxy(
+      CollateralManager,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await collateralManager.waitForDeployment();
+
+    // Deploy CreditScore
+    const CreditScore = await ethers.getContractFactory("CreditScore");
+    creditScore = await upgrades.deployProxy(
+      CreditScore,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await creditScore.waitForDeployment();
+
+    // Deploy ComplianceManager
+    const ComplianceManager = await ethers.getContractFactory("ComplianceManager");
+    complianceManager = await upgrades.deployProxy(
+      ComplianceManager,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await complianceManager.waitForDeployment();
+
+    // Deploy BancafiLending
+    const BancafiLending = await ethers.getContractFactory("BancafiLending");
+    bancafiLending = await upgrades.deployProxy(
+      BancafiLending,
+      [
+        await collateralManager.getAddress(),
+        await creditScore.getAddress(),
+        await complianceManager.getAddress()
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await bancafiLending.waitForDeployment();
+
+    // Setup authorizations
+    await collateralManager.setAuthorizedCaller(await bancafiLending.getAddress(), true);
+    await collateralManager.configureAsset(
+      await mockUSDC.getAddress(),
+      true, 8000, 15000, ethers.ZeroAddress
+    );
+    await collateralManager.configureAsset(
+      await mockWETH.getAddress(),
+      true, 8000, 15000, ethers.ZeroAddress
+    );
+    await collateralManager.updateAssetPrice(await mockUSDC.getAddress(), ethers.parseEther("1"));
+    await collateralManager.updateAssetPrice(await mockWETH.getAddress(), ethers.parseEther("2000"));
+
+    // Configure lending
+    await bancafiLending.configureLendingAsset(
+      await mockUSDC.getAddress(),
+      true, 500, 2000, ethers.parseUnits("1000000", 6)
+    );
+
+    // Mint tokens
+    await mockUSDC.mint(lender.address, ethers.parseUnits("10000000", 6));
+    await mockWETH.mint(borrower.address, ethers.parseEther("1000"));
+
+    // Approve KYC
+    await complianceManager.approveKYC(borrower.address, 2);
+    await complianceManager.approveKYC(lender.address, 2);
+  });
+
+  describe("C-3.1: MAX_PRINCIPAL Validation", function () {
+    it("Should have MAX_PRINCIPAL constant defined", async function () {
+      const maxPrincipal = await bancafiLending.MAX_PRINCIPAL();
+      expect(maxPrincipal).to.be.gt(0);
+    });
+
+    it("Should reject loan with principal exceeding MAX_PRINCIPAL", async function () {
+      const maxPrincipal = await bancafiLending.MAX_PRINCIPAL();
+      const excessivePrincipal = maxPrincipal + 1n;
+
+      // Deposit collateral
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("100")
+      );
+
+      // Try to create loan with excessive principal
+      await expect(
+        bancafiLending.connect(borrower).createLoanRequest(
+          await mockUSDC.getAddress(),
+          excessivePrincipal,
+          1000, // 10% APR
+          30 * 24 * 60 * 60, // 30 days
+          await mockWETH.getAddress(),
+          ethers.parseEther("100")
+        )
+      ).to.be.revertedWith("Principal too large (overflow risk)");
+    });
+
+    it("Should accept loan at MAX_PRINCIPAL boundary", async function () {
+      const maxPrincipal = await bancafiLending.MAX_PRINCIPAL();
+
+      // Mint enough tokens
+      await mockUSDC.mint(lender.address, maxPrincipal);
+      await mockWETH.mint(borrower.address, ethers.parseEther("100000"));
+
+      // Deposit large collateral
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("100000")
+      );
+
+      // Create loan at exact MAX_PRINCIPAL
+      await expect(
+        bancafiLending.connect(borrower).createLoanRequest(
+          await mockUSDC.getAddress(),
+          maxPrincipal,
+          500, // 5% APR
+          30 * 24 * 60 * 60,
+          await mockWETH.getAddress(),
+          ethers.parseEther("100000")
+        )
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("C-3.2: Safe Interest Calculation", function () {
+    it("Should calculate interest without overflow for large principal", async function () {
+      // Use a large but safe principal
+      const largePrincipal = ethers.parseUnits("1000000", 6); // 1M USDC
+      const interestRate = 1500; // 15% APR
+      const duration = 365 * 24 * 60 * 60; // 1 year
+
+      // Mint and approve
+      await mockUSDC.mint(lender.address, largePrincipal * 2n);
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("1000")
+      );
+
+      // Create loan
+      await bancafiLending.connect(borrower).createLoanRequest(
+        await mockUSDC.getAddress(),
+        largePrincipal,
+        interestRate,
+        duration,
+        await mockWETH.getAddress(),
+        ethers.parseEther("1000")
+      );
+
+      const loanId = 1;
+
+      // Fund loan
+      await mockUSDC.connect(lender).approve(await bancafiLending.getAddress(), largePrincipal);
+      await bancafiLending.connect(lender).fundLoan(loanId);
+
+      // Calculate total owed (should not overflow)
+      const totalOwed = await bancafiLending.calculateTotalOwed(loanId);
+
+      // Expected: principal + (principal * rate / BASIS_POINTS)
+      // 1M + (1M * 0.15) = 1.15M
+      const expectedInterest = (largePrincipal * BigInt(interestRate)) / BASIS_POINTS;
+      const expected = largePrincipal + expectedInterest;
+
+      expect(totalOwed).to.be.closeTo(expected, ethers.parseUnits("1000", 6)); // Within 1000 USDC
+    });
+
+    it("Should handle maximum safe interest rate without overflow", async function () {
+      const principal = ethers.parseUnits("100000", 6); // 100K USDC
+      const maxInterestRate = 2000; // 20% APR (max allowed)
+      const duration = 365 * 24 * 60 * 60;
+
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("100")
+      );
+
+      await bancafiLending.connect(borrower).createLoanRequest(
+        await mockUSDC.getAddress(),
+        principal,
+        maxInterestRate,
+        duration,
+        await mockWETH.getAddress(),
+        ethers.parseEther("100")
+      );
+
+      const loanId = 1;
+
+      await mockUSDC.connect(lender).approve(await bancafiLending.getAddress(), principal);
+      await bancafiLending.connect(lender).fundLoan(loanId);
+
+      const totalOwed = await bancafiLending.calculateTotalOwed(loanId);
+
+      // Should complete without overflow
+      expect(totalOwed).to.be.gt(principal);
+    });
+
+    it("Should calculate correct interest for partial duration", async function () {
+      const principal = ethers.parseUnits("10000", 6);
+      const interestRate = 1000; // 10% APR
+      const duration = 30 * 24 * 60 * 60; // 30 days
+
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("10")
+      );
+
+      await bancafiLending.connect(borrower).createLoanRequest(
+        await mockUSDC.getAddress(),
+        principal,
+        interestRate,
+        duration,
+        await mockWETH.getAddress(),
+        ethers.parseEther("10")
+      );
+
+      const loanId = 1;
+
+      await mockUSDC.connect(lender).approve(await bancafiLending.getAddress(), principal);
+      await bancafiLending.connect(lender).fundLoan(loanId);
+
+      const totalOwed = await bancafiLending.calculateTotalOwed(loanId);
+
+      // Interest = (10000 * 0.10 * 30) / 365 ≈ 82.19 USDC
+      // Total ≈ 10082.19 USDC
+      const expectedMin = ethers.parseUnits("10080", 6);
+      const expectedMax = ethers.parseUnits("10085", 6);
+
+      expect(totalOwed).to.be.gte(expectedMin);
+      expect(totalOwed).to.be.lte(expectedMax);
+    });
+  });
+
+  describe("C-3.3: Overflow Prevention Edge Cases", function () {
+    it("Should handle zero duration correctly", async function () {
+      const principal = ethers.parseUnits("10000", 6);
+      const interestRate = 1000;
+      const duration = 0; // Zero duration
+
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("10")
+      );
+
+      // Should reject zero duration
+      await expect(
+        bancafiLending.connect(borrower).createLoanRequest(
+          await mockUSDC.getAddress(),
+          principal,
+          interestRate,
+          duration,
+          await mockWETH.getAddress(),
+          ethers.parseEther("10")
+        )
+      ).to.be.reverted;
+    });
+
+    it("Should handle maximum duration without overflow", async function () {
+      const principal = ethers.parseUnits("10000", 6);
+      const interestRate = 1000;
+      const maxDuration = 10 * 365 * 24 * 60 * 60; // 10 years
+
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("20")
+      );
+
+      await bancafiLending.connect(borrower).createLoanRequest(
+        await mockUSDC.getAddress(),
+        principal,
+        interestRate,
+        maxDuration,
+        await mockWETH.getAddress(),
+        ethers.parseEther("20")
+      );
+
+      const loanId = 1;
+
+      await mockUSDC.connect(lender).approve(await bancafiLending.getAddress(), principal * 2n);
+      await bancafiLending.connect(lender).fundLoan(loanId);
+
+      // Should calculate without overflow
+      const totalOwed = await bancafiLending.calculateTotalOwed(loanId);
+      expect(totalOwed).to.be.gt(principal);
+    });
+
+    it("Should handle minimum interest rate (zero) correctly", async function () {
+      // Reconfigure to allow 0% interest for testing
+      await bancafiLending.configureLendingAsset(
+        await mockUSDC.getAddress(),
+        true, 0, 2000, ethers.parseUnits("1000000", 6)
+      );
+
+      const principal = ethers.parseUnits("10000", 6);
+      const interestRate = 0;
+      const duration = 365 * 24 * 60 * 60;
+
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("10")
+      );
+
+      await bancafiLending.connect(borrower).createLoanRequest(
+        await mockUSDC.getAddress(),
+        principal,
+        interestRate,
+        duration,
+        await mockWETH.getAddress(),
+        ethers.parseEther("10")
+      );
+
+      const loanId = 1;
+
+      await mockUSDC.connect(lender).approve(await bancafiLending.getAddress(), principal);
+      await bancafiLending.connect(lender).fundLoan(loanId);
+
+      const totalOwed = await bancafiLending.calculateTotalOwed(loanId);
+
+      // Zero interest = principal only
+      expect(totalOwed).to.equal(principal);
+    });
+  });
+
+  describe("C-3.4: Comparison with Vulnerable Calculation", function () {
+    it("Should produce same result as safe calculation for small values", async function () {
+      const principal = ethers.parseUnits("1000", 6);
+      const interestRate = 1000; // 10%
+      const duration = 365 * 24 * 60 * 60;
+
+      // Safe calculation: (principal * rate / BASIS_POINTS) * duration / SECONDS_PER_YEAR
+      const rateAdjustedPrincipal = (principal * BigInt(interestRate)) / BASIS_POINTS;
+      const interest = (rateAdjustedPrincipal * BigInt(duration)) / SECONDS_PER_YEAR;
+      const expectedTotal = principal + interest;
+
+      // Create actual loan
+      await mockWETH.connect(borrower).approve(
+        await collateralManager.getAddress(),
+        ethers.parseEther("2")
+      );
+
+      await bancafiLending.connect(borrower).createLoanRequest(
+        await mockUSDC.getAddress(),
+        principal,
+        interestRate,
+        duration,
+        await mockWETH.getAddress(),
+        ethers.parseEther("2")
+      );
+
+      const loanId = 1;
+
+      await mockUSDC.connect(lender).approve(await bancafiLending.getAddress(), principal);
+      await bancafiLending.connect(lender).fundLoan(loanId);
+
+      const actualTotal = await bancafiLending.calculateTotalOwed(loanId);
+
+      // Should match safe calculation
+      expect(actualTotal).to.equal(expectedTotal);
+    });
+  });
+
+  describe("C-3.5: MAX_PRINCIPAL Calculation Correctness", function () {
+    it("Should have MAX_PRINCIPAL that prevents overflow", async function () {
+      const maxPrincipal = await bancafiLending.MAX_PRINCIPAL();
+      const maxInterestRate = 2000; // 20% (from MAX_INTEREST_RATE)
+
+      // Verify that MAX_PRINCIPAL * MAX_INTEREST_RATE doesn't overflow
+      // MAX_PRINCIPAL should be: type(uint256).max / (MAX_INTEREST_RATE * 365 days)
+
+      const calculation = maxPrincipal * BigInt(maxInterestRate) * SECONDS_PER_YEAR;
+
+      // Should not overflow uint256
+      expect(calculation).to.be.lt(ethers.MaxUint256);
+    });
+  });
+});

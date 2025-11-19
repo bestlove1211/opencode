@@ -1,0 +1,159 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("🔐 GRANT GOVERNANCE ROLES TO DAO\n");
+  console.log("=".repeat(70));
+
+  const [deployer] = await ethers.getSigners();
+  console.log("Admin Account:", deployer.address, "\n");
+
+  // Contract addresses (update these with your deployed addresses)
+  const addresses = {
+    governanceToken: "0xc3e53F4d16Ae77Db1c982e75a937B9f60FE63690",
+    timelock: "0x84eA74d481Ee0A5332c457a4d796187F6Ba67fEB",
+    dao: "0xa82fF9aFd8f496c3d6ac40E2a0F282E47488CFc9",
+    assetToken: "0x851356ae760d987E095750cCeb3bC6014560891C",
+    bailout: "0x95401dc811bb5740090279Ba06cfA8fcF6113778",
+    rentalIncome: "0x70e0bA845a1A0F2DA3359C97E0285013525FFC49",
+    institutional: "0x99bbA657f2BbC93c02D617f8bA121cB8Fc104Acf"
+  };
+
+  // Get contract instances
+  const governanceToken = await ethers.getContractAt("BancafiGovernanceToken", addresses.governanceToken);
+  const timelock = await ethers.getContractAt("BancafiTimelock", addresses.timelock);
+  const dao = await ethers.getContractAt("BancafiDAO", addresses.dao);
+  const assetToken = await ethers.getContractAt("BancafiAssetToken", addresses.assetToken);
+  const bailout = await ethers.getContractAt("BancafiBailout", addresses.bailout);
+  const rentalIncome = await ethers.getContractAt("BancafiRentalIncome", addresses.rentalIncome);
+  const institutional = await ethers.getContractAt("BancafiInstitutional", addresses.institutional);
+
+  console.log("📋 STEP 1: Grant DAO roles on Timelock");
+  console.log("=".repeat(70));
+
+  const PROPOSER_ROLE = await timelock.PROPOSER_ROLE();
+  const EXECUTOR_ROLE = await timelock.EXECUTOR_ROLE();
+
+  // Check if already granted
+  const hasProposer = await timelock.hasRole(PROPOSER_ROLE, addresses.dao);
+  const hasExecutor = await timelock.hasRole(EXECUTOR_ROLE, addresses.dao);
+
+  if (!hasProposer) {
+    await timelock.grantRole(PROPOSER_ROLE, addresses.dao);
+    console.log("✅ Granted PROPOSER_ROLE to DAO");
+  } else {
+    console.log("✅ DAO already has PROPOSER_ROLE");
+  }
+
+  if (!hasExecutor) {
+    await timelock.grantRole(EXECUTOR_ROLE, addresses.dao);
+    console.log("✅ Granted EXECUTOR_ROLE to DAO");
+  } else {
+    console.log("✅ DAO already has EXECUTOR_ROLE");
+  }
+
+  console.log("\n📋 STEP 2: Grant DAO control over Bailout System");
+  console.log("=".repeat(70));
+
+  const BAILOUT_APPROVER_ROLE = await bailout.BAILOUT_APPROVER_ROLE();
+  const TREASURY_MANAGER_ROLE = await bailout.TREASURY_MANAGER_ROLE();
+
+  const hasBailoutApprover = await bailout.hasRole(BAILOUT_APPROVER_ROLE, addresses.dao);
+
+  if (!hasBailoutApprover) {
+    await bailout.grantRole(BAILOUT_APPROVER_ROLE, addresses.dao);
+    console.log("✅ Granted BAILOUT_APPROVER_ROLE to DAO");
+  } else {
+    console.log("✅ DAO already has BAILOUT_APPROVER_ROLE");
+  }
+
+  console.log("\n📋 STEP 3: Grant DAO control over Asset Token");
+  console.log("=".repeat(70));
+
+  const VERIFIER_ROLE = await assetToken.VERIFIER_ROLE();
+
+  const hasVerifier = await assetToken.hasRole(VERIFIER_ROLE, addresses.dao);
+
+  if (!hasVerifier) {
+    await assetToken.grantRole(VERIFIER_ROLE, addresses.dao);
+    console.log("✅ Granted VERIFIER_ROLE to DAO on AssetToken");
+  } else {
+    console.log("✅ DAO already has VERIFIER_ROLE on AssetToken");
+  }
+
+  console.log("\n📋 STEP 4: Grant DAO control over Rental Income");
+  console.log("=".repeat(70));
+
+  const INCOME_MANAGER_ROLE = await rentalIncome.INCOME_MANAGER_ROLE();
+
+  const hasIncomeManager = await rentalIncome.hasRole(INCOME_MANAGER_ROLE, addresses.dao);
+
+  if (!hasIncomeManager) {
+    await rentalIncome.grantRole(INCOME_MANAGER_ROLE, addresses.dao);
+    console.log("✅ Granted INCOME_MANAGER_ROLE to DAO");
+  } else {
+    console.log("✅ DAO already has INCOME_MANAGER_ROLE");
+  }
+
+  console.log("\n📋 STEP 5: Grant DAO control over Institutional Onboarding");
+  console.log("=".repeat(70));
+
+  const COMPLIANCE_OFFICER_ROLE = await institutional.COMPLIANCE_OFFICER_ROLE();
+  const INST_VERIFIER_ROLE = await institutional.VERIFIER_ROLE();
+
+  const hasCompliance = await institutional.hasRole(COMPLIANCE_OFFICER_ROLE, addresses.dao);
+  const hasInstVerifier = await institutional.hasRole(INST_VERIFIER_ROLE, addresses.dao);
+
+  if (!hasCompliance) {
+    await institutional.grantRole(COMPLIANCE_OFFICER_ROLE, addresses.dao);
+    console.log("✅ Granted COMPLIANCE_OFFICER_ROLE to DAO");
+  } else {
+    console.log("✅ DAO already has COMPLIANCE_OFFICER_ROLE");
+  }
+
+  if (!hasInstVerifier) {
+    await institutional.grantRole(INST_VERIFIER_ROLE, addresses.dao);
+    console.log("✅ Granted VERIFIER_ROLE to DAO on Institutional");
+  } else {
+    console.log("✅ DAO already has VERIFIER_ROLE on Institutional");
+  }
+
+  console.log("\n📋 STEP 6: Delegate voting power");
+  console.log("=".repeat(70));
+
+  const currentDelegate = await governanceToken.delegates(deployer.address);
+
+  if (currentDelegate === ethers.ZeroAddress) {
+    await governanceToken.delegate(deployer.address);
+    console.log("✅ Deployer delegated tokens to self");
+  } else {
+    console.log("✅ Tokens already delegated to:", currentDelegate);
+  }
+
+  const votingPower = await governanceToken.getVotes(deployer.address);
+  console.log("   Voting power:", ethers.formatEther(votingPower), "BGT");
+
+  console.log("\n" + "=".repeat(70));
+  console.log("✅ GOVERNANCE ROLES GRANTED SUCCESSFULLY!");
+  console.log("=".repeat(70));
+
+  console.log("\n📊 ROLE SUMMARY:");
+  console.log("  DAO can now:");
+  console.log("  ✅ Propose and execute timelock proposals");
+  console.log("  ✅ Approve bailout requests");
+  console.log("  ✅ Verify assets");
+  console.log("  ✅ Manage rental income distribution");
+  console.log("  ✅ Verify institutional investors");
+  console.log("  ✅ Handle compliance for institutions");
+
+  console.log("\n💡 Next Steps:");
+  console.log("  1. Create governance proposals through the DAO");
+  console.log("  2. Vote on proposals with delegated tokens");
+  console.log("  3. Execute approved proposals after timelock delay");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

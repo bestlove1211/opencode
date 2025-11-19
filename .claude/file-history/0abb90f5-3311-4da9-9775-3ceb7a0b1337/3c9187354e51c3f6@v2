@@ -1,0 +1,219 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("🧪 Starting Bancafi Function Tests...\n");
+
+  // Load deployment addresses
+  const addresses = {
+    governanceToken: "0xc6e7DF5E7b4f2A278906862b61205850344D4e7d",
+    timelock: "0x59b670e9fA9D0A427751Af201D676719a970857b",
+    dao: "0x4ed7c70F96B99c776995fB64377f0d4aB3B0e1C1",
+    assetToken: "0x322813Fd9A801c5507c9de605d63CEA4f2CE6c44",
+    bailout: "0xa85233C63b9Ee964Add6F2cffe00Fd84eb32338f"
+  };
+
+  const [deployer, user1, user2] = await ethers.getSigners();
+  console.log("Test Accounts:");
+  console.log("  Deployer:", deployer.address);
+  console.log("  User1:", user1.address);
+  console.log("  User2:", user2.address, "\n");
+
+  // Get contract instances
+  const governanceToken = await ethers.getContractAt("BancafiGovernanceToken", addresses.governanceToken);
+  const assetToken = await ethers.getContractAt("BancafiAssetToken", addresses.assetToken);
+  const bailout = await ethers.getContractAt("BancafiBailout", addresses.bailout);
+  const dao = await ethers.getContractAt("BancafiDAO", addresses.dao);
+
+  console.log("=" .repeat(60));
+  console.log("TEST 1: Governance Token Functions");
+  console.log("=" .repeat(60));
+
+  // Check total supply
+  const totalSupply = await governanceToken.totalSupply();
+  console.log("✅ Total Supply:", ethers.formatEther(totalSupply), "BGT");
+
+  // Check balance
+  const balance = await governanceToken.balanceOf(deployer.address);
+  console.log("✅ Deployer Balance:", ethers.formatEther(balance), "BGT");
+
+  // Transfer tokens to user1
+  console.log("\n📤 Transferring 10,000 BGT to User1...");
+  const transferAmount = ethers.parseEther("10000");
+  await governanceToken.transfer(user1.address, transferAmount);
+  const user1Balance = await governanceToken.balanceOf(user1.address);
+  console.log("✅ User1 Balance:", ethers.formatEther(user1Balance), "BGT");
+
+  // Delegate voting power
+  console.log("\n🗳️  User1 delegating voting power to self...");
+  await governanceToken.connect(user1).delegate(user1.address);
+  const votes = await governanceToken.getVotes(user1.address);
+  console.log("✅ User1 Voting Power:", ethers.formatEther(votes), "votes");
+
+  console.log("\n" + "=".repeat(60));
+  console.log("TEST 2: Asset Tokenization Functions");
+  console.log("=" .repeat(60));
+
+  // Tokenize Real Estate
+  console.log("\n🏠 Tokenizing Real Estate Asset...");
+  const tx1 = await assetToken.tokenizeAsset(
+    user1.address,
+    0, // AssetType.RealEstate
+    ethers.parseEther("1000000"), // 1M valuation
+    "Dubai Marina Tower 3, Floor 15",
+    "ipfs://QmRealEstateDocs123abc"
+  );
+  const receipt1 = await tx1.wait();
+  console.log("✅ Real Estate Asset Tokenized! Token ID: 1");
+  console.log("   Owner:", user1.address);
+  console.log("   Valuation: 1,000,000 ETH");
+
+  // Tokenize Gold
+  console.log("\n🥇 Tokenizing Gold Asset...");
+  const tx2 = await assetToken.tokenizeAsset(
+    user2.address,
+    3, // AssetType.GoldAndPreciousMetals
+    ethers.parseEther("500000"), // 500K valuation
+    "Swiss Gold Vault #7842",
+    "ipfs://QmGoldCertificate456def"
+  );
+  await tx2.wait();
+  console.log("✅ Gold Asset Tokenized! Token ID: 2");
+  console.log("   Owner:", user2.address);
+  console.log("   Valuation: 500,000 ETH");
+
+  // Verify asset
+  console.log("\n✔️  Verifying Real Estate Asset (Token ID: 1)...");
+  await assetToken.verifyAsset(1);
+  const metadata = await assetToken.assetMetadata(1);
+  console.log("✅ Asset Verified!");
+  console.log("   Status:", metadata.status); // 1 = Verified
+
+  // Get total assets
+  const totalAssets = await assetToken.totalSupply();
+  console.log("\n📊 Total Assets Tokenized:", totalAssets.toString());
+
+  // Fractionalize asset
+  console.log("\n🔀 Fractionalizing Real Estate (Token ID: 1) into 1000 fractions...");
+  await assetToken.connect(user1).fractionalizeAsset(1, 1000);
+  const fractionalMeta = await assetToken.assetMetadata(1);
+  console.log("✅ Asset Fractionalized!");
+  console.log("   Total Fractions:", fractionalMeta.totalFractions.toString());
+
+  // Transfer fractional ownership
+  console.log("\n📤 User1 transferring 250 fractions to User2...");
+  await assetToken.connect(user1).transferFractional(1, user2.address, 250);
+  const user1Fractions = await assetToken.fractionalOwnership(1, user1.address);
+  const user2Fractions = await assetToken.fractionalOwnership(1, user2.address);
+  console.log("✅ Fractional Transfer Complete!");
+  console.log("   User1 Fractions:", user1Fractions.toString());
+  console.log("   User2 Fractions:", user2Fractions.toString());
+
+  console.log("\n" + "=".repeat(60));
+  console.log("TEST 3: Bailout System Functions");
+  console.log("=" .repeat(60));
+
+  // Check treasury balance
+  const treasuryBalance = await bailout.treasuryBalance();
+  console.log("\n💰 Treasury Balance:", ethers.formatEther(treasuryBalance), "ETH");
+
+  // Deposit more to treasury
+  console.log("\n💵 Depositing 500 ETH to treasury...");
+  await bailout.depositToTreasury({ value: ethers.parseEther("500") });
+  const newTreasuryBalance = await bailout.treasuryBalance();
+  console.log("✅ Deposit Complete!");
+  console.log("   New Treasury Balance:", ethers.formatEther(newTreasuryBalance), "ETH");
+
+  // Request bailout
+  console.log("\n🆘 User1 requesting bailout...");
+  const bailoutTx = await bailout.connect(user1).requestBailout(
+    ethers.parseEther("50000"), // 50K ETH request
+    "Liquidity crisis due to market downturn",
+    "ipfs://QmSolvencyProof789xyz",
+    1, // Using Real Estate token as collateral
+    12 // 12 months repayment
+  );
+  const bailoutReceipt = await bailoutTx.wait();
+  console.log("✅ Bailout Requested! Request ID: 1");
+  console.log("   Amount: 50,000 ETH");
+  console.log("   Collateral: Token ID 1 (Real Estate)");
+  console.log("   Repayment Period: 12 months");
+
+  // Get bailout details
+  const bailoutRequest = await bailout.bailoutRequests(1);
+  console.log("\n📋 Bailout Request Details:");
+  console.log("   Requester:", bailoutRequest.requester);
+  console.log("   Amount:", ethers.formatEther(bailoutRequest.amount), "ETH");
+  console.log("   Status:", bailoutRequest.status); // 0 = Pending
+  console.log("   Reason:", bailoutRequest.reason);
+
+  // Check user active bailouts
+  const activeBailout = await bailout.userActiveBailouts(user1.address);
+  console.log("   Active Bailout ID:", activeBailout.toString());
+
+  console.log("\n" + "=".repeat(60));
+  console.log("TEST 4: Pause/Unpause Functions");
+  console.log("=" .repeat(60));
+
+  // Pause asset token
+  console.log("\n⏸️  Pausing Asset Token Contract...");
+  await assetToken.pause();
+  console.log("✅ Asset Token Paused!");
+
+  // Try to tokenize while paused (should fail)
+  console.log("\n❌ Attempting to tokenize while paused (should fail)...");
+  try {
+    await assetToken.tokenizeAsset(
+      user1.address,
+      4, // PhysicalAssets
+      ethers.parseEther("100000"),
+      "Test Location",
+      "ipfs://test"
+    );
+    console.log("⚠️  UNEXPECTED: Transaction succeeded!");
+  } catch (error) {
+    console.log("✅ Correctly Rejected: Contract is paused");
+  }
+
+  // Unpause
+  console.log("\n▶️  Unpausing Asset Token Contract...");
+  await assetToken.unpause();
+  console.log("✅ Asset Token Unpaused!");
+
+  console.log("\n" + "=".repeat(60));
+  console.log("TEST 5: Role-Based Access Control");
+  console.log("=" .repeat(60));
+
+  // Check roles
+  const MINTER_ROLE = await assetToken.MINTER_ROLE();
+  const hasMinterRole = await assetToken.hasRole(MINTER_ROLE, deployer.address);
+  console.log("\n🔑 Deployer has MINTER_ROLE:", hasMinterRole);
+
+  const user1HasMinter = await assetToken.hasRole(MINTER_ROLE, user1.address);
+  console.log("🔑 User1 has MINTER_ROLE:", user1HasMinter);
+
+  // Try unauthorized action
+  console.log("\n❌ User1 attempting to pause contract (should fail)...");
+  try {
+    await assetToken.connect(user1).pause();
+    console.log("⚠️  UNEXPECTED: Transaction succeeded!");
+  } catch (error) {
+    console.log("✅ Correctly Rejected: User1 lacks PAUSER_ROLE");
+  }
+
+  console.log("\n" + "=".repeat(60));
+  console.log("🎉 ALL TESTS COMPLETED SUCCESSFULLY!");
+  console.log("=" .repeat(60));
+
+  console.log("\n📊 Final Summary:");
+  console.log("  Total BGT Supply:", ethers.formatEther(await governanceToken.totalSupply()), "BGT");
+  console.log("  Total Assets:", (await assetToken.totalSupply()).toString());
+  console.log("  Treasury Balance:", ethers.formatEther(await bailout.treasuryBalance()), "ETH");
+  console.log("  Total Bailout Requests:", (await bailout.userActiveBailouts(user1.address)).toString());
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

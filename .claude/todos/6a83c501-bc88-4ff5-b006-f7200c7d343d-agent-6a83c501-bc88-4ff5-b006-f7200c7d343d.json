@@ -1,0 +1,47 @@
+[
+  {
+    "content": "Phase 1: Add PausableUpgradeable to ReputationManager",
+    "status": "completed",
+    "activeForm": "Adding Pausable to ReputationManager"
+  },
+  {
+    "content": "Phase 1: Fix role setup in test helpers",
+    "status": "completed",
+    "activeForm": "Fixing role setup"
+  },
+  {
+    "content": "Phase 1: Update ComplianceManager test helper",
+    "status": "completed",
+    "activeForm": "Updating test helper"
+  },
+  {
+    "content": "Phase 2: Add CollectionAutomator setter functions",
+    "status": "completed",
+    "activeForm": "Adding setters"
+  },
+  {
+    "content": "Phase 2: Add CollectionAutomator public functions",
+    "status": "completed",
+    "activeForm": "Adding public functions"
+  },
+  {
+    "content": "Phase 4: Update CollectionAutomator initialization",
+    "status": "completed",
+    "activeForm": "Updating initialization"
+  },
+  {
+    "content": "Phase 4: Update ReputationManager constants",
+    "status": "completed",
+    "activeForm": "Updating constants"
+  },
+  {
+    "content": "Phase 4: Recompile all contracts",
+    "status": "completed",
+    "activeForm": "Recompiling"
+  },
+  {
+    "content": "Phase 4: Run full test suite",
+    "status": "in_progress",
+    "activeForm": "Testing all fixes"
+  }
+]

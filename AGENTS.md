@@ -1,0 +1,21 @@
+# AGENTS Guidelines
+
+- Solidarity across Rust, TypeScript, and JavaScript; unify conventions.
+- Build/Lint/Test
+- Rust: `cargo build`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`
+- TypeScript/JavaScript: `npm ci`; `npm run build`; `npm run lint`; `npm test` (single test: `npm test -- -t "<pattern>"`)
+- Code Style
+- Rust: `rustfmt` for formatting; `clippy` for linting; explicit error propagation; doc comments for public APIs.
+- TypeScript/JavaScript: `eslint` + `prettier`; consistent imports; prefer `const`/`let`; avoid `any` in TS; use explicit types; robust error handling; pass `prettier --check` and `eslint .`.
+- Testing
+- Node: deterministic tests; parameterized tests; `npm test -- -t "<pattern>"`.
+- Rust: `cargo test` (use `-- --nocapture` for verbose).
+- Cursor/Copilot Rules
+- Cursor: apply `.cursor/rules/` and `.cursorrules` guidelines when present.
+- Copilot: follow `.github/copilot-instructions.md` if present.
+- Sandbox/Approvals
+- FS: workspace-write; Net: enabled; Approvals: on-failure.
+- Commit/Review
+- Ensure changes are formatted and tests pass; draft meaningful commit messages.
+- Quick checks
+- Run language-specific tests locally before creating PR.

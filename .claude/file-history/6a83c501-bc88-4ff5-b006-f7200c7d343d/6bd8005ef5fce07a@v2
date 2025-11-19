@@ -1,0 +1,471 @@
+import { expect, ethers } from "./helpers/setup.js";
+import {
+    deployFullSystem,
+    createDebtMetadata,
+    createRepaymentSchedule,
+    createCollateral,
+    setupKYC,
+    mintDebtToken,
+    increaseTime,
+    getCurrentTimestamp
+} from "./helpers/setup.js";
+
+describe("DebtMarketplace", function () {
+    let system, marketplace, debtToken, complianceManager, treasury;
+    let admin, operator, user1, user2, user3;
+    let tokenId, metadata, schedule;
+
+    beforeEach(async function () {
+        system = await deployFullSystem();
+        ({
+            marketplace,
+            debtToken,
+            complianceManager,
+            treasury,
+            admin,
+            operator,
+            user1,
+            user2,
+            user3
+        } = system);
+
+        // Setup KYC
+        await setupKYC(complianceManager, user1, 2);
+        await setupKYC(complianceManager, user2, 2);
+        await setupKYC(complianceManager, user3, 2);
+
+        // Mint test debt token
+        metadata = createDebtMetadata();
+        schedule = createRepaymentSchedule();
+        tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+
+        // Approve marketplace
+        await debtToken.connect(user1).approve(await marketplace.getAddress(), tokenId);
+    });
+
+    describe("Initialization", function () {
+        it("Should set correct initial parameters", async function () {
+            expect(await marketplace.debtToken()).to.equal(await debtToken.getAddress());
+            expect(await marketplace.complianceManager()).to.equal(await complianceManager.getAddress());
+            expect(await marketplace.treasury()).to.equal(treasury.address);
+        });
+
+        it("Should set trading fee", async function () {
+            expect(await marketplace.tradingFee()).to.equal(250); // 2.5%
+        });
+
+        it("Should set listing duration limits", async function () {
+            expect(await marketplace.minListingDuration()).to.equal(86400); // 1 day
+            expect(await marketplace.maxListingDuration()).to.equal(2592000); // 30 days
+        });
+    });
+
+    describe("Fixed Price Listings", function () {
+        it("Should create fixed price listing", async function () {
+            const price = ethers.parseEther("8000");
+            const duration = 86400 * 7; // 7 days
+
+            await expect(
+                marketplace.connect(user1).createListing(
+                    tokenId,
+                    price,
+                    0, // listingType: FIXED_PRICE
+                    duration,
+                    ethers.parseEther("7000") // minOffer
+                )
+            ).to.emit(marketplace, "ListingCreated");
+        });
+
+        it("Should transfer NFT to marketplace on listing", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("8000"),
+                0,
+                86400 * 7,
+                0
+            );
+
+            expect(await debtToken.ownerOf(tokenId)).to.equal(await marketplace.getAddress());
+        });
+
+        it("Should buy fixed price listing", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+
+            const listingId = 0;
+            await marketplace.connect(user2).buyListing(listingId, { value: price });
+
+            expect(await debtToken.ownerOf(tokenId)).to.equal(user2.address);
+        });
+
+        it("Should calculate and distribute fees correctly", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+
+            const initialBalance = await ethers.provider.getBalance(user1.address);
+            const initialTreasuryBalance = await ethers.provider.getBalance(treasury.address);
+
+            await marketplace.connect(user2).buyListing(0, { value: price });
+
+            const fee = (price * 250n) / 10000n; // 2.5%
+            const sellerAmount = price - fee;
+
+            const finalBalance = await ethers.provider.getBalance(user1.address);
+            const finalTreasuryBalance = await ethers.provider.getBalance(treasury.address);
+
+            expect(finalBalance - initialBalance).to.be.closeTo(sellerAmount, ethers.parseEther("0.01"));
+            expect(finalTreasuryBalance - initialTreasuryBalance).to.equal(fee);
+        });
+
+        it("Should revert if buyer sends insufficient payment", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+
+            await expect(
+                marketplace.connect(user2).buyListing(0, { value: ethers.parseEther("7000") })
+            ).to.be.reverted;
+        });
+
+        it("Should revert if listing is not active", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+            await marketplace.connect(user2).buyListing(0, { value: price });
+
+            // Try to buy again
+            await expect(
+                marketplace.connect(user3).buyListing(0, { value: price })
+            ).to.be.reverted;
+        });
+
+        it("Should cancel listing", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("8000"),
+                0,
+                86400 * 7,
+                0
+            );
+
+            await marketplace.connect(user1).cancelListing(0);
+            expect(await debtToken.ownerOf(tokenId)).to.equal(user1.address);
+        });
+
+        it("Should not allow non-seller to cancel listing", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("8000"),
+                0,
+                86400 * 7,
+                0
+            );
+
+            await expect(
+                marketplace.connect(user2).cancelListing(0)
+            ).to.be.reverted;
+        });
+
+        it("Should expire listing after duration", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("8000"),
+                0,
+                86400, // 1 day
+                0
+            );
+
+            await increaseTime(86401); // Just over 1 day
+
+            await expect(
+                marketplace.connect(user2).buyListing(0, { value: ethers.parseEther("8000") })
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Auctions", function () {
+        it("Should create auction", async function () {
+            await expect(
+                marketplace.connect(user1).createListing(
+                    tokenId,
+                    ethers.parseEther("5000"), // starting price
+                    1, // AUCTION
+                    86400 * 3, // 3 days
+                    ethers.parseEther("5000")
+                )
+            ).to.emit(marketplace, "ListingCreated");
+        });
+
+        it("Should place bid on auction", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("5000"),
+                1,
+                86400 * 3,
+                ethers.parseEther("5000")
+            );
+
+            await expect(
+                marketplace.connect(user2).placeBid(0, { value: ethers.parseEther("6000") })
+            ).to.emit(marketplace, "BidPlaced");
+        });
+
+        it("Should require higher bid than current highest", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("5000"),
+                1,
+                86400 * 3,
+                ethers.parseEther("5000")
+            );
+
+            await marketplace.connect(user2).placeBid(0, { value: ethers.parseEther("6000") });
+
+            await expect(
+                marketplace.connect(user3).placeBid(0, { value: ethers.parseEther("5500") })
+            ).to.be.reverted;
+        });
+
+        it("Should refund previous highest bidder", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("5000"),
+                1,
+                86400 * 3,
+                ethers.parseEther("5000")
+            );
+
+            await marketplace.connect(user2).placeBid(0, { value: ethers.parseEther("6000") });
+
+            const balanceBefore = await ethers.provider.getBalance(user2.address);
+            await marketplace.connect(user3).placeBid(0, { value: ethers.parseEther("7000") });
+            const balanceAfter = await ethers.provider.getBalance(user2.address);
+
+            expect(balanceAfter - balanceBefore).to.equal(ethers.parseEther("6000"));
+        });
+
+        it("Should finalize auction after expiry", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("5000"),
+                1,
+                86400, // 1 day
+                ethers.parseEther("5000")
+            );
+
+            await marketplace.connect(user2).placeBid(0, { value: ethers.parseEther("6000") });
+            await increaseTime(86401);
+
+            await marketplace.finalizeAuction(0);
+            expect(await debtToken.ownerOf(tokenId)).to.equal(user2.address);
+        });
+
+        it("Should not finalize before expiry", async function () {
+            await marketplace.connect(user1).createListing(
+                tokenId,
+                ethers.parseEther("5000"),
+                1,
+                86400,
+                ethers.parseEther("5000")
+            );
+
+            await marketplace.connect(user2).placeBid(0, { value: ethers.parseEther("6000") });
+
+            await expect(
+                marketplace.finalizeAuction(0)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Offers", function () {
+        it("Should make offer on unlisted token", async function () {
+            await expect(
+                marketplace.connect(user2).makeOffer(
+                    tokenId,
+                    ethers.parseEther("7000"),
+                    86400 * 7, // 7 days
+                    { value: ethers.parseEther("7000") }
+                )
+            ).to.emit(marketplace, "OfferMade");
+        });
+
+        it("Should accept offer", async function () {
+            await marketplace.connect(user2).makeOffer(
+                tokenId,
+                ethers.parseEther("7000"),
+                86400 * 7,
+                { value: ethers.parseEther("7000") }
+            );
+
+            const offerId = 0;
+            await debtToken.connect(user1).approve(await marketplace.getAddress(), tokenId);
+            await marketplace.connect(user1).acceptOffer(offerId);
+
+            expect(await debtToken.ownerOf(tokenId)).to.equal(user2.address);
+        });
+
+        it("Should cancel offer", async function () {
+            await marketplace.connect(user2).makeOffer(
+                tokenId,
+                ethers.parseEther("7000"),
+                86400 * 7,
+                { value: ethers.parseEther("7000") }
+            );
+
+            const balanceBefore = await ethers.provider.getBalance(user2.address);
+            await marketplace.connect(user2).cancelOffer(0);
+            const balanceAfter = await ethers.provider.getBalance(user2.address);
+
+            expect(balanceAfter).to.be.gt(balanceBefore);
+        });
+
+        it("Should get offers for token", async function () {
+            await marketplace.connect(user2).makeOffer(
+                tokenId,
+                ethers.parseEther("7000"),
+                86400 * 7,
+                { value: ethers.parseEther("7000") }
+            );
+
+            await marketplace.connect(user3).makeOffer(
+                tokenId,
+                ethers.parseEther("7500"),
+                86400 * 7,
+                { value: ethers.parseEther("7500") }
+            );
+
+            const offers = await marketplace.getTokenOffers(tokenId);
+            expect(offers.length).to.equal(2);
+        });
+    });
+
+    describe("Batch Operations", function () {
+        let tokenIds;
+
+        beforeEach(async function () {
+            tokenIds = [];
+            for (let i = 0; i < 3; i++) {
+                const id = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+                tokenIds.push(id);
+                await debtToken.connect(user1).approve(await marketplace.getAddress(), id);
+            }
+        });
+
+        it("Should create batch listings", async function () {
+            const prices = [
+                ethers.parseEther("8000"),
+                ethers.parseEther("9000"),
+                ethers.parseEther("7500")
+            ];
+
+            await marketplace.connect(user1).createBatchListings(
+                tokenIds,
+                prices,
+                [0, 0, 0], // all fixed price
+                [86400 * 7, 86400 * 7, 86400 * 7],
+                [0, 0, 0]
+            );
+
+            expect(await debtToken.ownerOf(tokenIds[0])).to.equal(await marketplace.getAddress());
+            expect(await debtToken.ownerOf(tokenIds[1])).to.equal(await marketplace.getAddress());
+            expect(await debtToken.ownerOf(tokenIds[2])).to.equal(await marketplace.getAddress());
+        });
+    });
+
+    describe("Trading Statistics", function () {
+        it("Should track total volume", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+            await marketplace.connect(user2).buyListing(0, { value: price });
+
+            const stats = await marketplace.getTradingStats();
+            expect(stats.totalVolume).to.equal(price);
+        });
+
+        it("Should track total trades", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+            await marketplace.connect(user2).buyListing(0, { value: price });
+
+            const stats = await marketplace.getTradingStats();
+            expect(stats.totalTrades).to.equal(1);
+        });
+    });
+
+    describe("Blacklist", function () {
+        it("Should blacklist user", async function () {
+            await marketplace.blacklistUser(user3.address, "Fraudulent activity");
+            expect(await marketplace.isBlacklisted(user3.address)).to.be.true;
+        });
+
+        it("Should prevent blacklisted user from buying", async function () {
+            await marketplace.blacklistUser(user2.address, "Test");
+
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+
+            await expect(
+                marketplace.connect(user2).buyListing(0, { value: price })
+            ).to.be.reverted;
+        });
+
+        it("Should prevent blacklisted user from creating listings", async function () {
+            await marketplace.blacklistUser(user1.address, "Test");
+
+            await expect(
+                marketplace.connect(user1).createListing(
+                    tokenId,
+                    ethers.parseEther("8000"),
+                    0,
+                    86400 * 7,
+                    0
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should remove from blacklist", async function () {
+            await marketplace.blacklistUser(user3.address, "Test");
+            await marketplace.removeFromBlacklist(user3.address);
+            expect(await marketplace.isBlacklisted(user3.address)).to.be.false;
+        });
+    });
+
+    describe("Configuration", function () {
+        it("Should update trading fee", async function () {
+            await marketplace.setTradingFee(300); // 3%
+            expect(await marketplace.tradingFee()).to.equal(300);
+        });
+
+        it("Should not allow fee above maximum", async function () {
+            await expect(
+                marketplace.setTradingFee(1001) // Over 10%
+            ).to.be.reverted;
+        });
+
+        it("Should update treasury address", async function () {
+            await marketplace.setTreasury(user3.address);
+            expect(await marketplace.treasury()).to.equal(user3.address);
+        });
+
+        it("Should not allow non-admin to change config", async function () {
+            await expect(
+                marketplace.connect(user1).setTradingFee(300)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Pausable", function () {
+        it("Should pause marketplace", async function () {
+            await marketplace.pause();
+            expect(await marketplace.paused()).to.be.true;
+        });
+
+        it("Should prevent trading when paused", async function () {
+            const price = ethers.parseEther("8000");
+            await marketplace.connect(user1).createListing(tokenId, price, 0, 86400 * 7, 0);
+            await marketplace.pause();
+
+            await expect(
+                marketplace.connect(user2).buyListing(0, { value: price })
+            ).to.be.reverted;
+        });
+    });
+});

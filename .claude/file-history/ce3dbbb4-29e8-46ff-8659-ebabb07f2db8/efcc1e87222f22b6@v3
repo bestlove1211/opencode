@@ -1,0 +1,836 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+
+import "./libraries/DataTypes.sol";
+import "./libraries/Errors.sol";
+import "./libraries/Events.sol";
+import "./libraries/DebtCalculations.sol";
+import "./interfaces/IComplianceManager.sol";
+
+/**
+ * @title CollectionAutomator
+ * @notice Automated debt collection with slashing, blacklisting, and liquidation
+ * @dev Manages payment schedules, defaults, penalties, and reputation slashing
+ */
+contract CollectionAutomator is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable
+{
+    // ============ Roles ============
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    // ============ State Variables ============
+
+    // Contracts
+    address public debtToken;
+    address public complianceManager;
+    address public reputationManager;
+    address public marketplace;
+
+    // Payment schedules
+    mapping(uint256 => uint256) private _nextPaymentDue; // tokenId => timestamp
+    mapping(uint256 => bool) private _inDefault; // tokenId => isDefaulted
+    mapping(uint256 => uint8) private _warningLevel; // tokenId => warning level (0-3)
+    mapping(uint256 => uint256) private _lastWarningDate; // tokenId => timestamp
+
+    // Default records
+    mapping(uint256 => DataTypes.DefaultRecord) private _defaultRecords;
+    uint256[] private _defaultedTokenIds;
+
+    // Security deposits
+    mapping(address => uint256) private _securityDeposits; // debtor => amount
+    mapping(address => bool) private _tradingPrivilegesSuspended;
+    mapping(address => uint256) private _suspensionEndDate;
+
+    // Slashing history
+    mapping(address => DataTypes.SlashingRecord[]) private _slashingHistory;
+
+    // Liquidation tracking
+    mapping(uint256 => bool) private _liquidationInProgress;
+    mapping(uint256 => uint256) private _liquidationStartDate;
+
+    // Configuration
+    uint256 public defaultSecurityDepositAmount;
+    uint256 public slashingPercentage; // Basis points
+    uint256 public tradingSuspensionDuration; // In seconds
+    uint8 public maxWarningsBeforeDefault;
+    uint256 public warningInterval; // Minimum time between warnings
+
+    // Fees
+    uint256 public lateFeePercentage; // Basis points
+    uint256 public liquidationFeePercentage; // Basis points
+
+    // Statistics
+    uint256 public totalDefaults;
+    uint256 public totalSlashedAmount;
+    uint256 public totalLiquidations;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the contract
+     * @param admin_ Admin address
+     * @param debtToken_ DebtToken contract
+     * @param complianceManager_ ComplianceManager contract
+     * @param reputationManager_ ReputationManager contract
+     */
+    function initialize(
+        address admin_,
+        address debtToken_,
+        address complianceManager_,
+        address reputationManager_
+    ) public initializer {
+        if (admin_ == address(0) || debtToken_ == address(0) ||
+            complianceManager_ == address(0) || reputationManager_ == address(0)) {
+            revert Errors.ZeroAddress();
+        }
+
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(ADMIN_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, admin_);
+
+        debtToken = debtToken_;
+        complianceManager = complianceManager_;
+        reputationManager = reputationManager_;
+
+        // Set default configuration
+        defaultSecurityDepositAmount = 1 ether;
+        slashingPercentage = 2000; // 20%
+        tradingSuspensionDuration = 90 days;
+        maxWarningsBeforeDefault = 3;
+        warningInterval = 7 days;
+        lateFeePercentage = 500; // 5%
+        liquidationFeePercentage = 1000; // 10%
+    }
+
+    // ============ Payment Collection Functions ============
+
+    /**
+     * @notice Process a payment for a debt token
+     * @param tokenId Token ID
+     */
+    function processPayment(uint256 tokenId)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
+        if (msg.value == 0) revert Errors.ZeroAmount();
+        if (_inDefault[tokenId]) revert Errors.DebtDefaulted();
+
+        // Get debtor from DebtToken contract
+        (bool success, bytes memory data) = debtToken.call(
+            abi.encodeWithSignature("getDebtMetadata(uint256)", tokenId)
+        );
+        require(success, "Failed to get debt metadata");
+
+        // Decode debtor address (simplified - in production use proper struct decoding)
+        address debtor = address(uint160(uint256(bytes32(data))));
+
+        if (msg.sender != debtor) revert Errors.Unauthorized();
+
+        // Check if payment is late
+        bool isLate = block.timestamp > _nextPaymentDue[tokenId];
+        uint256 daysLate = 0;
+        uint256 lateFee = 0;
+
+        if (isLate) {
+            daysLate = (block.timestamp - _nextPaymentDue[tokenId]) / 1 days;
+            lateFee = DebtCalculations.calculateLateFee(
+                msg.value,
+                lateFeePercentage,
+                daysLate
+            );
+
+            // Record late payment in reputation
+            (bool repSuccess, ) = reputationManager.call(
+                abi.encodeWithSignature(
+                    "recordLatePayment(address,uint256,uint256)",
+                    debtor,
+                    tokenId,
+                    daysLate
+                )
+            );
+            require(repSuccess, "Failed to record late payment");
+
+            emit Events.LatePayment(tokenId, debtor, daysLate, lateFee);
+        } else {
+            // Record on-time payment in reputation
+            (bool repSuccess, ) = reputationManager.call(
+                abi.encodeWithSignature(
+                    "recordOnTimePayment(address,uint256)",
+                    debtor,
+                    tokenId
+                )
+            );
+            require(repSuccess, "Failed to record on-time payment");
+        }
+
+        // Record payment in DebtToken
+        (bool recordSuccess, ) = debtToken.call(
+            abi.encodeWithSignature("recordPayment(uint256,uint256)", tokenId, msg.value)
+        );
+        require(recordSuccess, "Failed to record payment");
+
+        // Reset warning level on successful payment
+        if (_warningLevel[tokenId] > 0) {
+            _warningLevel[tokenId] = 0;
+        }
+
+        // Calculate next payment due date
+        _nextPaymentDue[tokenId] = block.timestamp + 30 days; // Simplified - should use actual schedule
+
+        emit Events.PaymentCollected(tokenId, msg.value, block.timestamp);
+
+        // Transfer payment to current token owner
+        (bool ownerSuccess, bytes memory ownerData) = debtToken.call(
+            abi.encodeWithSignature("ownerOf(uint256)", tokenId)
+        );
+        require(ownerSuccess, "Failed to get owner");
+        address owner = abi.decode(ownerData, (address));
+
+        uint256 paymentToOwner = msg.value + lateFee;
+        payable(owner).transfer(paymentToOwner);
+    }
+
+    /**
+     * @notice Schedule next payment for a debt token
+     * @param tokenId Token ID
+     * @param dueDate Due date timestamp
+     * @param amount Payment amount
+     */
+    function schedulePayment(
+        uint256 tokenId,
+        uint256 dueDate,
+        uint256 amount
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (dueDate <= block.timestamp) revert Errors.InvalidParameter();
+
+        _nextPaymentDue[tokenId] = dueDate;
+
+        emit Events.PaymentScheduled(tokenId, dueDate, amount);
+    }
+
+    // ============ Warning & Default Functions ============
+
+    /**
+     * @notice Issue warning for missed payment
+     * @param tokenId Token ID
+     */
+    function issueWarning(uint256 tokenId) external onlyRole(OPERATOR_ROLE) {
+        if (_inDefault[tokenId]) revert Errors.AlreadyInDefault();
+
+        // Check if payment is actually overdue
+        if (block.timestamp <= _nextPaymentDue[tokenId]) {
+            revert Errors.PaymentNotDue();
+        }
+
+        // Check warning interval
+        if (block.timestamp < _lastWarningDate[tokenId] + warningInterval) {
+            revert Errors.InvalidParameter();
+        }
+
+        uint8 currentLevel = _warningLevel[tokenId];
+
+        if (currentLevel >= maxWarningsBeforeDefault) {
+            // Trigger default
+            _declareDefault(tokenId);
+        } else {
+            // Issue warning
+            _warningLevel[tokenId] = currentLevel + 1;
+            _lastWarningDate[tokenId] = block.timestamp;
+
+            // Get debtor
+            (bool success, bytes memory data) = debtToken.call(
+                abi.encodeWithSignature("getDebtMetadata(uint256)", tokenId)
+            );
+            require(success, "Failed to get debt metadata");
+            address debtor = address(uint160(uint256(bytes32(data))));
+
+            // Increment missed payments counter
+            (bool incSuccess, ) = debtToken.call(
+                abi.encodeWithSignature("incrementMissedPayments(uint256)", tokenId)
+            );
+            require(incSuccess, "Failed to increment missed payments");
+
+            emit Events.DefaultWarningIssued(
+                tokenId,
+                debtor,
+                _warningLevel[tokenId],
+                block.timestamp
+            );
+
+            // Send payment reminder notification
+            emit Events.PaymentReminderNeeded(
+                tokenId,
+                debtor,
+                _nextPaymentDue[tokenId],
+                0 // Amount should be fetched from debt metadata
+            );
+        }
+    }
+
+    /**
+     * @notice Declare a debt as defaulted
+     * @param tokenId Token ID
+     */
+    function declareDefault(uint256 tokenId) external onlyRole(OPERATOR_ROLE) {
+        _declareDefault(tokenId);
+    }
+
+    /**
+     * @dev Internal function to declare default
+     */
+    function _declareDefault(uint256 tokenId) internal {
+        if (_inDefault[tokenId]) revert Errors.AlreadyInDefault();
+
+        _inDefault[tokenId] = true;
+        _defaultedTokenIds.push(tokenId);
+        totalDefaults++;
+
+        // Get debt metadata
+        (bool success, bytes memory data) = debtToken.call(
+            abi.encodeWithSignature("getDebtMetadata(uint256)", tokenId)
+        );
+        require(success, "Failed to get debt metadata");
+
+        // Simplified decoding - in production use proper struct decoding
+        address debtor = address(uint160(uint256(bytes32(data))));
+        uint256 outstandingAmount = 0; // Should decode from metadata
+
+        // Mark as defaulted in DebtToken
+        (bool markSuccess, ) = debtToken.call(
+            abi.encodeWithSignature("markAsDefaulted(uint256)", tokenId)
+        );
+        require(markSuccess, "Failed to mark as defaulted");
+
+        // Record default in reputation
+        (bool repSuccess, ) = reputationManager.call(
+            abi.encodeWithSignature("recordDefault(address,uint256)", debtor, tokenId)
+        );
+        require(repSuccess, "Failed to record default");
+
+        // Create default record
+        _defaultRecords[tokenId] = DataTypes.DefaultRecord({
+            tokenId: tokenId,
+            debtor: debtor,
+            defaultDate: block.timestamp,
+            outstandingAmount: outstandingAmount,
+            missedPayments: _warningLevel[tokenId],
+            penaltyAmount: 0,
+            resolved: false,
+            resolvedDate: 0,
+            resolutionType: ""
+        });
+
+        emit Events.DefaultDeclared(tokenId, debtor, outstandingAmount, block.timestamp);
+
+        // Trigger slashing
+        _executeSlashing(debtor, tokenId, "PAYMENT_DEFAULT");
+    }
+
+    // ============ Slashing Functions ============
+
+    /**
+     * @notice Execute slashing on a debtor
+     * @param debtor Debtor address
+     * @param tokenId Related token ID
+     * @param reason Slashing reason
+     */
+    function _executeSlashing(
+        address debtor,
+        uint256 tokenId,
+        string memory reason
+    ) internal {
+        // 1. Slash security deposit
+        uint256 depositAmount = _securityDeposits[debtor];
+        if (depositAmount > 0) {
+            uint256 slashAmount = (depositAmount * slashingPercentage) / 10000;
+
+            _securityDeposits[debtor] -= slashAmount;
+            totalSlashedAmount += slashAmount;
+
+            // Transfer slashed amount to treasury/insurance pool
+            // For now, keep it in contract
+
+            DataTypes.SlashingRecord memory record = DataTypes.SlashingRecord({
+                user: debtor,
+                tokenId: tokenId,
+                amount: slashAmount,
+                timestamp: block.timestamp,
+                reason: reason,
+                reputationPenalty: 0
+            });
+
+            _slashingHistory[debtor].push(record);
+
+            emit Events.SecurityDepositSlashed(debtor, slashAmount, reason);
+        }
+
+        // 2. Slash reputation
+        (bool repSuccess, ) = reputationManager.call(
+            abi.encodeWithSignature(
+                "slashReputation(address,uint256,uint256,string)",
+                debtor,
+                tokenId,
+                slashingPercentage,
+                reason
+            )
+        );
+        require(repSuccess, "Failed to slash reputation");
+
+        // 3. Suspend trading privileges
+        _suspendTradingPrivileges(debtor, reason);
+
+        // 4. Blacklist in marketplace
+        if (marketplace != address(0)) {
+            (bool blacklistSuccess, ) = marketplace.call(
+                abi.encodeWithSignature("blacklistUser(address,string)", debtor, reason)
+            );
+            // Don't require success as marketplace might not support this yet
+        }
+
+        // 5. Blacklist in compliance manager
+        (bool complianceSuccess, ) = complianceManager.call(
+            abi.encodeWithSignature("addToBlacklist(address,string)", debtor, reason)
+        );
+        // Don't require success
+
+        emit Events.DebtorBlacklisted(debtor, tokenId, reason);
+    }
+
+    /**
+     * @notice Suspend trading privileges
+     * @param user User address
+     * @param reason Suspension reason
+     */
+    function _suspendTradingPrivileges(address user, string memory reason) internal {
+        if (_tradingPrivilegesSuspended[user]) return;
+
+        _tradingPrivilegesSuspended[user] = true;
+        _suspensionEndDate[user] = block.timestamp + tradingSuspensionDuration;
+
+        emit Events.TradingPrivilegesSuspended(
+            user,
+            _suspensionEndDate[user],
+            reason
+        );
+    }
+
+    /**
+     * @notice Restore trading privileges
+     * @param user User address
+     */
+    function restoreTradingPrivileges(address user) external onlyRole(ADMIN_ROLE) {
+        if (!_tradingPrivilegesSuspended[user]) return;
+
+        _tradingPrivilegesSuspended[user] = false;
+        _suspensionEndDate[user] = 0;
+
+        emit Events.TradingPrivilegesRestored(user, block.timestamp);
+    }
+
+    /**
+     * @notice Manually slash a user (admin function)
+     * @param user User address
+     * @param tokenId Related token ID
+     * @param amount Amount to slash from deposit
+     * @param reputationPenalty Reputation penalty in basis points
+     * @param reason Slashing reason
+     */
+    function manualSlash(
+        address user,
+        uint256 tokenId,
+        uint256 amount,
+        uint256 reputationPenalty,
+        string calldata reason
+    ) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (user == address(0)) revert Errors.ZeroAddress();
+
+        // Slash security deposit
+        if (amount > 0) {
+            if (_securityDeposits[user] < amount) {
+                revert Errors.InsufficientSecurityDeposit();
+            }
+
+            _securityDeposits[user] -= amount;
+            totalSlashedAmount += amount;
+
+            emit Events.SecurityDepositSlashed(user, amount, reason);
+        }
+
+        // Slash reputation if specified
+        if (reputationPenalty > 0) {
+            (bool repSuccess, ) = reputationManager.call(
+                abi.encodeWithSignature(
+                    "slashReputation(address,uint256,uint256,string)",
+                    user,
+                    tokenId,
+                    reputationPenalty,
+                    reason
+                )
+            );
+            require(repSuccess, "Failed to slash reputation");
+        }
+
+        // Record slashing
+        DataTypes.SlashingRecord memory record = DataTypes.SlashingRecord({
+            user: user,
+            tokenId: tokenId,
+            amount: amount,
+            timestamp: block.timestamp,
+            reason: reason,
+            reputationPenalty: reputationPenalty
+        });
+
+        _slashingHistory[user].push(record);
+    }
+
+    // ============ Security Deposit Functions ============
+
+    /**
+     * @notice Deposit security deposit
+     */
+    function depositSecurity() external payable whenNotPaused {
+        if (msg.value == 0) revert Errors.ZeroAmount();
+
+        _securityDeposits[msg.sender] += msg.value;
+    }
+
+    /**
+     * @notice Withdraw security deposit
+     * @param amount Amount to withdraw
+     */
+    function withdrawSecurity(uint256 amount) external nonReentrant {
+        if (amount == 0) revert Errors.ZeroAmount();
+        if (_securityDeposits[msg.sender] < amount) {
+            revert Errors.InsufficientSecurityDeposit();
+        }
+
+        // Check if user has any active defaults
+        // For simplicity, we'll allow withdrawal if not suspended
+        if (_tradingPrivilegesSuspended[msg.sender]) {
+            revert Errors.Unauthorized();
+        }
+
+        _securityDeposits[msg.sender] -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+
+    // ============ Liquidation Functions ============
+
+    /**
+     * @notice Start liquidation process for defaulted debt
+     * @param tokenId Token ID
+     */
+    function startLiquidation(uint256 tokenId) external onlyRole(OPERATOR_ROLE) {
+        if (!_inDefault[tokenId]) revert Errors.InvalidDebtStatus();
+        if (_liquidationInProgress[tokenId]) revert Errors.InvalidParameter();
+
+        _liquidationInProgress[tokenId] = true;
+        _liquidationStartDate[tokenId] = block.timestamp;
+        totalLiquidations++;
+
+        emit Events.CollateralLiquidationStarted(tokenId, 0); // Value should come from collateral
+    }
+
+    /**
+     * @notice Complete liquidation
+     * @param tokenId Token ID
+     * @param recoveredAmount Amount recovered from liquidation
+     */
+    function completeLiquidation(
+        uint256 tokenId,
+        uint256 recoveredAmount
+    ) external onlyRole(OPERATOR_ROLE) nonReentrant {
+        if (!_liquidationInProgress[tokenId]) revert Errors.LiquidationNotAllowed();
+
+        _liquidationInProgress[tokenId] = false;
+
+        // Calculate liquidation fee
+        uint256 fee = (recoveredAmount * liquidationFeePercentage) / 10000;
+        uint256 netAmount = recoveredAmount - fee;
+
+        // Transfer to token owner
+        (bool ownerSuccess, bytes memory ownerData) = debtToken.call(
+            abi.encodeWithSignature("ownerOf(uint256)", tokenId)
+        );
+        require(ownerSuccess, "Failed to get owner");
+        address owner = abi.decode(ownerData, (address));
+
+        if (netAmount > 0) {
+            payable(owner).transfer(netAmount);
+        }
+
+        // Mark collateral as liquidated in DebtToken
+        (bool liquidateSuccess, ) = debtToken.call(
+            abi.encodeWithSignature(
+                "liquidateCollateral(uint256,uint256,uint256)",
+                tokenId,
+                0, // collateral index
+                recoveredAmount
+            )
+        );
+        require(liquidateSuccess, "Failed to mark collateral as liquidated");
+
+        // Update default record
+        DataTypes.DefaultRecord storage record = _defaultRecords[tokenId];
+        record.resolved = true;
+        record.resolvedDate = block.timestamp;
+        record.resolutionType = "liquidated";
+
+        emit Events.CollateralSold(tokenId, recoveredAmount, msg.sender);
+    }
+
+    // ============ Restructuring Functions ============
+
+    /**
+     * @notice Restructure a defaulted debt
+     * @param tokenId Token ID
+     * @param newMaturityDate New maturity date
+     */
+    function restructureDebt(
+        uint256 tokenId,
+        uint256 newMaturityDate
+    ) external onlyRole(ADMIN_ROLE) {
+        if (!_inDefault[tokenId]) revert Errors.InvalidDebtStatus();
+
+        // Reset default status
+        _inDefault[tokenId] = false;
+        _warningLevel[tokenId] = 0;
+
+        // Update default record
+        DataTypes.DefaultRecord storage record = _defaultRecords[tokenId];
+        record.resolved = true;
+        record.resolvedDate = block.timestamp;
+        record.resolutionType = "restructured";
+
+        emit Events.DebtRestructured(tokenId, 0, 0, newMaturityDate);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get next payment due date
+     * @param tokenId Token ID
+     * @return dueDate Due date timestamp
+     */
+    function getNextPaymentDue(uint256 tokenId)
+        external
+        view
+        returns (uint256 dueDate)
+    {
+        return _nextPaymentDue[tokenId];
+    }
+
+    /**
+     * @notice Check if debt is in default
+     * @param tokenId Token ID
+     * @return isDefaulted Whether debt is defaulted
+     */
+    function isDefaulted(uint256 tokenId)
+        external
+        view
+        returns (bool isDefaulted)
+    {
+        return _inDefault[tokenId];
+    }
+
+    /**
+     * @notice Get warning level
+     * @param tokenId Token ID
+     * @return level Warning level (0-3)
+     */
+    function getWarningLevel(uint256 tokenId)
+        external
+        view
+        returns (uint8 level)
+    {
+        return _warningLevel[tokenId];
+    }
+
+    /**
+     * @notice Get default record
+     * @param tokenId Token ID
+     * @return record Default record
+     */
+    function getDefaultRecord(uint256 tokenId)
+        external
+        view
+        returns (DataTypes.DefaultRecord memory record)
+    {
+        return _defaultRecords[tokenId];
+    }
+
+    /**
+     * @notice Get all defaulted token IDs
+     * @return tokenIds Array of defaulted token IDs
+     */
+    function getDefaultedTokens()
+        external
+        view
+        returns (uint256[] memory tokenIds)
+    {
+        return _defaultedTokenIds;
+    }
+
+    /**
+     * @notice Get security deposit balance
+     * @param user User address
+     * @return balance Deposit balance
+     */
+    function getSecurityDeposit(address user)
+        external
+        view
+        returns (uint256 balance)
+    {
+        return _securityDeposits[user];
+    }
+
+    /**
+     * @notice Check if trading privileges are suspended
+     * @param user User address
+     * @return suspended Whether suspended
+     * @return endDate Suspension end date
+     */
+    function getTradingStatus(address user)
+        external
+        view
+        returns (bool suspended, uint256 endDate)
+    {
+        return (_tradingPrivilegesSuspended[user], _suspensionEndDate[user]);
+    }
+
+    /**
+     * @notice Get slashing history for user
+     * @param user User address
+     * @return history Slashing records
+     */
+    function getSlashingHistory(address user)
+        external
+        view
+        returns (DataTypes.SlashingRecord[] memory history)
+    {
+        return _slashingHistory[user];
+    }
+
+    /**
+     * @notice Check if liquidation is in progress
+     * @param tokenId Token ID
+     * @return inProgress Whether liquidation is in progress
+     */
+    function isLiquidationInProgress(uint256 tokenId)
+        external
+        view
+        returns (bool inProgress)
+    {
+        return _liquidationInProgress[tokenId];
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Set marketplace contract address
+     * @param marketplace_ Marketplace address
+     */
+    function setMarketplace(address marketplace_) external onlyRole(ADMIN_ROLE) {
+        marketplace = marketplace_;
+    }
+
+    /**
+     * @notice Update configuration
+     */
+    function updateConfiguration(
+        uint256 depositAmount,
+        uint256 slashingPct,
+        uint256 suspensionDuration,
+        uint8 maxWarnings,
+        uint256 warningInt
+    ) external onlyRole(ADMIN_ROLE) {
+        defaultSecurityDepositAmount = depositAmount;
+        slashingPercentage = slashingPct;
+        tradingSuspensionDuration = suspensionDuration;
+        maxWarningsBeforeDefault = maxWarnings;
+        warningInterval = warningInt;
+    }
+
+    /**
+     * @notice Update fee configuration
+     * @param lateFee Late fee percentage
+     * @param liquidationFee Liquidation fee percentage
+     */
+    function updateFees(
+        uint256 lateFee,
+        uint256 liquidationFee
+    ) external onlyRole(ADMIN_ROLE) {
+        lateFeePercentage = lateFee;
+        liquidationFeePercentage = liquidationFee;
+
+        emit Events.FeeUpdated("late_fee", lateFeePercentage, lateFee);
+        emit Events.FeeUpdated("liquidation_fee", liquidationFeePercentage, liquidationFee);
+    }
+
+    /**
+     * @notice Pause contract
+     */
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+        emit Events.ContractPaused(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Unpause contract
+     */
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+        emit Events.ContractUnpaused(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @dev Authorize upgrade
+     */
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    /**
+     * @notice Emergency withdrawal (admin only)
+     */
+    function emergencyWithdraw(address payable recipient, uint256 amount)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        if (recipient == address(0)) revert Errors.ZeroAddress();
+        if (amount > address(this).balance) revert Errors.InvalidParameter();
+
+        recipient.transfer(amount);
+
+        emit Events.EmergencyWithdrawal(address(0), recipient, amount);
+    }
+
+    /**
+     * @notice Receive function to accept ETH
+     */
+    receive() external payable {}
+}

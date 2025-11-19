@@ -1,0 +1,272 @@
+// Test setup and utilities
+import hre from "hardhat";
+const { ethers, upgrades } = hre;
+import pkg from "chai";
+const { expect } = pkg;
+
+/**
+ * Deploy all core contracts
+ */
+export async function deployFullSystem() {
+    const [admin, treasury, operator, user1, user2, user3] = await ethers.getSigners();
+
+    // 1. Deploy BancafiToken
+    const BancafiToken = await ethers.getContractFactory("BancafiToken");
+    const token = await upgrades.deployProxy(
+        BancafiToken,
+        [admin.address, ethers.parseEther("1000000")],
+        { initializer: "initialize" }
+    );
+    await token.waitForDeployment();
+
+    // 2. Deploy ReputationManager
+    const ReputationManager = await ethers.getContractFactory("ReputationManager");
+    const reputationManager = await upgrades.deployProxy(
+        ReputationManager,
+        [admin.address],
+        { initializer: "initialize" }
+    );
+    await reputationManager.waitForDeployment();
+
+    // 3. Deploy ComplianceManager
+    const ComplianceManager = await ethers.getContractFactory("ComplianceManager");
+    const complianceManager = await upgrades.deployProxy(
+        ComplianceManager,
+        [admin.address],
+        { initializer: "initialize" }
+    );
+    await complianceManager.waitForDeployment();
+
+    // 4. Deploy DebtToken
+    const DebtToken = await ethers.getContractFactory("DebtToken");
+    const debtToken = await upgrades.deployProxy(
+        DebtToken,
+        ["Bancafi Debt Token", "BDT", admin.address],
+        { initializer: "initialize" }
+    );
+    await debtToken.waitForDeployment();
+
+    // 5. Deploy CollectionAutomator
+    const CollectionAutomator = await ethers.getContractFactory("CollectionAutomator");
+    const collectionAutomator = await upgrades.deployProxy(
+        CollectionAutomator,
+        [
+            admin.address,
+            await debtToken.getAddress(),
+            await complianceManager.getAddress(),
+            await reputationManager.getAddress()
+        ],
+        { initializer: "initialize" }
+    );
+    await collectionAutomator.waitForDeployment();
+
+    // 6. Deploy DebtMarketplace
+    const DebtMarketplace = await ethers.getContractFactory("DebtMarketplace");
+    const marketplace = await upgrades.deployProxy(
+        DebtMarketplace,
+        [
+            admin.address,
+            await debtToken.getAddress(),
+            await complianceManager.getAddress(),
+            treasury.address
+        ],
+        { initializer: "initialize" }
+    );
+    await marketplace.waitForDeployment();
+
+    // 7. Deploy Mock Timelock for testing
+    const MockTimelock = await ethers.getContractFactory("MockTimelock");
+    const timelock = await MockTimelock.deploy(
+        172800, // 2 days
+        [admin.address], // proposers
+        [admin.address], // executors
+        admin.address    // admin
+    );
+    await timelock.waitForDeployment();
+
+    // 8. Deploy BancafiDAO
+    const BancafiDAO = await ethers.getContractFactory("BancafiDAO");
+    const dao = await upgrades.deployProxy(
+        BancafiDAO,
+        [
+            await token.getAddress(),
+            await timelock.getAddress(),
+            1,      // voting delay (1 block)
+            50400,  // voting period (~1 week)
+            ethers.parseEther("100000"), // proposal threshold
+            4       // 4% quorum
+        ],
+        { initializer: "initialize" }
+    );
+    await dao.waitForDeployment();
+
+    // Setup roles and permissions
+    const MINTER_ROLE = await debtToken.MINTER_ROLE();
+    const OPERATOR_ROLE = await debtToken.OPERATOR_ROLE();
+    const ADMIN_ROLE = await debtToken.ADMIN_ROLE();
+
+    await debtToken.grantRole(MINTER_ROLE, admin.address);
+    await debtToken.grantRole(OPERATOR_ROLE, await collectionAutomator.getAddress());
+    await collectionAutomator.grantRole(OPERATOR_ROLE, operator.address);
+    await reputationManager.grantRole(OPERATOR_ROLE, await collectionAutomator.getAddress());
+
+    // Set contract references
+    await debtToken.setComplianceManager(await complianceManager.getAddress());
+    await debtToken.setCollectionAutomator(await collectionAutomator.getAddress());
+    await collectionAutomator.setMarketplace(await marketplace.getAddress());
+
+    // Set default parameters
+    await debtToken.setMinPrincipalAmount(ethers.parseEther("100"));
+    await debtToken.setMaxInterestRate(5000); // 50%
+    await marketplace.setTradingFee(250); // 2.5%
+    await marketplace.setListingDurations(86400, 2592000); // 1 day to 30 days
+    // CollectionAutomator parameters are set in initializer
+    // defaultSecurityDepositAmount = 1 ether
+    // slashingPercentage = 2000 (20%)
+    // maxWarningsBeforeDefault = 3
+
+    return {
+        token,
+        reputationManager,
+        complianceManager,
+        debtToken,
+        collectionAutomator,
+        marketplace,
+        timelock,
+        dao,
+        admin,
+        treasury,
+        operator,
+        user1,
+        user2,
+        user3
+    };
+}
+
+/**
+ * Create sample debt metadata
+ */
+export function createDebtMetadata(overrides = {}) {
+    return {
+        debtType: 0, // PHYSICAL
+        principalAmount: ethers.parseEther("10000"),
+        currency: "USD",
+        interestRate: 500, // 5%
+        interestType: 0, // FIXED
+        originationDate: Math.floor(Date.now() / 1000),
+        maturityDate: Math.floor(Date.now() / 1000) + 31536000, // 1 year
+        debtor: ethers.ZeroAddress,
+        originalCreditor: ethers.ZeroAddress,
+        riskRating: "BBB",
+        legalDocumentHash: ethers.id("ipfs://Qm..."),
+        status: 0, // ACTIVE
+        outstandingBalance: ethers.parseEther("10000"),
+        totalPaid: 0,
+        missedPayments: 0,
+        ...overrides
+    };
+}
+
+/**
+ * Create sample repayment schedule
+ */
+export function createRepaymentSchedule(overrides = {}) {
+    return {
+        frequency: 3, // MONTHLY
+        installmentAmount: ethers.parseEther("1000"),
+        numberOfPayments: 12,
+        paymentsMade: 0,
+        nextPaymentDate: Math.floor(Date.now() / 1000) + 2592000, // 30 days
+        gracePeriodDays: 5,
+        lateFeePercentage: 500, // 5%
+        ...overrides
+    };
+}
+
+/**
+ * Create sample collateral
+ */
+export function createCollateral(overrides = {}) {
+    return {
+        collateralType: 0, // REAL_ESTATE
+        description: "Single family home at 123 Main St",
+        valuationAmount: ethers.parseEther("50000"),
+        valuationCurrency: "USD",
+        valuationDate: Math.floor(Date.now() / 1000),
+        documentHash: ethers.id("ipfs://Qm..."),
+        liquidated: false,
+        liquidationAmount: 0,
+        ...overrides
+    };
+}
+
+/**
+ * Setup KYC for user
+ */
+export async function setupKYC(complianceManager, user, level = 2) {
+    const COMPLIANCE_OFFICER_ROLE = await complianceManager.COMPLIANCE_OFFICER_ROLE();
+    const [admin] = await ethers.getSigners();
+
+    await complianceManager.connect(admin).updateKYCStatus(
+        user.address,
+        level,
+        Math.floor(Date.now() / 1000) + 31536000, // 1 year expiry
+        "US",
+        ethers.id("kyc-doc-hash")
+    );
+}
+
+/**
+ * Mint a debt token
+ */
+export async function mintDebtToken(debtToken, to, debtor, metadata, schedule, collaterals = []) {
+    metadata.debtor = debtor;
+    metadata.originalCreditor = to;
+
+    const tx = await debtToken.mintDebtToken(
+        to,
+        debtor,
+        metadata,
+        schedule,
+        collaterals,
+        "ipfs://metadata"
+    );
+    const receipt = await tx.wait();
+
+    // Extract tokenId from event
+    const event = receipt.logs.find(log => {
+        try {
+            return debtToken.interface.parseLog(log)?.name === "DebtTokenMinted";
+        } catch {
+            return false;
+        }
+    });
+
+    const parsedEvent = debtToken.interface.parseLog(event);
+    return parsedEvent.args.tokenId;
+}
+
+/**
+ * Time travel helper
+ */
+export async function increaseTime(seconds) {
+    await ethers.provider.send("evm_increaseTime", [seconds]);
+    await ethers.provider.send("evm_mine", []);
+}
+
+/**
+ * Expect revert with custom error
+ */
+export async function expectRevert(promise, errorName) {
+    await expect(promise).to.be.revertedWithCustomError({ interface: [] }, errorName);
+}
+
+/**
+ * Get current timestamp
+ */
+export async function getCurrentTimestamp() {
+    const block = await ethers.provider.getBlock("latest");
+    return block.timestamp;
+}
+
+export { expect, ethers, upgrades };

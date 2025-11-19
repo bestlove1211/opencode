@@ -1,0 +1,32 @@
+[
+  {
+    "content": "Create Multi-Signature Treasury contract for secure fund management",
+    "status": "completed",
+    "activeForm": "Creating Multi-Signature Treasury contract"
+  },
+  {
+    "content": "Create Interest Manager contract for flexible APY logic",
+    "status": "completed",
+    "activeForm": "Creating Interest Manager contract"
+  },
+  {
+    "content": "Update BancafiSavingsAccount to integrate with new contracts",
+    "status": "completed",
+    "activeForm": "Updating BancafiSavingsAccount integration"
+  },
+  {
+    "content": "Add tests for new contracts",
+    "status": "in_progress",
+    "activeForm": "Adding tests for new contracts"
+  },
+  {
+    "content": "Update deployment scripts",
+    "status": "pending",
+    "activeForm": "Updating deployment scripts"
+  },
+  {
+    "content": "Update documentation",
+    "status": "pending",
+    "activeForm": "Updating documentation"
+  }
+]

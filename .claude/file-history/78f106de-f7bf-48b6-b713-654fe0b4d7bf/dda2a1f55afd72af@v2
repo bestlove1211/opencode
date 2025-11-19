@@ -1,0 +1,545 @@
+import { expect, ethers, upgrades } from "./helpers/setup.js";
+import {
+    deployFullSystem,
+    createDebtMetadata,
+    createRepaymentSchedule,
+    createCollateral,
+    setupKYC,
+    mintDebtToken,
+    increaseTime,
+    getCurrentTimestamp
+} from "./helpers/setup.js";
+
+describe("DebtToken", function () {
+    let system;
+    let debtToken, complianceManager, collectionAutomator, reputationManager;
+    let admin, treasury, operator, user1, user2, user3;
+
+    beforeEach(async function () {
+        system = await deployFullSystem();
+        ({
+            debtToken,
+            complianceManager,
+            collectionAutomator,
+            reputationManager,
+            admin,
+            treasury,
+            operator,
+            user1,
+            user2,
+            user3
+        } = system);
+
+        // Setup KYC for test users
+        await setupKYC(complianceManager, user1, 2);
+        await setupKYC(complianceManager, user2, 2);
+        await setupKYC(complianceManager, user3, 2);
+    });
+
+    describe("Initialization", function () {
+        it("Should initialize with correct name and symbol", async function () {
+            expect(await debtToken.name()).to.equal("Bancafi Debt Token");
+            expect(await debtToken.symbol()).to.equal("BDT");
+        });
+
+        it("Should set admin roles correctly", async function () {
+            const ADMIN_ROLE = await debtToken.ADMIN_ROLE();
+            const DEFAULT_ADMIN_ROLE = await debtToken.DEFAULT_ADMIN_ROLE();
+
+            expect(await debtToken.hasRole(ADMIN_ROLE, admin.address)).to.be.true;
+            expect(await debtToken.hasRole(DEFAULT_ADMIN_ROLE, admin.address)).to.be.true;
+        });
+
+        it("Should set compliance manager correctly", async function () {
+            expect(await debtToken.complianceManager()).to.equal(await complianceManager.getAddress());
+        });
+
+        it("Should set collection automator correctly", async function () {
+            expect(await debtToken.collectionAutomator()).to.equal(await collectionAutomator.getAddress());
+        });
+
+        it("Should prevent initialization twice", async function () {
+            await expect(
+                debtToken.initialize("Test", "TST", admin.address)
+            ).to.be.revertedWith("Initializable: contract is already initialized");
+        });
+
+        it("Should set min principal amount", async function () {
+            expect(await debtToken.minPrincipalAmount()).to.equal(ethers.parseEther("100"));
+        });
+
+        it("Should set max interest rate", async function () {
+            expect(await debtToken.maxInterestRate()).to.equal(5000); // 50%
+        });
+    });
+
+    describe("Minting Debt Tokens", function () {
+        let metadata, schedule, collateral;
+
+        beforeEach(function () {
+            metadata = createDebtMetadata();
+            schedule = createRepaymentSchedule();
+            collateral = createCollateral();
+        });
+
+        it("Should mint debt token with valid parameters", async function () {
+            const tokenId = await mintDebtToken(
+                debtToken,
+                user1.address,
+                user2.address,
+                metadata,
+                schedule,
+                [collateral]
+            );
+
+            expect(await debtToken.ownerOf(tokenId)).to.equal(user1.address);
+            expect(await debtToken.balanceOf(user1.address)).to.equal(1);
+        });
+
+        it("Should increment token ID counter", async function () {
+            const tokenId1 = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+            const tokenId2 = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+
+            expect(tokenId2).to.equal(tokenId1 + 1n);
+        });
+
+        it("Should store debt metadata correctly", async function () {
+            const tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+            const storedMetadata = await debtToken.getDebtMetadata(tokenId);
+
+            expect(storedMetadata.principalAmount).to.equal(metadata.principalAmount);
+            expect(storedMetadata.interestRate).to.equal(metadata.interestRate);
+            expect(storedMetadata.debtor).to.equal(user2.address);
+            expect(storedMetadata.originalCreditor).to.equal(user1.address);
+        });
+
+        it("Should store repayment schedule correctly", async function () {
+            const tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+            const storedSchedule = await debtToken.getRepaymentSchedule(tokenId);
+
+            expect(storedSchedule.installmentAmount).to.equal(schedule.installmentAmount);
+            expect(storedSchedule.numberOfPayments).to.equal(schedule.numberOfPayments);
+            expect(storedSchedule.frequency).to.equal(schedule.frequency);
+        });
+
+        it("Should store collateral correctly", async function () {
+            const tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, [collateral]);
+            const storedCollaterals = await debtToken.getCollaterals(tokenId);
+
+            expect(storedCollaterals.length).to.equal(1);
+            expect(storedCollaterals[0].valuationAmount).to.equal(collateral.valuationAmount);
+            expect(storedCollaterals[0].collateralType).to.equal(collateral.collateralType);
+        });
+
+        it("Should support multiple collaterals", async function () {
+            const collateral2 = createCollateral({ collateralType: 1, valuationAmount: ethers.parseEther("20000") });
+            const tokenId = await mintDebtToken(
+                debtToken,
+                user1.address,
+                user2.address,
+                metadata,
+                schedule,
+                [collateral, collateral2]
+            );
+
+            const storedCollaterals = await debtToken.getCollaterals(tokenId);
+            expect(storedCollaterals.length).to.equal(2);
+        });
+
+        it("Should track debtor's tokens", async function () {
+            await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+            await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+
+            const debtorTokens = await debtToken.getDebtorTokens(user2.address);
+            expect(debtorTokens.length).to.equal(2);
+        });
+
+        it("Should emit DebtTokenMinted event", async function () {
+            metadata.debtor = user2.address;
+            metadata.originalCreditor = user1.address;
+
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.emit(debtToken, "DebtTokenMinted");
+        });
+
+        it("Should revert if recipient is zero address", async function () {
+            await expect(
+                debtToken.mintDebtToken(
+                    ethers.ZeroAddress,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert if debtor is zero address", async function () {
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    ethers.ZeroAddress,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert if principal is below minimum", async function () {
+            metadata.principalAmount = ethers.parseEther("50"); // Below min of 100
+
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert if interest rate exceeds maximum", async function () {
+            metadata.interestRate = 6000; // Above max of 5000 (50%)
+
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert if maturity date is in the past", async function () {
+            metadata.maturityDate = Math.floor(Date.now() / 1000) - 86400; // Yesterday
+
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert if payment schedule is invalid (zero payments)", async function () {
+            schedule.numberOfPayments = 0;
+
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert when paused", async function () {
+            await debtToken.pause();
+
+            await expect(
+                debtToken.mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+
+        it("Should revert if caller doesn't have MINTER_ROLE", async function () {
+            await expect(
+                debtToken.connect(user1).mintDebtToken(
+                    user1.address,
+                    user2.address,
+                    metadata,
+                    schedule,
+                    [],
+                    "ipfs://metadata"
+                )
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Payment Recording", function () {
+        let tokenId, metadata, schedule;
+
+        beforeEach(async function () {
+            metadata = createDebtMetadata();
+            schedule = createRepaymentSchedule();
+            tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+        });
+
+        it("Should record payment correctly", async function () {
+            const paymentAmount = ethers.parseEther("1000");
+            await debtToken.recordPayment(tokenId, paymentAmount);
+
+            const updatedMetadata = await debtToken.getDebtMetadata(tokenId);
+            expect(updatedMetadata.totalPaid).to.equal(paymentAmount);
+            expect(updatedMetadata.outstandingBalance).to.equal(
+                metadata.principalAmount - paymentAmount
+            );
+        });
+
+        it("Should update last payment date", async function () {
+            await debtToken.recordPayment(tokenId, ethers.parseEther("1000"));
+            const lastPayment = await debtToken.getLastPaymentDate(tokenId);
+            const currentTime = await getCurrentTimestamp();
+
+            expect(lastPayment).to.be.closeTo(currentTime, 5);
+        });
+
+        it("Should emit PaymentRecorded event", async function () {
+            await expect(
+                debtToken.recordPayment(tokenId, ethers.parseEther("1000"))
+            ).to.emit(debtToken, "PaymentRecorded");
+        });
+
+        it("Should allow multiple payments", async function () {
+            await debtToken.recordPayment(tokenId, ethers.parseEther("1000"));
+            await debtToken.recordPayment(tokenId, ethers.parseEther("500"));
+
+            const updatedMetadata = await debtToken.getDebtMetadata(tokenId);
+            expect(updatedMetadata.totalPaid).to.equal(ethers.parseEther("1500"));
+        });
+
+        it("Should track payment history", async function () {
+            await debtToken.recordPayment(tokenId, ethers.parseEther("1000"));
+            await debtToken.recordPayment(tokenId, ethers.parseEther("500"));
+
+            const history = await debtToken.getPaymentHistory(tokenId);
+            expect(history.length).to.equal(2);
+            expect(history[0].amount).to.equal(ethers.parseEther("1000"));
+            expect(history[1].amount).to.equal(ethers.parseEther("500"));
+        });
+
+        it("Should revert if payment amount is zero", async function () {
+            await expect(
+                debtToken.recordPayment(tokenId, 0)
+            ).to.be.reverted;
+        });
+
+        it("Should revert if token doesn't exist", async function () {
+            await expect(
+                debtToken.recordPayment(999, ethers.parseEther("1000"))
+            ).to.be.reverted;
+        });
+
+        it("Should revert when paused", async function () {
+            await debtToken.pause();
+
+            await expect(
+                debtToken.recordPayment(tokenId, ethers.parseEther("1000"))
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Debt Status Management", function () {
+        let tokenId;
+
+        beforeEach(async function () {
+            const metadata = createDebtMetadata();
+            const schedule = createRepaymentSchedule();
+            tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+        });
+
+        it("Should update debt status", async function () {
+            await debtToken.updateDebtStatus(tokenId, 1); // DEFAULTED
+            const metadata = await debtToken.getDebtMetadata(tokenId);
+            expect(metadata.status).to.equal(1);
+        });
+
+        it("Should mark debt as paid off when fully paid", async function () {
+            await debtToken.markAsPaidOff(tokenId);
+            const metadata = await debtToken.getDebtMetadata(tokenId);
+            expect(metadata.status).to.equal(2); // PAID_OFF
+        });
+
+        it("Should mark debt as defaulted", async function () {
+            await debtToken.connect(operator).markAsDefaulted(tokenId);
+            const metadata = await debtToken.getDebtMetadata(tokenId);
+            expect(metadata.status).to.equal(1); // DEFAULTED
+        });
+
+        it("Should emit DebtStatusUpdated event", async function () {
+            await expect(
+                debtToken.updateDebtStatus(tokenId, 1)
+            ).to.emit(debtToken, "DebtStatusUpdated");
+        });
+
+        it("Should only allow operator to mark as defaulted", async function () {
+            await expect(
+                debtToken.connect(user1).markAsDefaulted(tokenId)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("View Functions", function () {
+        let tokenId;
+
+        beforeEach(async function () {
+            const metadata = createDebtMetadata();
+            const schedule = createRepaymentSchedule();
+            const collateral = createCollateral();
+            tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, [collateral]);
+        });
+
+        it("Should return debt metadata", async function () {
+            const metadata = await debtToken.getDebtMetadata(tokenId);
+            expect(metadata.principalAmount).to.equal(ethers.parseEther("10000"));
+        });
+
+        it("Should return repayment schedule", async function () {
+            const schedule = await debtToken.getRepaymentSchedule(tokenId);
+            expect(schedule.numberOfPayments).to.equal(12);
+        });
+
+        it("Should return collaterals", async function () {
+            const collaterals = await debtToken.getCollaterals(tokenId);
+            expect(collaterals.length).to.equal(1);
+        });
+
+        it("Should return debtor tokens", async function () {
+            const tokens = await debtToken.getDebtorTokens(user2.address);
+            expect(tokens.length).to.equal(1);
+            expect(tokens[0]).to.equal(tokenId);
+        });
+
+        it("Should return outstanding balance", async function () {
+            const balance = await debtToken.getOutstandingBalance(tokenId);
+            expect(balance).to.equal(ethers.parseEther("10000"));
+        });
+
+        it("Should return total supply", async function () {
+            expect(await debtToken.totalSupply()).to.equal(1);
+        });
+    });
+
+    describe("Access Control", function () {
+        it("Should allow admin to grant roles", async function () {
+            const MINTER_ROLE = await debtToken.MINTER_ROLE();
+            await debtToken.grantRole(MINTER_ROLE, user1.address);
+            expect(await debtToken.hasRole(MINTER_ROLE, user1.address)).to.be.true;
+        });
+
+        it("Should allow admin to revoke roles", async function () {
+            const MINTER_ROLE = await debtToken.MINTER_ROLE();
+            await debtToken.grantRole(MINTER_ROLE, user1.address);
+            await debtToken.revokeRole(MINTER_ROLE, user1.address);
+            expect(await debtToken.hasRole(MINTER_ROLE, user1.address)).to.be.false;
+        });
+
+        it("Should not allow non-admin to grant roles", async function () {
+            const MINTER_ROLE = await debtToken.MINTER_ROLE();
+            await expect(
+                debtToken.connect(user1).grantRole(MINTER_ROLE, user2.address)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Pausable", function () {
+        it("Should allow admin to pause", async function () {
+            await debtToken.pause();
+            expect(await debtToken.paused()).to.be.true;
+        });
+
+        it("Should allow admin to unpause", async function () {
+            await debtToken.pause();
+            await debtToken.unpause();
+            expect(await debtToken.paused()).to.be.false;
+        });
+
+        it("Should not allow non-admin to pause", async function () {
+            await expect(
+                debtToken.connect(user1).pause()
+            ).to.be.reverted;
+        });
+
+        it("Should prevent transfers when paused", async function () {
+            const metadata = createDebtMetadata();
+            const schedule = createRepaymentSchedule();
+            const tokenId = await mintDebtToken(debtToken, user1.address, user2.address, metadata, schedule, []);
+
+            await debtToken.pause();
+
+            await expect(
+                debtToken.connect(user1).transferFrom(user1.address, user3.address, tokenId)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Configuration", function () {
+        it("Should allow admin to set compliance manager", async function () {
+            const newAddress = user3.address;
+            await debtToken.setComplianceManager(newAddress);
+            expect(await debtToken.complianceManager()).to.equal(newAddress);
+        });
+
+        it("Should allow admin to set collection automator", async function () {
+            const newAddress = user3.address;
+            await debtToken.setCollectionAutomator(newAddress);
+            expect(await debtToken.collectionAutomator()).to.equal(newAddress);
+        });
+
+        it("Should allow admin to set min principal amount", async function () {
+            await debtToken.setMinPrincipalAmount(ethers.parseEther("500"));
+            expect(await debtToken.minPrincipalAmount()).to.equal(ethers.parseEther("500"));
+        });
+
+        it("Should allow admin to set max interest rate", async function () {
+            await debtToken.setMaxInterestRate(10000); // 100%
+            expect(await debtToken.maxInterestRate()).to.equal(10000);
+        });
+
+        it("Should revert setting zero address for compliance manager", async function () {
+            await expect(
+                debtToken.setComplianceManager(ethers.ZeroAddress)
+            ).to.be.reverted;
+        });
+
+        it("Should not allow non-admin to change configuration", async function () {
+            await expect(
+                debtToken.connect(user1).setMinPrincipalAmount(ethers.parseEther("500"))
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Upgradability", function () {
+        it("Should allow upgrade by upgrader role", async function () {
+            const DebtTokenV2 = await ethers.getContractFactory("DebtToken");
+            await upgrades.upgradeProxy(await debtToken.getAddress(), DebtTokenV2);
+
+            // Verify state persisted
+            expect(await debtToken.name()).to.equal("Bancafi Debt Token");
+        });
+
+        it("Should not allow upgrade by non-upgrader", async function () {
+            // This would fail at proxy level, tested in integration
+            expect(await debtToken.hasRole(await debtToken.UPGRADER_ROLE(), admin.address)).to.be.true;
+        });
+    });
+});

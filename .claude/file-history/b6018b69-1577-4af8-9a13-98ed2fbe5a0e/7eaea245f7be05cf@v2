@@ -1,0 +1,284 @@
+# Bancafi Savings Account - Backend API
+
+RESTful API for the Bancafi Savings Account system.
+
+## Features
+
+- Account management and balance tracking
+- Transaction history and monitoring
+- Real-time interest calculation
+- Global statistics and analytics
+- Multi-chain support
+
+## Tech Stack
+
+- **Framework**: Express.js
+- **Database**: PostgreSQL with Sequelize ORM
+- **Blockchain**: ethers.js
+- **Logging**: Winston
+- **Security**: Helmet, CORS, Rate Limiting
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js >= 18.x
+- PostgreSQL >= 14
+- Redis (optional, for caching)
+
+### Installation
+
+```bash
+# Install dependencies
+npm install
+
+# Copy environment variables
+cp .env.example .env
+
+# Edit .env with your configuration
+nano .env
+
+# Run database migrations
+npm run migrate
+
+# Start development server
+npm run dev
+```
+
+### Environment Variables
+
+See `.env.example` for all required configuration.
+
+Key variables:
+- `DATABASE_URL`: PostgreSQL connection string
+- `SAVINGS_ACCOUNT_ADDRESS`: Deployed contract address
+- `ETHEREUM_RPC_URL`: Blockchain RPC endpoint
+- `API_PORT`: Server port (default: 3000)
+
+## API Endpoints
+
+### Account Management
+
+#### Get Account Information
+```
+GET /api/accounts/:walletAddress
+```
+
+Returns all savings accounts for a wallet address.
+
+**Response:**
+```json
+{
+  "walletAddress": "0x...",
+  "accounts": [
+    {
+      "tokenAddress": "0x...",
+      "balance": "1000000000000000000",
+      "totalInterestEarned": "45000000000000000",
+      "currentAPY": "4.50",
+      "accountOpenDate": "2024-01-01T00:00:00Z",
+      "chainId": 1
+    }
+  ]
+}
+```
+
+#### Get Token Account Info
+```
+GET /api/accounts/:walletAddress/:tokenAddress
+```
+
+Get detailed info for a specific token account.
+
+#### Sync Account
+```
+POST /api/accounts/sync
+Body: { "walletAddress": "0x..." }
+```
+
+Sync account data from blockchain.
+
+#### Get Pending Interest
+```
+GET /api/accounts/:walletAddress/interest
+```
+
+Calculate pending interest for all accounts.
+
+### Transaction History
+
+#### Get Transaction History
+```
+GET /api/transactions/:walletAddress?page=1&limit=20&type=DEPOSIT
+```
+
+Query parameters:
+- `page`: Page number (default: 1)
+- `limit`: Results per page (default: 20, max: 100)
+- `type`: Filter by type (DEPOSIT, WITHDRAWAL, INTEREST_CLAIM)
+
+**Response:**
+```json
+{
+  "walletAddress": "0x...",
+  "total": 100,
+  "page": 1,
+  "totalPages": 5,
+  "transactions": [
+    {
+      "id": "uuid",
+      "txHash": "0x...",
+      "type": "DEPOSIT",
+      "amount": "1000000000000000000",
+      "status": "CONFIRMED",
+      "timestamp": "2024-01-01T00:00:00Z",
+      "tokenAddress": "0x...",
+      "chainId": 1,
+      "blockNumber": 12345678
+    }
+  ]
+}
+```
+
+#### Get Transaction by Hash
+```
+GET /api/transactions/hash/:txHash
+```
+
+Get details for a specific transaction.
+
+#### Track Transaction
+```
+POST /api/transactions/track
+Body: {
+  "walletAddress": "0x...",
+  "tokenAddress": "0x...",
+  "txHash": "0x...",
+  "type": "DEPOSIT",
+  "amount": "1000000000000000000",
+  "chainId": 1
+}
+```
+
+### Statistics
+
+#### Get Global Stats
+```
+GET /api/stats/global
+```
+
+Get contract-wide statistics.
+
+**Response:**
+```json
+{
+  "onChain": {
+    "totalDeposits": "1000000000000000000000",
+    "totalInterestPaid": "50000000000000000000",
+    "totalAccounts": "1500"
+  },
+  "offChain": {
+    "totalUsers": 1000,
+    "totalTransactions": 5000,
+    "recentTransactions24h": 150
+  }
+}
+```
+
+#### Get Current APY
+```
+GET /api/stats/apy
+```
+
+Get current APY rates.
+
+#### Get Supported Tokens
+```
+GET /api/stats/tokens
+```
+
+List all supported tokens.
+
+### Health Check
+
+```
+GET /health
+```
+
+Check API status.
+
+## Database Schema
+
+### Users
+- `id`: UUID (primary key)
+- `walletAddress`: Ethereum address (unique)
+- `email`: Optional email
+- `isActive`: Boolean
+- `lastLogin`: Timestamp
+
+### Accounts
+- `id`: UUID (primary key)
+- `userId`: Foreign key to Users
+- `tokenAddress`: Token contract address
+- `balance`: Decimal (78,0)
+- `totalInterestEarned`: Decimal (78,0)
+- `currentAPY`: Decimal (10,2)
+- `accountOpenDate`: Timestamp
+- `isActive`: Boolean
+- `chainId`: Integer
+
+### Transactions
+- `id`: UUID (primary key)
+- `accountId`: Foreign key to Accounts
+- `txHash`: Transaction hash (unique)
+- `type`: Enum (DEPOSIT, WITHDRAWAL, INTEREST_CLAIM)
+- `amount`: Decimal (78,0)
+- `status`: Enum (PENDING, CONFIRMED, FAILED)
+- `blockNumber`: Integer
+- `timestamp`: Timestamp
+
+## Development
+
+### Run Tests
+```bash
+npm test
+```
+
+### Linting
+```bash
+npm run lint
+```
+
+### Database Migrations
+```bash
+# Create migration
+npx sequelize-cli migration:generate --name migration-name
+
+# Run migrations
+npx sequelize-cli db:migrate
+
+# Rollback
+npx sequelize-cli db:migrate:undo
+```
+
+## Security
+
+- Rate limiting: 100 requests per 15 minutes per IP
+- Helmet.js for security headers
+- Input validation with express-validator
+- CORS configuration
+- Reentrancy protection in smart contracts
+
+## Production Deployment
+
+1. Set `NODE_ENV=production`
+2. Configure production database
+3. Enable SSL for database connections
+4. Set up proper logging
+5. Configure reverse proxy (nginx)
+6. Enable HTTPS
+7. Set up monitoring and alerts
+
+## License
+
+MIT

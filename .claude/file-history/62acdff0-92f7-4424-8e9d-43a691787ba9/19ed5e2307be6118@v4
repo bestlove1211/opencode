@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title AggregatorV3Interface
+ * @notice Chainlink price feed interface
+ */
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function description() external view returns (string memory);
+    function version() external view returns (uint256);
+
+    function getRoundData(uint80 _roundId)
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
+
+/**
+ * @title BancafiOracle
+ * @notice Price oracle using Chainlink for real-world asset valuations
+ * @dev Supports Chainlink feeds, manual updates, and aggregation
+ */
+contract BancafiOracle is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+    bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
+
+    enum AssetType {
+        RealEstate,
+        Minerals,
+        OilAndEnergy,
+        Gold,
+        PhysicalAsset
+    }
+
+    enum PriceSource {
+        Chainlink,
+        Manual,
+        Aggregated
+    }
+
+    struct AssetValuation {
+        uint256 tokenId;
+        AssetType assetType;
+        address chainlinkFeed; // Chainlink price feed address
+        uint256 currentPrice;
+        uint256 previousPrice;
+        uint256 lastUpdated;
+        uint256 updateCount;
+        bool stale;
+        uint256 stalenessThreshold; // in seconds
+        PriceSource priceSource;
+    }
+
+    struct PriceUpdate {
+        uint256 price;
+        uint256 timestamp;
+        PriceSource source;
+        address updatedBy;
+    }
+
+    // State variables
+    mapping(uint256 => AssetValuation) public assetValuations; // tokenId => valuation
+    mapping(uint256 => PriceUpdate[]) public priceUpdates; // tokenId => price history
+    mapping(AssetType => uint256) public defaultStalenessThreshold;
+    mapping(AssetType => address) public defaultChainlinkFeeds; // Default feeds per asset type
+
+    uint256[] public trackedAssets;
+    uint256 public maxPriceAge; // Max age for Chainlink price
+
+    // Events
+    event PriceUpdated(
+        uint256 indexed tokenId,
+        uint256 oldPrice,
+        uint256 newPrice,
+        PriceSource source,
+        uint256 timestamp
+    );
+
+    event ChainlinkFeedUpdated(
+        uint256 indexed tokenId,
+        address indexed feed,
+        uint256 timestamp
+    );
+
+    event StalenessDetected(
+        uint256 indexed tokenId,
+        uint256 lastUpdate,
+        uint256 threshold,
+        uint256 timestamp
+    );
+
+    event DefaultFeedSet(
+        AssetType indexed assetType,
+        address indexed feed,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(ORACLE_ROLE, msg.sender);
+        _grantRole(VALIDATOR_ROLE, msg.sender);
+
+        // Set default values
+        maxPriceAge = 24 hours;
+
+        // Set default staleness thresholds
+        _setDefaultStaleness();
+    }
+
+    /**
+     * @notice Initialize asset with Chainlink feed
+     */
+    function initializeAssetWithChainlink(
+        uint256 tokenId_,
+        AssetType assetType_,
+        address chainlinkFeed_,
+        uint256 stalenessThreshold_
+    ) external onlyRole(ORACLE_ROLE) {
+        require(assetValuations[tokenId_].tokenId == 0, "Already initialized");
+        require(chainlinkFeed_ != address(0), "Invalid feed");
+
+        // Get price from Chainlink
+        uint256 price = _getChainlinkPrice(chainlinkFeed_);
+
+        assetValuations[tokenId_] = AssetValuation({
+            tokenId: tokenId_,
+            assetType: assetType_,
+            chainlinkFeed: chainlinkFeed_,
+            currentPrice: price,
+            previousPrice: 0,
+            lastUpdated: block.timestamp,
+            updateCount: 1,
+            stale: false,
+            stalenessThreshold: stalenessThreshold_ > 0 ? stalenessThreshold_ : defaultStalenessThreshold[assetType_],
+            priceSource: PriceSource.Chainlink
+        });
+
+        priceUpdates[tokenId_].push(PriceUpdate({
+            price: price,
+            timestamp: block.timestamp,
+            source: PriceSource.Chainlink,
+            updatedBy: msg.sender
+        }));
+
+        trackedAssets.push(tokenId_);
+
+        emit PriceUpdated(tokenId_, 0, price, PriceSource.Chainlink, block.timestamp);
+        emit ChainlinkFeedUpdated(tokenId_, chainlinkFeed_, block.timestamp);
+    }
+
+    /**
+     * @notice Initialize asset with manual price (no Chainlink)
+     */
+    function initializeAssetManual(
+        uint256 tokenId_,
+        AssetType assetType_,
+        uint256 initialPrice_,
+        uint256 stalenessThreshold_
+    ) external onlyRole(ORACLE_ROLE) {
+        require(assetValuations[tokenId_].tokenId == 0, "Already initialized");
+        require(initialPrice_ > 0, "Invalid price");
+
+        assetValuations[tokenId_] = AssetValuation({
+            tokenId: tokenId_,
+            assetType: assetType_,
+            chainlinkFeed: address(0),
+            currentPrice: initialPrice_,
+            previousPrice: 0,
+            lastUpdated: block.timestamp,
+            updateCount: 1,
+            stale: false,
+            stalenessThreshold: stalenessThreshold_ > 0 ? stalenessThreshold_ : defaultStalenessThreshold[assetType_],
+            priceSource: PriceSource.Manual
+        });
+
+        priceUpdates[tokenId_].push(PriceUpdate({
+            price: initialPrice_,
+            timestamp: block.timestamp,
+            source: PriceSource.Manual,
+            updatedBy: msg.sender
+        }));
+
+        trackedAssets.push(tokenId_);
+
+        emit PriceUpdated(tokenId_, 0, initialPrice_, PriceSource.Manual, block.timestamp);
+    }
+
+    /**
+     * @notice Update price from Chainlink feed
+     */
+    function updatePriceFromChainlink(uint256 tokenId_) external whenNotPaused {
+        AssetValuation storage valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(valuation.chainlinkFeed != address(0), "No Chainlink feed");
+
+        uint256 newPrice = _getChainlinkPrice(valuation.chainlinkFeed);
+        uint256 oldPrice = valuation.currentPrice;
+
+        // Update valuation
+        valuation.previousPrice = oldPrice;
+        valuation.currentPrice = newPrice;
+        valuation.lastUpdated = block.timestamp;
+        valuation.updateCount++;
+        valuation.stale = false;
+
+        priceUpdates[tokenId_].push(PriceUpdate({
+            price: newPrice,
+            timestamp: block.timestamp,
+            source: PriceSource.Chainlink,
+            updatedBy: msg.sender
+        }));
+
+        emit PriceUpdated(tokenId_, oldPrice, newPrice, PriceSource.Chainlink, block.timestamp);
+    }
+
+    /**
+     * @notice Update price manually
+     */
+    function updatePriceManual(
+        uint256 tokenId_,
+        uint256 newPrice_
+    ) external onlyRole(ORACLE_ROLE) whenNotPaused {
+        AssetValuation storage valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(newPrice_ > 0, "Invalid price");
+
+        uint256 oldPrice = valuation.currentPrice;
+
+        // Update valuation
+        valuation.previousPrice = oldPrice;
+        valuation.currentPrice = newPrice_;
+        valuation.lastUpdated = block.timestamp;
+        valuation.updateCount++;
+        valuation.stale = false;
+        valuation.priceSource = PriceSource.Manual;
+
+        priceUpdates[tokenId_].push(PriceUpdate({
+            price: newPrice_,
+            timestamp: block.timestamp,
+            source: PriceSource.Manual,
+            updatedBy: msg.sender
+        }));
+
+        emit PriceUpdated(tokenId_, oldPrice, newPrice_, PriceSource.Manual, block.timestamp);
+    }
+
+    /**
+     * @notice Set Chainlink feed for asset
+     */
+    function setChainlinkFeed(
+        uint256 tokenId_,
+        address chainlinkFeed_
+    ) external onlyRole(ORACLE_ROLE) {
+        require(assetValuations[tokenId_].tokenId != 0, "Asset not tracked");
+        require(chainlinkFeed_ != address(0), "Invalid feed");
+
+        assetValuations[tokenId_].chainlinkFeed = chainlinkFeed_;
+        assetValuations[tokenId_].priceSource = PriceSource.Chainlink;
+
+        emit ChainlinkFeedUpdated(tokenId_, chainlinkFeed_, block.timestamp);
+    }
+
+    /**
+     * @notice Set default Chainlink feed for asset type
+     */
+    function setDefaultChainlinkFeed(
+        AssetType assetType_,
+        address chainlinkFeed_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(chainlinkFeed_ != address(0), "Invalid feed");
+
+        defaultChainlinkFeeds[assetType_] = chainlinkFeed_;
+
+        emit DefaultFeedSet(assetType_, chainlinkFeed_, block.timestamp);
+    }
+
+    /**
+     * @notice Get price from Chainlink feed
+     */
+    function _getChainlinkPrice(address feed_) internal view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(feed_);
+
+        (
+            uint80 roundId,
+            int256 price,
+            ,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) = priceFeed.latestRoundData();
+
+        require(price > 0, "Invalid price from Chainlink");
+        require(answeredInRound >= roundId, "Stale Chainlink data");
+        require(block.timestamp - updatedAt <= maxPriceAge, "Price too old");
+
+        // Normalize to 18 decimals
+        uint8 decimals = priceFeed.decimals();
+        uint256 normalizedPrice = uint256(price);
+
+        if (decimals < 18) {
+            normalizedPrice = normalizedPrice * (10 ** (18 - decimals));
+        } else if (decimals > 18) {
+            normalizedPrice = normalizedPrice / (10 ** (decimals - 18));
+        }
+
+        return normalizedPrice;
+    }
+
+    /**
+     * @notice Bulk update prices from Chainlink
+     */
+    function bulkUpdateFromChainlink(uint256[] memory tokenIds_) external {
+        for (uint256 i = 0; i < tokenIds_.length; i++) {
+            AssetValuation storage valuation = assetValuations[tokenIds_[i]];
+
+            if (valuation.tokenId != 0 && valuation.chainlinkFeed != address(0)) {
+                try this.updatePriceFromChainlink(tokenIds_[i]) {
+                    // Success
+                } catch {
+                    // Skip on error
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Check and mark stale prices
+     */
+    function checkStaleness(uint256 tokenId_) external {
+        AssetValuation storage valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+
+        if (block.timestamp > valuation.lastUpdated + valuation.stalenessThreshold) {
+            valuation.stale = true;
+
+            emit StalenessDetected(
+                tokenId_,
+                valuation.lastUpdated,
+                valuation.stalenessThreshold,
+                block.timestamp
+            );
+        }
+    }
+
+    /**
+     * @notice Bulk check staleness
+     */
+    function bulkCheckStaleness() external {
+        for (uint256 i = 0; i < trackedAssets.length; i++) {
+            uint256 tokenId = trackedAssets[i];
+            AssetValuation storage valuation = assetValuations[tokenId];
+
+            if (block.timestamp > valuation.lastUpdated + valuation.stalenessThreshold) {
+                valuation.stale = true;
+
+                emit StalenessDetected(
+                    tokenId,
+                    valuation.lastUpdated,
+                    valuation.stalenessThreshold,
+                    block.timestamp
+                );
+            }
+        }
+    }
+
+    /**
+     * @notice Get current price
+     */
+    function getPrice(uint256 tokenId_) external view returns (uint256) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(!valuation.stale, "Price is stale");
+
+        return valuation.currentPrice;
+    }
+
+    /**
+     * @notice Get price with status
+     */
+    function getPriceWithStatus(uint256 tokenId_) external view returns (
+        uint256 price,
+        bool isStale,
+        uint256 lastUpdated,
+        PriceSource source
+    ) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+
+        return (
+            valuation.currentPrice,
+            valuation.stale,
+            valuation.lastUpdated,
+            valuation.priceSource
+        );
+    }
+
+    /**
+     * @notice Get latest Chainlink price directly
+     */
+    function getLatestChainlinkPrice(uint256 tokenId_) external view returns (uint256) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(valuation.chainlinkFeed != address(0), "No Chainlink feed");
+
+        return _getChainlinkPrice(valuation.chainlinkFeed);
+    }
+
+    /**
+     * @notice Get price change percentage
+     */
+    function getPriceChange(uint256 tokenId_) external view returns (int256) {
+        AssetValuation memory valuation = assetValuations[tokenId_];
+        require(valuation.tokenId != 0, "Asset not tracked");
+        require(valuation.previousPrice > 0, "No previous price");
+
+        int256 change = int256(valuation.currentPrice) - int256(valuation.previousPrice);
+        return (change * 10000) / int256(valuation.previousPrice); // in basis points
+    }
+
+    /**
+     * @notice Get price update history
+     */
+    function getPriceHistory(uint256 tokenId_) external view returns (PriceUpdate[] memory) {
+        return priceUpdates[tokenId_];
+    }
+
+    /**
+     * @notice Get all tracked assets
+     */
+    function getTrackedAssets() external view returns (uint256[] memory) {
+        return trackedAssets;
+    }
+
+    /**
+     * @notice Set max price age for Chainlink
+     */
+    function setMaxPriceAge(uint256 maxAge_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(maxAge_ > 0, "Invalid max age");
+        maxPriceAge = maxAge_;
+    }
+
+    /**
+     * @notice Set default staleness thresholds
+     */
+    function _setDefaultStaleness() internal {
+        defaultStalenessThreshold[AssetType.RealEstate] = 30 days;
+        defaultStalenessThreshold[AssetType.Minerals] = 7 days;
+        defaultStalenessThreshold[AssetType.OilAndEnergy] = 1 days;
+        defaultStalenessThreshold[AssetType.Gold] = 1 days;
+        defaultStalenessThreshold[AssetType.PhysicalAsset] = 14 days;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title BancafiKYC
+ * @notice Individual investor KYC (Know Your Customer) verification
+ * @dev Handles retail investor onboarding, verification, and tier management
+ */
+contract BancafiKYC is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant VERIFIER_ROLE = keccak256("VERIFIER_ROLE");
+
+    enum VerificationStatus {
+        Unverified,
+        Pending,
+        Verified,
+        Rejected,
+        Suspended,
+        Revoked
+    }
+
+    enum InvestorTier {
+        Basic,        // < $10K
+        Standard,     // $10K - $50K
+        Premium,      // $50K - $250K
+        Accredited    // > $250K (accredited investors)
+    }
+
+    enum RiskProfile {
+        Conservative,
+        Moderate,
+        Aggressive
+    }
+
+    struct Investor {
+        address investorAddress;
+        string fullName;
+        string email;
+        string countryCode;
+        VerificationStatus status;
+        InvestorTier tier;
+        RiskProfile riskProfile;
+        bool isAccredited;
+        uint256 investmentLimit;
+        uint256 totalInvested;
+        uint256 kycExpiryDate;
+        string kycDocumentHash; // IPFS hash
+        uint256 registeredAt;
+        uint256 lastUpdated;
+        address verifiedBy;
+    }
+
+    struct KYCDocument {
+        string documentType; // ID, Passport, Utility Bill, etc.
+        string documentHash; // IPFS hash
+        uint256 uploadedAt;
+        uint256 expiryDate;
+        bool isVerified;
+        address verifiedBy;
+    }
+
+    struct InvestmentRestriction {
+        uint256 minInvestment;
+        uint256 maxInvestment;
+        uint256 dailyLimit;
+        uint256 monthlyLimit;
+        bool canInvestInHighRisk;
+        bool canFractionalize;
+    }
+
+    // State variables
+    mapping(address => Investor) public investors;
+    mapping(address => mapping(string => KYCDocument)) public kycDocuments;
+    mapping(address => InvestmentRestriction) public restrictions;
+    mapping(InvestorTier => InvestmentRestriction) public tierRestrictions;
+    mapping(address => uint256) public dailyInvestment;
+    mapping(address => uint256) public monthlyInvestment;
+    mapping(address => uint256) public lastInvestmentDay;
+    mapping(address => uint256) public lastInvestmentMonth;
+
+    address[] public investorList;
+    uint256 public totalInvestors;
+    uint256 public verifiedInvestors;
+
+    // Events
+    event InvestorRegistered(
+        address indexed investor,
+        string fullName,
+        uint256 timestamp
+    );
+
+    event InvestorVerified(
+        address indexed investor,
+        VerificationStatus status,
+        address indexed verifier,
+        uint256 timestamp
+    );
+
+    event TierUpdated(
+        address indexed investor,
+        InvestorTier oldTier,
+        InvestorTier newTier,
+        uint256 timestamp
+    );
+
+    event KYCDocumentUploaded(
+        address indexed investor,
+        string documentType,
+        string documentHash,
+        uint256 timestamp
+    );
+
+    event InvestmentRecorded(
+        address indexed investor,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event InvestmentLimitUpdated(
+        address indexed investor,
+        uint256 oldLimit,
+        uint256 newLimit,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(VERIFIER_ROLE, msg.sender);
+
+        // Set default tier restrictions
+        _setTierRestrictions();
+    }
+
+    /**
+     * @notice Register a new investor
+     */
+    function registerInvestor(
+        string memory fullName_,
+        string memory email_,
+        string memory countryCode_,
+        RiskProfile riskProfile_
+    ) external whenNotPaused {
+        require(investors[msg.sender].investorAddress == address(0), "Already registered");
+        require(bytes(fullName_).length > 0, "Name required");
+        require(bytes(email_).length > 0, "Email required");
+
+        investors[msg.sender] = Investor({
+            investorAddress: msg.sender,
+            fullName: fullName_,
+            email: email_,
+            countryCode: countryCode_,
+            status: VerificationStatus.Pending,
+            tier: InvestorTier.Basic,
+            riskProfile: riskProfile_,
+            isAccredited: false,
+            investmentLimit: 0,
+            totalInvested: 0,
+            kycExpiryDate: block.timestamp + 365 days,
+            kycDocumentHash: "",
+            registeredAt: block.timestamp,
+            lastUpdated: block.timestamp,
+            verifiedBy: address(0)
+        });
+
+        investorList.push(msg.sender);
+        totalInvestors++;
+
+        // Set initial restrictions based on tier
+        restrictions[msg.sender] = tierRestrictions[InvestorTier.Basic];
+
+        emit InvestorRegistered(msg.sender, fullName_, block.timestamp);
+    }
+
+    /**
+     * @notice Upload KYC document
+     */
+    function uploadKYCDocument(
+        string memory documentType_,
+        string memory documentHash_,
+        uint256 expiryDate_
+    ) external whenNotPaused {
+        require(investors[msg.sender].investorAddress != address(0), "Not registered");
+
+        kycDocuments[msg.sender][documentType_] = KYCDocument({
+            documentType: documentType_,
+            documentHash: documentHash_,
+            uploadedAt: block.timestamp,
+            expiryDate: expiryDate_,
+            isVerified: false,
+            verifiedBy: address(0)
+        });
+
+        emit KYCDocumentUploaded(msg.sender, documentType_, documentHash_, block.timestamp);
+    }
+
+    /**
+     * @notice Verify KYC document
+     */
+    function verifyKYCDocument(
+        address investor_,
+        string memory documentType_
+    ) external onlyRole(VERIFIER_ROLE) {
+        KYCDocument storage doc = kycDocuments[investor_][documentType_];
+        require(bytes(doc.documentHash).length > 0, "Document not found");
+
+        doc.isVerified = true;
+        doc.verifiedBy = msg.sender;
+    }
+
+    /**
+     * @notice Verify investor
+     */
+    function verifyInvestor(
+        address investor_,
+        VerificationStatus status_,
+        InvestorTier tier_,
+        bool isAccredited_,
+        uint256 investmentLimit_
+    ) external onlyRole(VERIFIER_ROLE) {
+        Investor storage inv = investors[investor_];
+        require(inv.investorAddress != address(0), "Not registered");
+
+        VerificationStatus oldStatus = inv.status;
+        inv.status = status_;
+        inv.tier = tier_;
+        inv.isAccredited = isAccredited_;
+        inv.investmentLimit = investmentLimit_;
+        inv.verifiedBy = msg.sender;
+        inv.lastUpdated = block.timestamp;
+
+        if (status_ == VerificationStatus.Verified && oldStatus != VerificationStatus.Verified) {
+            verifiedInvestors++;
+        } else if (status_ != VerificationStatus.Verified && oldStatus == VerificationStatus.Verified) {
+            verifiedInvestors--;
+        }
+
+        // Update restrictions based on tier
+        restrictions[investor_] = tierRestrictions[tier_];
+        restrictions[investor_].maxInvestment = investmentLimit_;
+
+        emit InvestorVerified(investor_, status_, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Update investor tier
+     */
+    function updateTier(
+        address investor_,
+        InvestorTier newTier_
+    ) external onlyRole(VERIFIER_ROLE) {
+        Investor storage inv = investors[investor_];
+        require(inv.investorAddress != address(0), "Not registered");
+
+        InvestorTier oldTier = inv.tier;
+        inv.tier = newTier_;
+        inv.lastUpdated = block.timestamp;
+
+        // Update restrictions
+        restrictions[investor_] = tierRestrictions[newTier_];
+
+        emit TierUpdated(investor_, oldTier, newTier_, block.timestamp);
+    }
+
+    /**
+     * @notice Record investment
+     */
+    function recordInvestment(address investor_, uint256 amount_) external {
+        Investor storage inv = investors[investor_];
+        require(inv.status == VerificationStatus.Verified, "Not verified");
+
+        // Check and reset daily limit
+        uint256 currentDay = block.timestamp / 1 days;
+        if (lastInvestmentDay[investor_] < currentDay) {
+            dailyInvestment[investor_] = 0;
+            lastInvestmentDay[investor_] = currentDay;
+        }
+
+        // Check and reset monthly limit
+        uint256 currentMonth = block.timestamp / 30 days;
+        if (lastInvestmentMonth[investor_] < currentMonth) {
+            monthlyInvestment[investor_] = 0;
+            lastInvestmentMonth[investor_] = currentMonth;
+        }
+
+        InvestmentRestriction memory restrict = restrictions[investor_];
+
+        require(amount_ >= restrict.minInvestment, "Below min investment");
+        require(
+            inv.totalInvested + amount_ <= restrict.maxInvestment,
+            "Exceeds max investment"
+        );
+        require(
+            dailyInvestment[investor_] + amount_ <= restrict.dailyLimit,
+            "Exceeds daily limit"
+        );
+        require(
+            monthlyInvestment[investor_] + amount_ <= restrict.monthlyLimit,
+            "Exceeds monthly limit"
+        );
+
+        inv.totalInvested += amount_;
+        dailyInvestment[investor_] += amount_;
+        monthlyInvestment[investor_] += amount_;
+
+        // Auto tier upgrade based on total invested
+        if (inv.totalInvested >= 250000 ether && inv.tier < InvestorTier.Accredited && inv.isAccredited) {
+            inv.tier = InvestorTier.Accredited;
+            emit TierUpdated(investor_, inv.tier, InvestorTier.Accredited, block.timestamp);
+        } else if (inv.totalInvested >= 50000 ether && inv.tier < InvestorTier.Premium) {
+            inv.tier = InvestorTier.Premium;
+            emit TierUpdated(investor_, inv.tier, InvestorTier.Premium, block.timestamp);
+        } else if (inv.totalInvested >= 10000 ether && inv.tier < InvestorTier.Standard) {
+            inv.tier = InvestorTier.Standard;
+            emit TierUpdated(investor_, inv.tier, InvestorTier.Standard, block.timestamp);
+        }
+
+        emit InvestmentRecorded(investor_, amount_, block.timestamp);
+    }
+
+    /**
+     * @notice Check if investor is verified
+     */
+    function isVerifiedInvestor(address investor_) external view returns (bool) {
+        return investors[investor_].status == VerificationStatus.Verified;
+    }
+
+    /**
+     * @notice Get investor details
+     */
+    function getInvestor(address investor_) external view returns (Investor memory) {
+        return investors[investor_];
+    }
+
+    /**
+     * @notice Get investment restrictions
+     */
+    function getRestrictions(address investor_) external view returns (InvestmentRestriction memory) {
+        return restrictions[investor_];
+    }
+
+    /**
+     * @notice Set tier restrictions (internal)
+     */
+    function _setTierRestrictions() internal {
+        // Basic Tier (< $10K)
+        tierRestrictions[InvestorTier.Basic] = InvestmentRestriction({
+            minInvestment: 100 ether,
+            maxInvestment: 10000 ether,
+            dailyLimit: 1000 ether,
+            monthlyLimit: 5000 ether,
+            canInvestInHighRisk: false,
+            canFractionalize: true
+        });
+
+        // Standard Tier ($10K - $50K)
+        tierRestrictions[InvestorTier.Standard] = InvestmentRestriction({
+            minInvestment: 100 ether,
+            maxInvestment: 50000 ether,
+            dailyLimit: 5000 ether,
+            monthlyLimit: 25000 ether,
+            canInvestInHighRisk: false,
+            canFractionalize: true
+        });
+
+        // Premium Tier ($50K - $250K)
+        tierRestrictions[InvestorTier.Premium] = InvestmentRestriction({
+            minInvestment: 500 ether,
+            maxInvestment: 250000 ether,
+            dailyLimit: 25000 ether,
+            monthlyLimit: 125000 ether,
+            canInvestInHighRisk: true,
+            canFractionalize: true
+        });
+
+        // Accredited Tier (> $250K)
+        tierRestrictions[InvestorTier.Accredited] = InvestmentRestriction({
+            minInvestment: 1000 ether,
+            maxInvestment: type(uint256).max,
+            dailyLimit: 100000 ether,
+            monthlyLimit: 500000 ether,
+            canInvestInHighRisk: true,
+            canFractionalize: true
+        });
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

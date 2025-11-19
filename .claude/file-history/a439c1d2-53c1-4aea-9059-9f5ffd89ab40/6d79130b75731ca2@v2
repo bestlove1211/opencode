@@ -1,0 +1,574 @@
+# Security Analysis & Code Review Checklist
+
+## Overview
+
+This document provides a comprehensive security checklist for the Bancafi Credit platform. Use this during internal reviews and for preparing external audits.
+
+## Critical Security Areas
+
+### 1. Access Control
+
+#### Admin Functions
+- [ ] All admin functions protected by appropriate roles
+- [ ] Role granting/revoking properly restricted
+- [ ] DEFAULT_ADMIN_ROLE only held by multi-sig
+- [ ] Timelock implemented for critical operations
+- [ ] No functions callable by anyone that should be restricted
+
+#### Role Hierarchy
+```solidity
+// Check role assignments
+DEFAULT_ADMIN_ROLE
+├── ADMIN_ROLE
+├── MANAGER_ROLE
+├── COMPLIANCE_OFFICER_ROLE
+├── KYC_VERIFIER_ROLE
+├── SLASHING_ADMIN_ROLE
+└── LIQUIDATOR_ROLE
+```
+
+**Verification:**
+```bash
+# Check role assignments
+npx hardhat run scripts/audit/check-roles.ts
+```
+
+### 2. Reentrancy Protection
+
+#### All State-Changing Functions
+- [ ] `nonReentrant` modifier on all functions that:
+  - Transfer tokens (ERC20/ETH)
+  - Call external contracts
+  - Update balances
+  - Mint/burn tokens
+
+#### Check Pattern
+```solidity
+// ✅ Good
+function withdraw() external nonReentrant {
+    uint256 amount = balances[msg.sender];
+    balances[msg.sender] = 0;  // Update state first
+    payable(msg.sender).transfer(amount);  // External call last
+}
+
+// ❌ Bad
+function withdrawBad() external {
+    uint256 amount = balances[msg.sender];
+    payable(msg.sender).transfer(amount);  // External call first
+    balances[msg.sender] = 0;  // State update after
+}
+```
+
+**Test:**
+```typescript
+it('should prevent reentrancy attacks', async () => {
+    const attacker = await deployAttacker();
+    await expect(
+        attacker.reentrantAttack(lending.address)
+    ).to.be.revertedWith('ReentrancyGuard');
+});
+```
+
+### 3. Flash Loan Protection
+
+#### Flash Loan Guard
+- [ ] FlashLoanProtection library integrated
+- [ ] `flashLoanProtected` modifier on critical functions:
+  - `acceptBorrowRequest`
+  - `repayLoan`
+  - `liquidateCollateral`
+  - `drawCredit`
+  - `addCollateral`
+
+#### Protection Mechanisms
+1. **Rate Limiting**: Max actions per block per user
+2. **Same-Block Prevention**: Critical operations can't complete in same block
+3. **Bot Detection**: Suspicious activity tracking
+4. **Value Limits**: Maximum transaction sizes
+
+**Test:**
+```typescript
+it('should block flash loan attacks', async () => {
+    // Try to borrow and repay in same transaction
+    await expect(
+        flashLoanAttacker.attackLending()
+    ).to.be.revertedWith('Flash loan protection');
+});
+```
+
+### 4. Oracle Security
+
+#### Price Feed Validation
+- [ ] Chainlink feeds have heartbeat checks
+- [ ] Circuit breakers with min/max price bounds
+- [ ] Fallback mechanism for oracle failures
+- [ ] Staleness detection
+- [ ] Multiple price sources where possible
+
+#### Oracle Checklist
+```solidity
+// ✅ Validate price data
+function getLatestPrice(address asset) external view returns (uint256) {
+    // 1. Check Chainlink feed exists
+    require(feed.chainlinkAggregator != address(0), "No oracle");
+
+    // 2. Get latest price
+    (uint80 roundId, int256 price, , uint256 updatedAt, ) =
+        feed.chainlinkAggregator.latestRoundData();
+
+    // 3. Check staleness
+    require(block.timestamp - updatedAt < feed.heartbeat, "Stale price");
+
+    // 4. Check circuit breaker
+    require(price >= feed.minPrice && price <= feed.maxPrice, "Price out of bounds");
+
+    // 5. Check round completion
+    require(roundId > 0, "Round incomplete");
+
+    return uint256(price);
+}
+```
+
+**Test:**
+```typescript
+it('should reject stale prices', async () => {
+    await time.increase(7200); // 2 hours
+    await expect(
+        oracle.getLatestPrice(WETH)
+    ).to.be.revertedWith('Stale price');
+});
+```
+
+### 5. Integer Overflow/Underflow
+
+#### Solidity 0.8+ Protection
+- [ ] Using Solidity 0.8.25 (built-in overflow protection)
+- [ ] No `unchecked` blocks without validation
+- [ ] Safe math patterns for critical calculations
+
+#### Critical Calculations
+```solidity
+// Check these calculations:
+1. Interest calculation
+2. Collateral value calculation
+3. Liquidation threshold checks
+4. Fee calculations
+5. Token amount conversions
+```
+
+**Test:**
+```typescript
+it('should prevent overflow in interest calculation', async () => {
+    const maxUint256 = ethers.constants.MaxUint256;
+    await expect(
+        lending.calculateInterest(maxUint256, 10000)
+    ).to.be.reverted;
+});
+```
+
+### 6. Front-Running Protection
+
+#### Vulnerable Operations
+- [ ] Loan acceptance (slippage protection)
+- [ ] Liquidations (time-based ordering)
+- [ ] Debt purchases (price changes)
+- [ ] Collateral additions (value checks)
+
+#### Mitigation Strategies
+```solidity
+// Slippage protection
+function acceptBorrowRequest(uint256 requestId, uint256 maxInterestRate)
+    external
+{
+    require(request.interestRate <= maxInterestRate, "Rate too high");
+    // ...
+}
+
+// Deadline protection
+function buyDebt(uint256 listingId, uint256 deadline)
+    external
+    payable
+{
+    require(block.timestamp <= deadline, "Expired");
+    // ...
+}
+```
+
+### 7. Denial of Service
+
+#### Gas Limit Issues
+- [ ] No unbounded loops
+- [ ] Batch operations have size limits
+- [ ] Pagination for large datasets
+- [ ] Fails gracefully with large inputs
+
+#### Check These
+```solidity
+// ❌ Bad: Unbounded loop
+for (uint i = 0; i < users.length; i++) {
+    // Process all users
+}
+
+// ✅ Good: Bounded loop
+uint256 maxBatch = 100;
+require(users.length <= maxBatch, "Batch too large");
+for (uint i = 0; i < users.length; i++) {
+    // Process limited batch
+}
+```
+
+**Test:**
+```typescript
+it('should limit batch size', async () => {
+    const largeBatch = new Array(200).fill(user.address);
+    await expect(
+        compliance.batchVerify(largeBatch)
+    ).to.be.revertedWith('Batch too large');
+});
+```
+
+### 8. Token Handling
+
+#### ERC20 Operations
+- [ ] Using SafeERC20 for all token transfers
+- [ ] Checking return values
+- [ ] Handling tokens with transfer fees
+- [ ] Supporting different decimal places
+
+#### Safe Pattern
+```solidity
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+
+using SafeERC20Upgradeable for IERC20Upgradeable;
+
+// ✅ Good
+token.safeTransfer(recipient, amount);
+token.safeTransferFrom(sender, recipient, amount);
+
+// ❌ Bad
+token.transfer(recipient, amount);
+```
+
+**Test:**
+```typescript
+it('should handle tokens with transfer fees', async () => {
+    // Test with fee-on-transfer token
+    const received = await feeToken.balanceOf(recipient);
+    expect(received).to.be.lt(sentAmount);
+});
+```
+
+### 9. Upgrade Safety
+
+#### Storage Layout
+- [ ] No removed variables in upgrades
+- [ ] No type changes in upgrades
+- [ ] No reordering of variables
+- [ ] Storage gap properly used
+- [ ] Initialize functions protected
+
+#### Upgrade Checklist
+```solidity
+// ✅ Safe upgrade
+contract V1 {
+    uint256 public value1;
+    uint256 public value2;
+    uint256[50] private __gap;
+}
+
+contract V2 is V1 {
+    uint256 public value3;  // New variable
+    uint256[49] private __gap;  // Reduced gap
+}
+```
+
+**Validation:**
+```bash
+# Validate upgrade
+npx hardhat run scripts/validate-upgrade.ts
+```
+
+### 10. Economic Attacks
+
+#### Vulnerable Areas
+- [ ] Collateral manipulation
+- [ ] Oracle manipulation
+- [ ] Interest rate manipulation
+- [ ] Insurance pool drainage
+- [ ] Credit score gaming
+
+#### Checks
+```solidity
+// Maximum limits
+maxLoanAmount
+maxInterestRate
+maxCollateralValue
+maxWithdrawalPerBlock
+
+// Minimum requirements
+minCollateralRatio
+minLoanDuration
+minCreditScore
+```
+
+**Test:**
+```typescript
+describe('Economic Attack Vectors', () => {
+    it('should prevent credit score gaming', async () => {
+        // Try to increase score with small loans
+        for (let i = 0; i < 100; i++) {
+            await lending.createSmallLoan();
+        }
+        const score = await creditScore.getScore(user.address);
+        expect(score).to.be.lt(THRESHOLD);
+    });
+});
+```
+
+## Contract-Specific Checks
+
+### BancafiLending.sol
+
+- [ ] Loan creation validates all parameters
+- [ ] Collateral locked before loan activated
+- [ ] Repayment updates all state correctly
+- [ ] Liquidation only when health < threshold
+- [ ] Interest calculations are accurate
+- [ ] Platform fees are capped
+- [ ] Loan duration within bounds
+
+### CollateralManager.sol / MultiAssetCollateralManager.sol
+
+- [ ] Collateral lock atomically transfers tokens
+- [ ] Release only when loan repaid
+- [ ] Liquidation transfers to correct recipient
+- [ ] Health calculations use latest prices
+- [ ] Basket limits enforced (max 10 assets)
+- [ ] Asset allocation limits checked
+- [ ] Weighted calculations correct
+
+### CreditScore.sol
+
+- [ ] Score calculation is deterministic
+- [ ] Only authorized contracts can update
+- [ ] Score bounds (0-1000) enforced
+- [ ] Time-weighted calculations correct
+- [ ] Default penalties applied
+
+### BancafiCompliance.sol
+
+- [ ] KYC verification requires valid documents
+- [ ] Blacklist immediately blocks transactions
+- [ ] Slashing only for valid reasons
+- [ ] Sanctioned countries list maintained
+- [ ] Verification expiry enforced
+- [ ] Role-based access for all operations
+
+### BancafiInsurance.sol
+
+- [ ] Premium calculations fair
+- [ ] Claims validated properly
+- [ ] Pool solvency maintained
+- [ ] LP withdrawals respect lock periods
+- [ ] Coverage ratios enforced
+
+## Automated Security Tools
+
+### Static Analysis
+
+```bash
+# Slither
+slither contracts/ --exclude naming-convention
+
+# Mythril
+myth analyze contracts/BancafiLending.sol
+
+# Echidna (Fuzzing)
+echidna-test contracts/BancafiLending.sol --contract BancafiLending
+```
+
+### Coverage
+
+```bash
+# Generate coverage report
+npx hardhat coverage
+
+# Check coverage percentage
+# Target: >95% line coverage
+# Target: >90% branch coverage
+```
+
+### Gas Optimization
+
+```bash
+# Gas reporter
+REPORT_GAS=true npx hardhat test
+
+# Check for gas optimizations
+# - Use calldata instead of memory
+# - Pack storage variables
+# - Use uint256 over uint8
+# - Avoid repeated SLOAD
+```
+
+## External Audit Preparation
+
+### Documentation Required
+
+- [ ] Complete technical documentation
+- [ ] Architecture diagrams
+- [ ] Threat model
+- [ ] Known limitations
+- [ ] Deployment guide
+- [ ] Emergency procedures
+
+### Audit Scope
+
+Contracts in scope:
+1. BancafiLending.sol
+2. CollateralManager.sol
+3. MultiAssetCollateralManager.sol
+4. CreditScore.sol
+5. DebtCollection.sol
+6. BancafiPrivateCreditLine.sol
+7. BancafiBlockMarket.sol
+8. BancafiPortfolioManager.sol
+9. BancafiCompliance.sol
+10. BancafiInsurance.sol
+11. BancafiPriceOracle.sol
+12. BancafiWalletIntegration.sol
+13. InstitutionalOnboarding.sol
+
+Libraries:
+- FlashLoanProtection.sol
+- ComplianceIntegration.sol
+
+### Out of Scope
+
+- Frontend code
+- Off-chain systems
+- Third-party contracts (Chainlink, etc.)
+
+## Post-Deployment Monitoring
+
+### Real-Time Monitoring
+
+```javascript
+// Monitor critical events
+lending.on('LoanDefaulted', alertSecurityTeam);
+collateral.on('BasketLiquidated', logLiquidation);
+compliance.on('UserBlacklisted', notifyCompliance);
+insurance.on('ClaimPaid', trackClaims);
+
+// Check health metrics every block
+setInterval(async () => {
+    const totalLoans = await lending.totalActiveLoans();
+    const totalTVL = await getTVL();
+    const insuranceSolvency = await insurance.getSolvencyRatio();
+
+    if (insuranceSolvency < MIN_SOLVENCY) {
+        alert('Insurance pool underfunded');
+    }
+}, 12000);
+```
+
+### Daily Checks
+
+- [ ] Oracle price freshness
+- [ ] Pending liquidations
+- [ ] Insurance pool solvency
+- [ ] Unusual transaction patterns
+- [ ] Contract pause status
+- [ ] Role assignments
+
+### Weekly Checks
+
+- [ ] Review blacklist additions
+- [ ] Check slashing events
+- [ ] Analyze credit score distributions
+- [ ] Review large loans
+- [ ] Check gas costs
+- [ ] Review upgrade proposals
+
+## Emergency Response
+
+### Incident Response Plan
+
+1. **Detection** - Automated alerts or manual discovery
+2. **Assessment** - Determine severity and impact
+3. **Containment** - Pause contracts if needed
+4. **Communication** - Notify users and stakeholders
+5. **Resolution** - Deploy fixes or upgrades
+6. **Post-Mortem** - Document and learn
+
+### Emergency Contacts
+
+- Security Team: security@bancafi.com
+- Dev Team: dev@bancafi.com
+- Auditor: auditor@company.com
+- White Hat: Immunefi bounty program
+
+### Emergency Procedures
+
+```bash
+# Pause all contracts
+npx hardhat run scripts/emergency-pause.ts --network mainnet
+
+# Upgrade to fixed version
+export CONTRACT_NAME=BancafiLending
+export PROXY_ADDRESS=0x...
+npx hardhat run scripts/upgrade-contract.ts --network mainnet
+
+# Resume operations
+npx hardhat run scripts/unpause.ts --network mainnet
+```
+
+## Security Resources
+
+### Documentation
+- [Smart Contract Security Best Practices](https://consensys.github.io/smart-contract-best-practices/)
+- [OpenZeppelin Security](https://docs.openzeppelin.com/contracts/4.x/security)
+- [Solidity Security Considerations](https://docs.soliditylang.org/en/latest/security-considerations.html)
+
+### Tools
+- [Slither](https://github.com/crytic/slither)
+- [Mythril](https://github.com/ConsenSys/mythril)
+- [Echidna](https://github.com/crytic/echidna)
+- [Foundry](https://github.com/foundry-rs/foundry)
+
+### Bug Bounty Programs
+- [Immunefi](https://immunefi.com/)
+- [HackerOne](https://www.hackerone.com/)
+- [Code4rena](https://code4rena.com/)
+
+## Sign-Off
+
+### Internal Review
+
+- [ ] Lead Developer Review
+- [ ] Security Team Review
+- [ ] Architecture Review
+- [ ] Code Quality Check
+
+### External Review
+
+- [ ] Audit Firm 1 (Trail of Bits)
+- [ ] Audit Firm 2 (Quantstamp)
+- [ ] Audit Firm 3 (OpenZeppelin)
+- [ ] Community Review Period
+
+### Deployment Approval
+
+- [ ] All critical issues resolved
+- [ ] All high issues resolved
+- [ ] Medium issues assessed
+- [ ] Low issues documented
+- [ ] Gas optimization complete
+- [ ] Documentation complete
+- [ ] Emergency procedures tested
+
+---
+
+**Last Updated**: [Date]
+**Reviewed By**: [Name]
+**Status**: [In Progress / Complete]

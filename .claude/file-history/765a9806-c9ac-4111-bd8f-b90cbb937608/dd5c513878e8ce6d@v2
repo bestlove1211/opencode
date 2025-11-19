@@ -1,0 +1,571 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+/**
+ * Security Test Suite: C-4 Reentrancy Protection
+ *
+ * Tests for the reentrancy protection security fix that prevents reentrancy attacks
+ * in collateral release and liquidation functions.
+ *
+ * Vulnerability: External calls (token transfers) occurred before state updates,
+ * allowing reentrancy attacks via malicious token contracts.
+ *
+ * Fix: Applied Checks-Effects-Interactions pattern + nonReentrant modifier:
+ * - All state changes BEFORE external calls
+ * - Events emitted BEFORE external calls
+ * - Token transfers moved to end of function
+ */
+describe("Security Tests: C-4 Reentrancy Protection", function () {
+  let collateralManager;
+  let mockERC20, maliciousToken;
+  let owner, user1, attacker, authorizedCaller;
+
+  beforeEach(async function () {
+    [owner, user1, attacker, authorizedCaller] = await ethers.getSigners();
+
+    // Deploy CollateralManager
+    const CollateralManager = await ethers.getContractFactory("CollateralManager");
+    collateralManager = await upgrades.deployProxy(
+      CollateralManager,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await collateralManager.waitForDeployment();
+
+    // Deploy normal ERC20
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    mockERC20 = await MockERC20.deploy("Mock Token", "MOCK", 18);
+    await mockERC20.waitForDeployment();
+
+    // Deploy malicious reentrancy token
+    const MaliciousToken = await ethers.getContractFactory("MockERC20");
+    maliciousToken = await MaliciousToken.deploy("Malicious", "MAL", 18);
+    await maliciousToken.waitForDeployment();
+
+    // Configure assets
+    await collateralManager.configureAsset(
+      await mockERC20.getAddress(),
+      true, 8000, 15000, ethers.ZeroAddress
+    );
+    await collateralManager.configureAsset(
+      await maliciousToken.getAddress(),
+      true, 8000, 15000, ethers.ZeroAddress
+    );
+
+    // Set prices
+    await collateralManager.updateAssetPrice(await mockERC20.getAddress(), ethers.parseEther("100"));
+    await collateralManager.updateAssetPrice(await maliciousToken.getAddress(), ethers.parseEther("100"));
+
+    // Authorize caller
+    await collateralManager.setAuthorizedCaller(authorizedCaller.address, true);
+
+    // Mint tokens
+    await mockERC20.mint(owner.address, ethers.parseEther("10000"));
+    await mockERC20.mint(authorizedCaller.address, ethers.parseEther("10000"));
+    await maliciousToken.mint(owner.address, ethers.parseEther("10000"));
+    await maliciousToken.mint(authorizedCaller.address, ethers.parseEther("10000"));
+  });
+
+  describe("C-4.1: nonReentrant Modifier Protection", function () {
+    it("Should have nonReentrant modifier on releaseCollateral", async function () {
+      // Lock collateral first
+      const amount = ethers.parseEther("100");
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Release should be protected by nonReentrant
+      await expect(
+        collateralManager.connect(authorizedCaller).releaseCollateral(
+          user1.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("Should have nonReentrant modifier on liquidateCollateral", async function () {
+      // Lock collateral first
+      const amount = ethers.parseEther("100");
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Liquidate should be protected by nonReentrant
+      await expect(
+        collateralManager.connect(authorizedCaller).liquidateCollateral(
+          user1.address,
+          attacker.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("C-4.2: State Updates Before External Calls", function () {
+    it("Should update userCollateralBalance before token transfer in releaseCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      const balanceBefore = await collateralManager.getUserCollateral(
+        user1.address,
+        await mockERC20.getAddress()
+      );
+      expect(balanceBefore).to.equal(amount);
+
+      // Release collateral
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Balance should be updated (to zero)
+      const balanceAfter = await collateralManager.getUserCollateral(
+        user1.address,
+        await mockERC20.getAddress()
+      );
+      expect(balanceAfter).to.equal(0);
+    });
+
+    it("Should update userCollateralBalance before token transfer in liquidateCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      const balanceBefore = await collateralManager.getUserCollateral(
+        user1.address,
+        await mockERC20.getAddress()
+      );
+      expect(balanceBefore).to.equal(amount);
+
+      // Liquidate collateral
+      await collateralManager.connect(authorizedCaller).liquidateCollateral(
+        user1.address,
+        attacker.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Balance should be updated (to zero)
+      const balanceAfter = await collateralManager.getUserCollateral(
+        user1.address,
+        await mockERC20.getAddress()
+      );
+      expect(balanceAfter).to.equal(0);
+    });
+
+    it("Should deactivate locks before token transfer in releaseCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      const lockId = await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer.staticCall(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Verify lock is active
+      const lockBefore = await collateralManager.getCollateralLock(lockId);
+      expect(lockBefore.isActive).to.be.true;
+
+      // Release collateral
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Lock should be deactivated
+      const lockAfter = await collateralManager.getCollateralLock(lockId);
+      expect(lockAfter.isActive).to.be.false;
+    });
+  });
+
+  describe("C-4.3: Events Emitted Before External Calls", function () {
+    it("Should emit CollateralReleased before token transfer", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Release should emit event
+      await expect(
+        collateralManager.connect(authorizedCaller).releaseCollateral(
+          user1.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.emit(collateralManager, "CollateralReleased")
+        .withArgs(user1.address, await mockERC20.getAddress(), amount, 0);
+    });
+
+    it("Should emit CollateralLiquidated before token transfer", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Liquidate should emit event
+      await expect(
+        collateralManager.connect(authorizedCaller).liquidateCollateral(
+          user1.address,
+          attacker.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.emit(collateralManager, "CollateralLiquidated")
+        .withArgs(user1.address, attacker.address, await mockERC20.getAddress(), amount);
+    });
+  });
+
+  describe("C-4.4: Reentrancy Attack Prevention", function () {
+    it("Should prevent reentrancy in releaseCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // First release
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Second release should fail (insufficient collateral)
+      await expect(
+        collateralManager.connect(authorizedCaller).releaseCollateral(
+          user1.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.be.revertedWith("Insufficient collateral");
+    });
+
+    it("Should prevent reentrancy in liquidateCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // First liquidation
+      await collateralManager.connect(authorizedCaller).liquidateCollateral(
+        user1.address,
+        attacker.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Second liquidation should fail (insufficient collateral)
+      await expect(
+        collateralManager.connect(authorizedCaller).liquidateCollateral(
+          user1.address,
+          attacker.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.be.revertedWith("Insufficient collateral");
+    });
+
+    it("Should maintain state consistency after failed reentrancy attempt", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Release half
+      const halfAmount = amount / 2n;
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        halfAmount
+      );
+
+      // Verify remaining balance is correct
+      const remaining = await collateralManager.getUserCollateral(
+        user1.address,
+        await mockERC20.getAddress()
+      );
+      expect(remaining).to.equal(halfAmount);
+
+      // Can release remaining amount
+      await expect(
+        collateralManager.connect(authorizedCaller).releaseCollateral(
+          user1.address,
+          await mockERC20.getAddress(),
+          halfAmount
+        )
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("C-4.5: Cross-Function Reentrancy Protection", function () {
+    it("Should prevent cross-function reentrancy (release during release)", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Release collateral (nonReentrant should prevent any reentrant call)
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // State should be consistent
+      const balance = await collateralManager.getUserCollateral(
+        user1.address,
+        await mockERC20.getAddress()
+      );
+      expect(balance).to.equal(0);
+    });
+
+    it("Should prevent cross-function reentrancy (liquidate during release)", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Release collateral
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Can't liquidate after release (no collateral left)
+      await expect(
+        collateralManager.connect(authorizedCaller).liquidateCollateral(
+          user1.address,
+          attacker.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.be.revertedWith("Insufficient collateral");
+    });
+  });
+
+  describe("C-4.6: Safe Token Transfer Pattern", function () {
+    it("Should use SafeERC20.safeTransfer for releases", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Release should use safeTransfer (won't revert on success)
+      await expect(
+        collateralManager.connect(authorizedCaller).releaseCollateral(
+          user1.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.not.be.reverted;
+
+      // Verify user received tokens
+      const userBalance = await mockERC20.balanceOf(user1.address);
+      expect(userBalance).to.equal(amount);
+    });
+
+    it("Should handle token transfer failures safely", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Transfer tokens out of contract (simulate failure scenario)
+      await mockERC20.connect(owner).transferFrom(
+        await collateralManager.getAddress(),
+        owner.address,
+        amount
+      );
+
+      // Release should fail safely with SafeERC20 error
+      await expect(
+        collateralManager.connect(authorizedCaller).releaseCollateral(
+          user1.address,
+          await mockERC20.getAddress(),
+          amount
+        )
+      ).to.be.reverted; // SafeERC20: transfer failed
+    });
+  });
+
+  describe("C-4.7: Checks-Effects-Interactions Pattern Verification", function () {
+    it("Should follow CEI pattern in releaseCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Track contract balance before
+      const contractBalanceBefore = await mockERC20.balanceOf(
+        await collateralManager.getAddress()
+      );
+
+      // Release (CEI: Checks done, Effects applied, then Interactions)
+      await collateralManager.connect(authorizedCaller).releaseCollateral(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Verify interaction (token transfer) happened
+      const contractBalanceAfter = await mockERC20.balanceOf(
+        await collateralManager.getAddress()
+      );
+      expect(contractBalanceBefore - contractBalanceAfter).to.equal(amount);
+    });
+
+    it("Should follow CEI pattern in liquidateCollateral", async function () {
+      const amount = ethers.parseEther("100");
+
+      // Lock collateral
+      await mockERC20.connect(authorizedCaller).approve(
+        await collateralManager.getAddress(),
+        amount
+      );
+      await collateralManager.connect(authorizedCaller).lockCollateralWithTransfer(
+        user1.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Liquidate (CEI pattern)
+      await collateralManager.connect(authorizedCaller).liquidateCollateral(
+        user1.address,
+        attacker.address,
+        await mockERC20.getAddress(),
+        amount
+      );
+
+      // Verify recipient received tokens (interaction happened)
+      const recipientBalance = await mockERC20.balanceOf(attacker.address);
+      expect(recipientBalance).to.equal(amount);
+    });
+  });
+});

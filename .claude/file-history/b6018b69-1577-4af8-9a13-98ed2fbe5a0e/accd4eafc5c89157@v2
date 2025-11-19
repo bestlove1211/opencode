@@ -1,0 +1,281 @@
+# Bancafi Savings Account - Quick Start Guide
+
+Get up and running in 5 minutes!
+
+## Installation & Setup
+
+```bash
+# 1. Clone and install
+git clone <repo>
+cd bancafi-wallet
+npm install
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# 3. Compile contracts
+npx hardhat compile
+
+# 4. Run tests
+npx hardhat test
+```
+
+## Deploy to Testnet
+
+```bash
+# 1. Fund your wallet with testnet ETH
+# Get Sepolia ETH from: https://sepoliafaucet.com
+
+# 2. Deploy contract
+npx hardhat run scripts/deploy.js --network sepolia
+
+# 3. Save the contract address from output
+# SAVINGS_ACCOUNT_ADDRESS=0x...
+
+# 4. Verify on Etherscan
+npx hardhat verify --network sepolia <CONTRACT_ADDRESS>
+```
+
+## Add Supported Token
+
+```bash
+# Add USDC (or any ERC20 token)
+SAVINGS_ACCOUNT_ADDRESS=0x... \
+TOKEN_ADDRESS=0x... \
+npx hardhat run scripts/add-token.js --network sepolia
+```
+
+## Fund Contract for Interest
+
+```bash
+# Fund with tokens for interest payments
+SAVINGS_ACCOUNT_ADDRESS=0x... \
+TOKEN_ADDRESS=0x... \
+AMOUNT=100000 \
+npx hardhat run scripts/fund-contract.js --network sepolia
+```
+
+## Setup Backend API
+
+```bash
+cd backend
+
+# 1. Install dependencies
+npm install
+
+# 2. Setup database
+createdb bancafi_dev
+
+# 3. Configure environment
+cp .env.example .env
+# Add:
+# - DATABASE_URL
+# - SAVINGS_ACCOUNT_ADDRESS (from deployment)
+# - ETHEREUM_RPC_URL
+
+# 4. Start server
+npm run dev
+```
+
+## Test Your Deployment
+
+### Using Hardhat Console
+
+```bash
+npx hardhat console --network sepolia
+```
+
+```javascript
+// Get contract instance
+const Contract = await ethers.getContractFactory("BancafiSavingsAccount");
+const savings = Contract.attach("YOUR_CONTRACT_ADDRESS");
+
+// Check configuration
+const baseAPY = await savings.baseAPY();
+console.log("Base APY:", baseAPY.toString(), "bps"); // 450 = 4.5%
+
+const bonusAPY = await savings.bonusAPY();
+console.log("Bonus APY:", bonusAPY.toString(), "bps"); // 250 = 2.5%
+
+// Check if token is supported
+const isSupported = await savings.supportedTokens("TOKEN_ADDRESS");
+console.log("Token supported:", isSupported);
+```
+
+### Using Frontend (Web3)
+
+```javascript
+import { ethers } from 'ethers';
+
+// Connect to wallet
+const provider = new ethers.BrowserProvider(window.ethereum);
+const signer = await provider.getSigner();
+
+// Get contract
+const contractAddress = "YOUR_CONTRACT_ADDRESS";
+const contractABI = [...]; // Import from artifacts
+const savings = new ethers.Contract(contractAddress, contractABI, signer);
+
+// Deposit
+const tokenAddress = "0x..."; // USDC address
+const amount = ethers.parseUnits("100", 6); // 100 USDC (6 decimals)
+
+// 1. Approve
+const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
+await token.approve(contractAddress, amount);
+
+// 2. Deposit
+await savings.deposit(tokenAddress, amount);
+
+// Check balance
+const info = await savings.getAccountInfo(await signer.getAddress(), tokenAddress);
+console.log("Balance:", ethers.formatUnits(info.balance, 6));
+console.log("APY:", info.currentAPY.toString());
+```
+
+## API Endpoints
+
+### Check if Backend is Running
+
+```bash
+curl http://localhost:3000/health
+```
+
+### Get Account Info
+
+```bash
+curl http://localhost:3000/api/accounts/0xYourWalletAddress
+```
+
+### Get Global Stats
+
+```bash
+curl http://localhost:3000/api/stats/global
+```
+
+### Get Current APY
+
+```bash
+curl http://localhost:3000/api/stats/apy
+```
+
+## Common Commands
+
+### Smart Contract
+
+```bash
+# Compile
+npx hardhat compile
+
+# Test
+npx hardhat test
+
+# Test with gas report
+REPORT_GAS=true npx hardhat test
+
+# Coverage
+npx hardhat coverage
+
+# Deploy local
+npx hardhat node # Terminal 1
+npx hardhat run scripts/deploy.js --network localhost # Terminal 2
+
+# Deploy testnet
+npx hardhat run scripts/deploy.js --network sepolia
+
+# Deploy mainnet (use with caution!)
+npx hardhat run scripts/deploy.js --network ethereum
+
+# Verify contract
+npx hardhat verify --network sepolia <ADDRESS>
+```
+
+### Backend
+
+```bash
+# Development
+npm run dev
+
+# Production
+npm start
+
+# Run tests
+npm test
+
+# Database migrations (if using)
+npx sequelize-cli db:migrate
+```
+
+## Troubleshooting
+
+### "Token not supported" Error
+
+```bash
+# Make sure you added the token
+SAVINGS_ACCOUNT_ADDRESS=0x... \
+TOKEN_ADDRESS=0x... \
+npx hardhat run scripts/add-token.js --network sepolia
+```
+
+### "Insufficient allowance" Error
+
+```javascript
+// Need to approve first
+await token.approve(contractAddress, amount);
+// Then deposit
+await savings.deposit(tokenAddress, amount);
+```
+
+### "Amount below minimum" Error
+
+```javascript
+// Minimum is 10 tokens
+const amount = ethers.parseUnits("10", decimals); // At least 10
+```
+
+### High Gas Fees
+
+- Deploy on L2 (Polygon, Arbitrum, etc.)
+- Wait for lower gas times (weekends, late night)
+- Check gas prices: https://etherscan.io/gastracker
+
+### Backend Connection Issues
+
+```bash
+# Check PostgreSQL is running
+pg_isready
+
+# Check Redis (if using)
+redis-cli ping
+
+# Check RPC endpoint
+curl -X POST YOUR_RPC_URL \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+## Next Steps
+
+1. **Read the docs**: See `docs/TECHNICAL_DOCUMENTATION.md`
+2. **User guide**: See `docs/USER_GUIDE.md`
+3. **Build frontend**: Integrate with React/Vue/Next.js
+4. **Add monitoring**: Track contract events
+5. **Security audit**: Before mainnet deployment
+
+## Resources
+
+- **Hardhat Docs**: https://hardhat.org/docs
+- **OpenZeppelin**: https://docs.openzeppelin.com/
+- **ethers.js**: https://docs.ethers.org/v6/
+- **Solidity**: https://docs.soliditylang.org/
+
+## Support
+
+- Documentation: `docs/`
+- Issues: GitHub Issues
+- Email: support@bancafi.com
+
+---
+
+**Ready to deploy?** Follow the steps above and you'll be live in minutes!

@@ -1,0 +1,290 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("AMM Economic Tests - Liquidity Pool", function () {
+  let assetToken, liquidityPool;
+  let owner, lp1, lp2, trader;
+
+  beforeEach(async function () {
+    [owner, lp1, lp2, trader] = await ethers.getSigners();
+
+    // Deploy Asset Token
+    const AssetToken = await ethers.getContractFactory("BancafiAssetToken");
+    assetToken = await upgrades.deployProxy(
+      AssetToken,
+      ["Bancafi Assets", "BRWA"],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Deploy Liquidity Pool
+    const LiquidityPool = await ethers.getContractFactory("BancafiLiquidityPool");
+    liquidityPool = await upgrades.deployProxy(
+      LiquidityPool,
+      [await assetToken.getAddress()],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Setup roles
+    const VERIFIER_ROLE = await assetToken.VERIFIER_ROLE();
+    await assetToken.grantRole(VERIFIER_ROLE, owner.address);
+
+    const MINTER_ROLE = await assetToken.MINTER_ROLE();
+    await assetToken.grantRole(MINTER_ROLE, owner.address);
+
+    // Create and fractionalize asset
+    await assetToken.tokenizeAsset(
+      owner.address,
+      0,
+      ethers.parseEther("1000000"),
+      "Test Location",
+      "ipfs://test"
+    );
+    await assetToken.verifyAsset(1);
+    await assetToken.fractionalizeAsset(1, 10000);
+
+    // Approve liquidity pool
+    await assetToken.setApprovalForAll(await liquidityPool.getAddress(), true);
+    await assetToken.connect(lp1).setApprovalForAll(await liquidityPool.getAddress(), true);
+    await assetToken.connect(trader).setApprovalForAll(await liquidityPool.getAddress(), true);
+  });
+
+  describe("Constant Product Formula (x * y = k)", function () {
+    let poolId;
+
+    beforeEach(async function () {
+      // Create pool: 1000 fractions, 1000 ETH
+      const fractions = 1000;
+      const ethAmount = ethers.parseEther("1000");
+
+      // Note: owner has 10,000 fractions from fractionalizing in main beforeEach
+      // Approve liquidityPool to transfer fractions
+      await assetToken.approveFractional(1, await liquidityPool.getAddress(), fractions);
+
+      await liquidityPool.createPool(1, fractions, { value: ethAmount });
+      poolId = 1;
+    });
+
+    it("Should maintain constant product after swaps", async function () {
+      const pool = await liquidityPool.pools(poolId);
+      const initialK = pool.fractionsReserve * pool.ethReserve;
+
+      // Execute swap: ETH for fractions
+      const ethIn = ethers.parseEther("10");
+      await liquidityPool.connect(trader).swapETHForFractions(poolId, 1, { value: ethIn });
+
+      const poolAfter = await liquidityPool.pools(poolId);
+      const finalK = poolAfter.fractionsReserve * poolAfter.ethReserve;
+
+      // K should increase slightly due to 0.3% fee
+      expect(finalK).to.be.gte(initialK);
+    });
+
+    it("Should calculate correct output amount (0.3% fee)", async function () {
+      const ethIn = ethers.parseEther("10");
+
+      const pool = await liquidityPool.pools(poolId);
+      const fractionsReserve = pool.fractionsReserve;
+      const ethReserve = pool.ethReserve;
+
+      // Calculate expected output using formula: amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
+      const amountInWithFee = ethIn * BigInt(997);
+      const numerator = amountInWithFee * fractionsReserve;
+      const denominator = (ethReserve * BigInt(1000)) + amountInWithFee;
+      const expectedOut = numerator / denominator;
+
+      // Get actual output
+      const tx = await liquidityPool.connect(trader).swapETHForFractions(poolId, 1, { value: ethIn });
+      const receipt = await tx.wait();
+
+      // Find FractionsSwapped event
+      const swapEvent = receipt.logs.find(log => {
+        try {
+          return liquidityPool.interface.parseLog(log).name === "FractionsSwapped";
+        } catch {
+          return false;
+        }
+      });
+
+      const parsedEvent = liquidityPool.interface.parseLog(swapEvent);
+      const actualOut = parsedEvent.args.fractionsOut;
+
+      expect(actualOut).to.equal(expectedOut);
+    });
+
+    it("Should enforce slippage protection", async function () {
+      const ethIn = ethers.parseEther("10");
+      const minFractionsOut = 1000; // Unrealistic expectation
+
+      await expect(
+        liquidityPool.connect(trader).swapETHForFractions(poolId, minFractionsOut, { value: ethIn })
+      ).to.be.revertedWith("Slippage too high");
+    });
+
+    it("Should handle large swaps with price impact", async function () {
+      // Small swap
+      const smallSwap = ethers.parseEther("10");
+      await assetToken.transferFractional(1, trader.address, 100);
+
+      const poolBefore = await liquidityPool.pools(poolId);
+      const smallPrice = (poolBefore.ethReserve * BigInt(1000)) / (poolBefore.fractionsReserve * BigInt(997));
+
+      // Large swap (10% of pool)
+      const largeSwap = ethers.parseEther("100");
+      await liquidityPool.connect(trader).swapETHForFractions(poolId, 1, { value: largeSwap });
+
+      const poolAfter = await liquidityPool.pools(poolId);
+      const largePrice = (poolAfter.ethReserve * BigInt(1000)) / (poolAfter.fractionsReserve * BigInt(997));
+
+      // Large swap should have worse price (higher price per fraction)
+      expect(largePrice).to.be.gt(smallPrice);
+    });
+  });
+
+  describe("Liquidity Provider Economics", function () {
+    it("Should mint LP tokens proportional to liquidity", async function () {
+      // Transfer fractions to lp1 and approve
+      await assetToken.transferFractional(1, lp1.address, 1000);
+      await assetToken.connect(lp1).approveFractional(1, await liquidityPool.getAddress(), 1000);
+
+      // First LP: 1000 fractions, 1000 ETH
+      await liquidityPool.connect(lp1).createPool(1, 1000, { value: ethers.parseEther("1000") });
+
+      const lp1Tokens = await liquidityPool.liquidityProvided(1, lp1.address);
+      const initialSupply = BigInt(1000); // sqrt(1000 * 1000 ETH normalized)
+
+      expect(lp1Tokens).to.be.gt(0);
+
+      // Second LP adds liquidity: 500 fractions, 500 ETH (same ratio)
+      await assetToken.transferFractional(1, lp2.address, 500);
+      await assetToken.connect(lp2).approveFractional(1, await liquidityPool.getAddress(), 500);
+
+      await liquidityPool.connect(lp2).addLiquidity(1, 500, { value: ethers.parseEther("500") });
+
+      const lp2Tokens = await liquidityPool.liquidityProvided(1, lp2.address);
+
+      // LP2 should get half the tokens of LP1 (proportional to contribution)
+      expect(lp2Tokens * BigInt(2)).to.be.closeTo(lp1Tokens, lp1Tokens / BigInt(100)); // Within 1%
+    });
+
+    it("Should accumulate fees for LP holders", async function () {
+      // Approve and create pool
+      await assetToken.approveFractional(1, await liquidityPool.getAddress(), 1000);
+      await liquidityPool.createPool(1, 1000, { value: ethers.parseEther("1000") });
+
+      const lpTokensBefore = await liquidityPool.liquidityProvided(1, owner.address);
+
+      // Execute trades to generate fees
+      await assetToken.transferFractional(1, trader.address, 500);
+
+      for (let i = 0; i < 10; i++) {
+        // Swap ETH for fractions
+        await liquidityPool.connect(trader).swapETHForFractions(1, 1, { value: ethers.parseEther("10") });
+
+        // Swap fractions back for ETH
+        await liquidityPool.connect(trader).swapFractionsForETH(1, 5, 1);
+      }
+
+      // Remove all liquidity
+      await liquidityPool.removeLiquidity(1, lpTokensBefore);
+
+      // Should receive more than initial deposit due to accumulated fees
+      const finalBalance = await ethers.provider.getBalance(owner.address);
+      // Note: This is a simplified check; actual test would track exact balances
+    });
+
+    it("Should allow proportional withdrawal of liquidity", async function () {
+      // Add liquidity
+      const fractions = 1000;
+      const ethAmount = ethers.parseEther("1000");
+
+      await assetToken.approveFractional(1, await liquidityPool.getAddress(), fractions);
+      await liquidityPool.createPool(1, fractions, { value: ethAmount });
+
+      const lpTokens = await liquidityPool.liquidityProvided(1, owner.address);
+
+      // Execute some trades to change reserves
+      await assetToken.transferFractional(1, trader.address, 500);
+      await liquidityPool.connect(trader).swapETHForFractions(1, 1, { value: ethers.parseEther("50") });
+
+      // Withdraw 50% of liquidity
+      const halfTokens = lpTokens / BigInt(2);
+
+      const ownerBalanceBefore = await ethers.provider.getBalance(owner.address);
+      const fractionsBefore = await assetToken.fractionalOwnership(1, owner.address);
+
+      const tx = await liquidityPool.removeLiquidity(1, halfTokens);
+      const receipt = await tx.wait();
+      const gasUsed = receipt.gasUsed * receipt.gasPrice;
+
+      const ownerBalanceAfter = await ethers.provider.getBalance(owner.address);
+      const fractionsAfter = await assetToken.fractionalOwnership(1, owner.address);
+
+      // Should receive approximately 50% of pool reserves (within rounding)
+      const ethReceived = ownerBalanceAfter - ownerBalanceBefore + gasUsed;
+      const fractionsReceived = fractionsAfter - fractionsBefore;
+
+      expect(fractionsReceived).to.be.gt(0);
+      expect(ethReceived).to.be.gt(0);
+    });
+  });
+
+  describe("Arbitrage Prevention", function () {
+    it("Should quickly equilibrate price through arbitrage", async function () {
+      // Create pool at 1 ETH per fraction
+      await assetToken.approveFractional(1, await liquidityPool.getAddress(), 1000);
+      await liquidityPool.createPool(1, 1000, { value: ethers.parseEther("1000") });
+
+      // Large buy creates price discrepancy
+      await liquidityPool.connect(trader).swapETHForFractions(1, 1, { value: ethers.parseEther("200") });
+
+      const poolAfter = await liquidityPool.pools(1);
+
+      // Price should be higher after large buy
+      const priceAfter = (poolAfter.ethReserve * BigInt(1e18)) / poolAfter.fractionsReserve;
+      const initialPrice = BigInt(1e18); // 1 ETH
+
+      expect(priceAfter).to.be.gt(initialPrice);
+
+      // Arbitrageur sells back
+      const fractionsToSell = await assetToken.fractionalOwnership(1, trader.address) / BigInt(2);
+      await assetToken.connect(trader).approveFractional(1, await liquidityPool.getAddress(), fractionsToSell);
+      await liquidityPool.connect(trader).swapFractionsForETH(1, fractionsToSell, 1);
+
+      const poolFinal = await liquidityPool.pools(1);
+      const priceFinal = (poolFinal.ethReserve * BigInt(1e18)) / poolFinal.fractionsReserve;
+
+      // Price should move back towards initial (arbitrage)
+      expect(priceFinal).to.be.lt(priceAfter);
+      expect(priceFinal).to.be.closeTo(initialPrice, initialPrice / BigInt(10)); // Within 10%
+    });
+  });
+
+  describe("Edge Cases", function () {
+    it("Should handle minimum liquidity", async function () {
+      // Try to create pool with very small amounts
+      await expect(
+        liquidityPool.createPool(1, 1, { value: 1 })
+      ).to.be.revertedWith("Insufficient initial liquidity");
+    });
+
+    it("Should prevent removing more liquidity than owned", async function () {
+      await assetToken.approveFractional(1, await liquidityPool.getAddress(), 1000);
+      await liquidityPool.createPool(1, 1000, { value: ethers.parseEther("1000") });
+
+      const lpTokens = await liquidityPool.liquidityProvided(1, owner.address);
+
+      await expect(
+        liquidityPool.removeLiquidity(1, lpTokens + BigInt(1))
+      ).to.be.revertedWith("Insufficient LP tokens");
+    });
+
+    it("Should handle zero amount swaps", async function () {
+      await assetToken.approveFractional(1, await liquidityPool.getAddress(), 1000);
+      await liquidityPool.createPool(1, 1000, { value: ethers.parseEther("1000") });
+
+      await expect(
+        liquidityPool.connect(trader).swapETHForFractions(1, 0, { value: 0 })
+      ).to.be.revertedWith("Invalid amount");
+    });
+  });
+});

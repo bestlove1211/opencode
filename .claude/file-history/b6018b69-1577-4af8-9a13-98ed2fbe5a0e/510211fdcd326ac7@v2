@@ -1,0 +1,26 @@
+const { Sequelize } = require('sequelize');
+const config = require('../config/database');
+
+const env = process.env.NODE_ENV || 'development';
+const dbConfig = config[env];
+
+const sequelize = new Sequelize(dbConfig.url, dbConfig);
+
+// Import models
+const User = require('./User')(sequelize);
+const Account = require('./Account')(sequelize);
+const Transaction = require('./Transaction')(sequelize);
+
+// Define relationships
+User.hasMany(Account, { foreignKey: 'userId', as: 'accounts' });
+Account.belongsTo(User, { foreignKey: 'userId' });
+
+Account.hasMany(Transaction, { foreignKey: 'accountId', as: 'transactions' });
+Transaction.belongsTo(Account, { foreignKey: 'accountId' });
+
+module.exports = {
+  sequelize,
+  User,
+  Account,
+  Transaction
+};

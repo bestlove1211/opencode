@@ -1,0 +1,253 @@
+import { expect, ethers } from "./helpers/setup.js";
+import { deployFullSystem } from "./helpers/setup.js";
+
+describe("ReputationManager", function () {
+    let system, reputationManager, admin, operator, user1, user2;
+
+    beforeEach(async function () {
+        system = await deployFullSystem();
+        ({ reputationManager, admin, operator, user1, user2 } = system);
+    });
+
+    describe("Initialization", function () {
+        it("Should set default reputation score", async function () {
+            const DEFAULT_SCORE = 500;
+            expect(await reputationManager.DEFAULT_REPUTATION_SCORE()).to.equal(DEFAULT_SCORE);
+        });
+
+        it("Should set min and max scores", async function () {
+            expect(await reputationManager.MIN_REPUTATION_SCORE()).to.equal(300);
+            expect(await reputationManager.MAX_REPUTATION_SCORE()).to.equal(850);
+        });
+
+        it("Should grant admin role", async function () {
+            const ADMIN_ROLE = await reputationManager.ADMIN_ROLE();
+            expect(await reputationManager.hasRole(ADMIN_ROLE, admin.address)).to.be.true;
+        });
+    });
+
+    describe("Reputation Initialization", function () {
+        it("Should initialize reputation for new user", async function () {
+            await reputationManager.initializeReputation(user1.address);
+
+            const score = await reputationManager.getReputationScore(user1.address);
+            expect(score).to.equal(500);
+        });
+
+        it("Should emit event on initialization", async function () {
+            await expect(reputationManager.initializeReputation(user1.address))
+                .to.emit(reputationManager, "ReputationScoreUpdated")
+                .withArgs(user1.address, 0, 500);
+        });
+
+        it("Should not reinitialize existing reputation", async function () {
+            await reputationManager.initializeReputation(user1.address);
+
+            await expect(
+                reputationManager.initializeReputation(user1.address)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("On-Time Payments", function () {
+        beforeEach(async function () {
+            await reputationManager.initializeReputation(user1.address);
+        });
+
+        it("Should increase score for on-time payment", async function () {
+            const scoreBefore = await reputationManager.getReputationScore(user1.address);
+
+            await reputationManager.connect(operator).recordOnTimePayment(user1.address, 1);
+
+            const scoreAfter = await reputationManager.getReputationScore(user1.address);
+            expect(scoreAfter).to.be.gt(scoreBefore);
+        });
+
+        it("Should track on-time payment count", async function () {
+            await reputationManager.connect(operator).recordOnTimePayment(user1.address, 1);
+            await reputationManager.connect(operator).recordOnTimePayment(user1.address, 2);
+
+            const data = await reputationManager.getReputationData(user1.address);
+            expect(data.onTimePayments).to.equal(2);
+        });
+
+        it("Should cap score at maximum", async function () {
+            // Record many on-time payments
+            for (let i = 0; i < 50; i++) {
+                await reputationManager.connect(operator).recordOnTimePayment(user1.address, i);
+            }
+
+            const score = await reputationManager.getReputationScore(user1.address);
+            expect(score).to.be.lte(850); // MAX_SCORE
+        });
+
+        it("Should emit score updated event", async function () {
+            await expect(
+                reputationManager.connect(operator).recordOnTimePayment(user1.address, 1)
+            ).to.emit(reputationManager, "ReputationScoreUpdated");
+        });
+    });
+
+    describe("Late Payments", function () {
+        beforeEach(async function () {
+            await reputationManager.initializeReputation(user1.address);
+        });
+
+        it("Should decrease score for late payment", async function () {
+            const scoreBefore = await reputationManager.getReputationScore(user1.address);
+
+            await reputationManager.connect(operator).recordLatePayment(user1.address, 1, 5);
+
+            const scoreAfter = await reputationManager.getReputationScore(user1.address);
+            expect(scoreAfter).to.be.lt(scoreBefore);
+        });
+
+        it("Should increase penalty with days late", async function () {
+            await reputationManager.connect(operator).recordLatePayment(user1.address, 1, 1);
+            const score1 = await reputationManager.getReputationScore(user1.address);
+
+            await reputationManager.initializeReputation(user2.address);
+            await reputationManager.connect(operator).recordLatePayment(user2.address, 2, 30);
+            const score2 = await reputationManager.getReputationScore(user2.address);
+
+            // More days late should result in lower score
+            expect(score2).to.be.lt(score1);
+        });
+
+        it("Should track late payment count", async function () {
+            await reputationManager.connect(operator).recordLatePayment(user1.address, 1, 5);
+
+            const data = await reputationManager.getReputationData(user1.address);
+            expect(data.latePayments).to.equal(1);
+        });
+
+        it("Should not go below minimum score", async function () {
+            // Record many late payments
+            for (let i = 0; i < 50; i++) {
+                await reputationManager.connect(operator).recordLatePayment(user1.address, i, 30);
+            }
+
+            const score = await reputationManager.getReputationScore(user1.address);
+            expect(score).to.be.gte(300); // MIN_SCORE
+        });
+    });
+
+    describe("Defaults", function () {
+        beforeEach(async function () {
+            await reputationManager.initializeReputation(user1.address);
+        });
+
+        it("Should record default", async function () {
+            await reputationManager.connect(operator).recordDefault(user1.address, 1);
+
+            const data = await reputationManager.getReputationData(user1.address);
+            expect(data.defaults).to.equal(1);
+        });
+
+        it("Should severely penalize score on default", async function () {
+            const scoreBefore = await reputationManager.getReputationScore(user1.address);
+
+            await reputationManager.connect(operator).recordDefault(user1.address, 1);
+
+            const scoreAfter = await reputationManager.getReputationScore(user1.address);
+            const penalty = scoreBefore - scoreAfter;
+
+            expect(penalty).to.be.gt(100); // Significant penalty
+        });
+
+        it("Should track multiple defaults", async function () {
+            await reputationManager.connect(operator).recordDefault(user1.address, 1);
+            await reputationManager.connect(operator).recordDefault(user1.address, 2);
+
+            const data = await reputationManager.getReputationData(user1.address);
+            expect(data.defaults).to.equal(2);
+        });
+    });
+
+    describe("Reputation Queries", function () {
+        beforeEach(async function () {
+            await reputationManager.initializeReputation(user1.address);
+        });
+
+        it("Should get reputation score", async function () {
+            const score = await reputationManager.getReputationScore(user1.address);
+            expect(score).to.equal(500);
+        });
+
+        it("Should get full reputation data", async function () {
+            await reputationManager.connect(operator).recordOnTimePayment(user1.address, 1);
+
+            const data = await reputationManager.getReputationData(user1.address);
+
+            expect(data.score).to.be.gt(500);
+            expect(data.onTimePayments).to.equal(1);
+            expect(data.totalDebts).to.equal(1);
+        });
+
+        it("Should return zero for uninitialized user", async function () {
+            const score = await reputationManager.getReputationScore(user2.address);
+            expect(score).to.equal(0);
+        });
+
+        it("Should check if reputation exists", async function () {
+            expect(await reputationManager.hasReputation(user1.address)).to.be.true;
+            expect(await reputationManager.hasReputation(user2.address)).to.be.false;
+        });
+    });
+
+    describe("Configuration", function () {
+        it("Should update on-time payment weight", async function () {
+            await reputationManager.setOnTimePaymentWeight(15);
+            expect(await reputationManager.onTimePaymentWeight()).to.equal(15);
+        });
+
+        it("Should update late payment penalty", async function () {
+            await reputationManager.setLatePaymentPenalty(30);
+            expect(await reputationManager.latePaymentPenalty()).to.equal(30);
+        });
+
+        it("Should update default penalty", async function () {
+            await reputationManager.setDefaultPenalty(150);
+            expect(await reputationManager.defaultPenalty()).to.equal(150);
+        });
+
+        it("Should not allow non-admin to change config", async function () {
+            await expect(
+                reputationManager.connect(user1).setOnTimePaymentWeight(15)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Access Control", function () {
+        it("Should only allow operator to record payments", async function () {
+            await reputationManager.initializeReputation(user1.address);
+
+            await expect(
+                reputationManager.connect(user1).recordOnTimePayment(user2.address, 1)
+            ).to.be.reverted;
+        });
+
+        it("Should grant operator role", async function () {
+            const OPERATOR_ROLE = await reputationManager.OPERATOR_ROLE();
+            await reputationManager.grantRole(OPERATOR_ROLE, user1.address);
+
+            expect(await reputationManager.hasRole(OPERATOR_ROLE, user1.address)).to.be.true;
+        });
+    });
+
+    describe("Pausable", function () {
+        it("Should pause contract", async function () {
+            await reputationManager.pause();
+            expect(await reputationManager.paused()).to.be.true;
+        });
+
+        it("Should prevent operations when paused", async function () {
+            await reputationManager.initializeReputation(user1.address);
+            await reputationManager.pause();
+
+            await expect(
+                reputationManager.connect(operator).recordOnTimePayment(user1.address, 1)
+            ).to.be.reverted;
+        });
+    });
+});

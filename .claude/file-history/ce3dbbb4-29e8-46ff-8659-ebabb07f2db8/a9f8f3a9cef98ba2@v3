@@ -1,0 +1,954 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/utils/ERC721HolderUpgradeable.sol";
+
+import "./libraries/DataTypes.sol";
+import "./libraries/Errors.sol";
+import "./libraries/Events.sol";
+import "./interfaces/IComplianceManager.sol";
+
+/**
+ * @title DebtMarketplace
+ * @notice Upgradeable marketplace for trading debt tokens with comprehensive UI-optimized features
+ * @dev Supports fixed-price listings, auctions, offers, and batch trading
+ */
+contract DebtMarketplace is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable,
+    ERC721HolderUpgradeable
+{
+    // ============ Roles ============
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    // ============ State Variables ============
+    uint256 private _listingIdCounter;
+    uint256 private _auctionIdCounter;
+    uint256 private _offerIdCounter;
+
+    // Listings
+    mapping(uint256 => DataTypes.Listing) private _listings;
+    mapping(uint256 => uint256) private _tokenIdToListingId; // tokenId => listingId
+    uint256[] private _activeListingIds;
+
+    // Auctions
+    mapping(uint256 => DataTypes.Auction) private _auctions;
+    mapping(uint256 => uint256) private _tokenIdToAuctionId; // tokenId => auctionId
+    uint256[] private _activeAuctionIds;
+
+    // Offers
+    mapping(uint256 => DataTypes.Offer) private _offers;
+    mapping(uint256 => uint256[]) private _tokenIdToOfferIds; // tokenId => offerIds[]
+    mapping(address => uint256[]) private _userOffers; // user => offerIds[]
+
+    // Trading stats
+    DataTypes.TradeStats private _tradeStats;
+
+    // Blacklist
+    mapping(address => bool) private _blacklisted;
+    mapping(address => string) private _blacklistReasons;
+
+    // Contracts
+    address public debtToken;
+    address public complianceManager;
+    address public treasury;
+
+    // Fee structure (in basis points)
+    uint256 public tradingFee; // Platform fee
+    uint256 public constant MAX_FEE = 1000; // 10% max fee
+
+    // Minimum listing duration
+    uint256 public minListingDuration;
+    uint256 public maxListingDuration;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the contract
+     * @param admin_ Admin address
+     * @param debtToken_ DebtToken contract address
+     * @param complianceManager_ ComplianceManager contract address
+     * @param treasury_ Treasury address
+     */
+    function initialize(
+        address admin_,
+        address debtToken_,
+        address complianceManager_,
+        address treasury_
+    ) public initializer {
+        if (admin_ == address(0) || debtToken_ == address(0) ||
+            complianceManager_ == address(0) || treasury_ == address(0)) {
+            revert Errors.ZeroAddress();
+        }
+
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+        __ERC721Holder_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(ADMIN_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, admin_);
+
+        debtToken = debtToken_;
+        complianceManager = complianceManager_;
+        treasury = treasury_;
+
+        _listingIdCounter = 1;
+        _auctionIdCounter = 1;
+        _offerIdCounter = 1;
+
+        tradingFee = 250; // 2.5% default
+        minListingDuration = 1 days;
+        maxListingDuration = 365 days;
+    }
+
+    // ============ Listing Functions ============
+
+    /**
+     * @notice Create a fixed-price listing
+     * @param tokenId Token ID to list
+     * @param price Listing price
+     * @param duration Listing duration in seconds
+     * @param allowOffers Whether to allow offers
+     * @return listingId Created listing ID
+     */
+    function createListing(
+        uint256 tokenId,
+        uint256 price,
+        uint256 duration,
+        bool allowOffers
+    ) external whenNotPaused nonReentrant returns (uint256 listingId) {
+        _checkCompliance(msg.sender, DataTypes.KYCLevel.IDENTITY);
+        _checkNotBlacklisted(msg.sender);
+
+        if (price == 0) revert Errors.InvalidListingPrice();
+        if (duration < minListingDuration || duration > maxListingDuration) {
+            revert Errors.InvalidParameter();
+        }
+
+        // Transfer token to marketplace
+        IERC721Upgradeable(debtToken).safeTransferFrom(msg.sender, address(this), tokenId);
+
+        listingId = _listingIdCounter++;
+
+        DataTypes.Listing memory listing = DataTypes.Listing({
+            listingId: listingId,
+            tokenId: tokenId,
+            seller: msg.sender,
+            price: price,
+            minOffer: allowOffers ? (price * 80) / 100 : 0, // 80% of price as min offer
+            listingType: DataTypes.ListingType.FIXED_PRICE,
+            status: DataTypes.ListingStatus.ACTIVE,
+            createdAt: block.timestamp,
+            expiresAt: block.timestamp + duration,
+            allowOffers: allowOffers
+        });
+
+        _listings[listingId] = listing;
+        _tokenIdToListingId[tokenId] = listingId;
+        _activeListingIds.push(listingId);
+
+        _tradeStats.activeListings++;
+
+        emit Events.ListingCreated(
+            listingId,
+            tokenId,
+            msg.sender,
+            price,
+            DataTypes.ListingType.FIXED_PRICE,
+            listing.expiresAt
+        );
+    }
+
+    /**
+     * @notice Update listing price
+     * @param listingId Listing ID
+     * @param newPrice New price
+     */
+    function updateListingPrice(
+        uint256 listingId,
+        uint256 newPrice
+    ) external whenNotPaused {
+        DataTypes.Listing storage listing = _listings[listingId];
+
+        if (listing.seller != msg.sender) revert Errors.NotListingSeller();
+        if (listing.status != DataTypes.ListingStatus.ACTIVE) revert Errors.ListingNotActive();
+        if (newPrice == 0) revert Errors.InvalidListingPrice();
+
+        uint256 oldPrice = listing.price;
+        listing.price = newPrice;
+
+        if (listing.allowOffers) {
+            listing.minOffer = (newPrice * 80) / 100;
+        }
+
+        emit Events.ListingUpdated(listingId, oldPrice, newPrice);
+    }
+
+    /**
+     * @notice Cancel a listing
+     * @param listingId Listing ID
+     */
+    function cancelListing(uint256 listingId) external nonReentrant {
+        DataTypes.Listing storage listing = _listings[listingId];
+
+        if (listing.seller != msg.sender) revert Errors.NotListingSeller();
+        if (listing.status != DataTypes.ListingStatus.ACTIVE) revert Errors.ListingNotActive();
+
+        listing.status = DataTypes.ListingStatus.CANCELLED;
+        _tradeStats.activeListings--;
+
+        // Return token to seller
+        IERC721Upgradeable(debtToken).safeTransferFrom(
+            address(this),
+            msg.sender,
+            listing.tokenId
+        );
+
+        _removeFromActiveListings(listingId);
+
+        emit Events.ListingCancelled(listingId, msg.sender);
+    }
+
+    /**
+     * @notice Buy a listed token
+     * @param listingId Listing ID
+     */
+    function buyListing(uint256 listingId)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
+        _checkCompliance(msg.sender, DataTypes.KYCLevel.IDENTITY);
+        _checkNotBlacklisted(msg.sender);
+
+        DataTypes.Listing storage listing = _listings[listingId];
+
+        if (listing.status != DataTypes.ListingStatus.ACTIVE) revert Errors.ListingNotActive();
+        if (block.timestamp > listing.expiresAt) revert Errors.ListingExpired();
+        if (msg.sender == listing.seller) revert Errors.CannotBuyOwnListing();
+        if (msg.value < listing.price) revert Errors.InsufficientPayment();
+
+        _executeTrade(listingId, msg.sender, listing.price);
+    }
+
+    /**
+     * @notice Batch buy multiple listings
+     * @param listingIds Array of listing IDs
+     */
+    function batchBuyListings(uint256[] calldata listingIds)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
+        _checkCompliance(msg.sender, DataTypes.KYCLevel.IDENTITY);
+        _checkNotBlacklisted(msg.sender);
+
+        if (listingIds.length == 0) revert Errors.InvalidArrayLength();
+        if (listingIds.length > 50) revert Errors.TooManyOperations();
+
+        uint256 totalCost = 0;
+
+        for (uint256 i = 0; i < listingIds.length; i++) {
+            DataTypes.Listing storage listing = _listings[listingIds[i]];
+
+            if (listing.status != DataTypes.ListingStatus.ACTIVE) {
+                revert Errors.BatchOperationFailed(i);
+            }
+            if (block.timestamp > listing.expiresAt) {
+                revert Errors.BatchOperationFailed(i);
+            }
+            if (msg.sender == listing.seller) {
+                revert Errors.BatchOperationFailed(i);
+            }
+
+            totalCost += listing.price;
+        }
+
+        if (msg.value < totalCost) revert Errors.InsufficientPayment();
+
+        for (uint256 i = 0; i < listingIds.length; i++) {
+            _executeTrade(listingIds[i], msg.sender, _listings[listingIds[i]].price);
+        }
+
+        emit Events.BatchTradeExecuted(msg.sender, totalCost, listingIds.length);
+    }
+
+    // ============ Auction Functions ============
+
+    /**
+     * @notice Start an auction
+     * @param tokenId Token ID
+     * @param startingBid Starting bid amount
+     * @param bidIncrement Minimum bid increment
+     * @param duration Auction duration in seconds
+     * @return auctionId Created auction ID
+     */
+    function startAuction(
+        uint256 tokenId,
+        uint256 startingBid,
+        uint256 bidIncrement,
+        uint256 duration
+    ) external whenNotPaused nonReentrant returns (uint256 auctionId) {
+        _checkCompliance(msg.sender, DataTypes.KYCLevel.IDENTITY);
+        _checkNotBlacklisted(msg.sender);
+
+        if (startingBid == 0) revert Errors.InvalidParameter();
+        if (duration < minListingDuration || duration > maxListingDuration) {
+            revert Errors.InvalidParameter();
+        }
+
+        // Transfer token to marketplace
+        IERC721Upgradeable(debtToken).safeTransferFrom(msg.sender, address(this), tokenId);
+
+        auctionId = _auctionIdCounter++;
+
+        DataTypes.Auction memory auction = DataTypes.Auction({
+            auctionId: auctionId,
+            tokenId: tokenId,
+            seller: msg.sender,
+            startingBid: startingBid,
+            currentBid: 0,
+            currentBidder: address(0),
+            bidIncrement: bidIncrement,
+            startTime: block.timestamp,
+            endTime: block.timestamp + duration,
+            ended: false,
+            winner: address(0),
+            finalPrice: 0
+        });
+
+        _auctions[auctionId] = auction;
+        _tokenIdToAuctionId[tokenId] = auctionId;
+        _activeAuctionIds.push(auctionId);
+
+        emit Events.AuctionStarted(
+            auctionId,
+            tokenId,
+            msg.sender,
+            startingBid,
+            auction.endTime
+        );
+    }
+
+    /**
+     * @notice Place a bid on an auction
+     * @param auctionId Auction ID
+     */
+    function placeBid(uint256 auctionId)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
+        _checkCompliance(msg.sender, DataTypes.KYCLevel.IDENTITY);
+        _checkNotBlacklisted(msg.sender);
+
+        DataTypes.Auction storage auction = _auctions[auctionId];
+
+        if (auction.ended) revert Errors.AuctionAlreadyEnded();
+        if (block.timestamp > auction.endTime) revert Errors.AuctionNotActive();
+        if (msg.sender == auction.seller) revert Errors.CannotBidOnOwnAuction();
+
+        uint256 minBid = auction.currentBid == 0
+            ? auction.startingBid
+            : auction.currentBid + auction.bidIncrement;
+
+        if (msg.value < minBid) revert Errors.BidTooLow();
+
+        // Refund previous bidder
+        if (auction.currentBidder != address(0)) {
+            payable(auction.currentBidder).transfer(auction.currentBid);
+
+            emit Events.BidRefunded(
+                auctionId,
+                auction.currentBidder,
+                auction.currentBid
+            );
+        }
+
+        auction.currentBid = msg.value;
+        auction.currentBidder = msg.sender;
+
+        emit Events.BidPlaced(auctionId, msg.sender, msg.value, block.timestamp);
+    }
+
+    /**
+     * @notice End an auction and transfer token to winner
+     * @param auctionId Auction ID
+     */
+    function endAuction(uint256 auctionId) external nonReentrant {
+        DataTypes.Auction storage auction = _auctions[auctionId];
+
+        if (auction.ended) revert Errors.AuctionAlreadyEnded();
+        if (block.timestamp <= auction.endTime) revert Errors.AuctionNotEnded();
+
+        auction.ended = true;
+
+        if (auction.currentBidder == address(0)) {
+            // No bids, return token to seller
+            IERC721Upgradeable(debtToken).safeTransferFrom(
+                address(this),
+                auction.seller,
+                auction.tokenId
+            );
+
+            emit Events.AuctionCancelled(auctionId);
+        } else {
+            // Transfer token to winner
+            auction.winner = auction.currentBidder;
+            auction.finalPrice = auction.currentBid;
+
+            // Calculate and distribute fees
+            uint256 fee = (auction.finalPrice * tradingFee) / 10000;
+            uint256 sellerProceeds = auction.finalPrice - fee;
+
+            payable(treasury).transfer(fee);
+            payable(auction.seller).transfer(sellerProceeds);
+
+            IERC721Upgradeable(debtToken).safeTransferFrom(
+                address(this),
+                auction.winner,
+                auction.tokenId
+            );
+
+            // Update stats
+            _tradeStats.totalTrades++;
+            _tradeStats.totalVolume += auction.finalPrice;
+            _tradeStats.last24hVolume += auction.finalPrice;
+
+            emit Events.AuctionEnded(auctionId, auction.winner, auction.finalPrice);
+            emit Events.TradeExecuted(
+                0,
+                auction.tokenId,
+                auction.winner,
+                auction.seller,
+                auction.finalPrice,
+                block.timestamp
+            );
+        }
+
+        _removeFromActiveAuctions(auctionId);
+    }
+
+    // ============ Offer Functions ============
+
+    /**
+     * @notice Make an offer on a token
+     * @param tokenId Token ID
+     * @param expiresIn Offer expiration in seconds
+     * @param message Optional message to seller
+     */
+    function makeOffer(
+        uint256 tokenId,
+        uint256 expiresIn,
+        string calldata message
+    ) external payable whenNotPaused nonReentrant returns (uint256 offerId) {
+        _checkCompliance(msg.sender, DataTypes.KYCLevel.IDENTITY);
+        _checkNotBlacklisted(msg.sender);
+
+        if (msg.value == 0) revert Errors.ZeroAmount();
+        if (IERC721Upgradeable(debtToken).ownerOf(tokenId) == msg.sender) {
+            revert Errors.CannotOfferOnOwnToken();
+        }
+
+        offerId = _offerIdCounter++;
+
+        DataTypes.Offer memory offer = DataTypes.Offer({
+            offerId: offerId,
+            tokenId: tokenId,
+            buyer: msg.sender,
+            amount: msg.value,
+            expiresAt: block.timestamp + expiresIn,
+            accepted: false,
+            rejected: false,
+            cancelled: false,
+            message: message
+        });
+
+        _offers[offerId] = offer;
+        _tokenIdToOfferIds[tokenId].push(offerId);
+        _userOffers[msg.sender].push(offerId);
+
+        emit Events.OfferMade(offerId, tokenId, msg.sender, msg.value, offer.expiresAt);
+    }
+
+    /**
+     * @notice Accept an offer
+     * @param offerId Offer ID
+     */
+    function acceptOffer(uint256 offerId) external whenNotPaused nonReentrant {
+        DataTypes.Offer storage offer = _offers[offerId];
+
+        address tokenOwner = IERC721Upgradeable(debtToken).ownerOf(offer.tokenId);
+        if (msg.sender != tokenOwner) revert Errors.Unauthorized();
+
+        if (offer.accepted) revert Errors.OfferAlreadyAccepted();
+        if (offer.rejected) revert Errors.OfferAlreadyRejected();
+        if (offer.cancelled) revert Errors.OfferAlreadyCancelled();
+        if (block.timestamp > offer.expiresAt) revert Errors.OfferExpired();
+
+        _checkNotBlacklisted(msg.sender);
+        _checkNotBlacklisted(offer.buyer);
+
+        offer.accepted = true;
+
+        // Calculate and distribute fees
+        uint256 fee = (offer.amount * tradingFee) / 10000;
+        uint256 sellerProceeds = offer.amount - fee;
+
+        payable(treasury).transfer(fee);
+        payable(msg.sender).transfer(sellerProceeds);
+
+        // Transfer token
+        IERC721Upgradeable(debtToken).safeTransferFrom(
+            msg.sender,
+            offer.buyer,
+            offer.tokenId
+        );
+
+        // Update stats
+        _tradeStats.totalTrades++;
+        _tradeStats.totalVolume += offer.amount;
+        _tradeStats.last24hVolume += offer.amount;
+
+        emit Events.OfferAccepted(offerId, offer.tokenId, msg.sender, offer.buyer, offer.amount);
+        emit Events.TradeExecuted(
+            0,
+            offer.tokenId,
+            offer.buyer,
+            msg.sender,
+            offer.amount,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Reject an offer
+     * @param offerId Offer ID
+     * @param reason Rejection reason
+     */
+    function rejectOffer(uint256 offerId, string calldata reason) external {
+        DataTypes.Offer storage offer = _offers[offerId];
+
+        address tokenOwner = IERC721Upgradeable(debtToken).ownerOf(offer.tokenId);
+        if (msg.sender != tokenOwner) revert Errors.Unauthorized();
+
+        if (offer.accepted) revert Errors.OfferAlreadyAccepted();
+        if (offer.rejected) revert Errors.OfferAlreadyRejected();
+        if (offer.cancelled) revert Errors.OfferAlreadyCancelled();
+
+        offer.rejected = true;
+
+        // Refund buyer
+        payable(offer.buyer).transfer(offer.amount);
+
+        emit Events.OfferRejected(offerId, msg.sender, reason);
+    }
+
+    /**
+     * @notice Cancel an offer (by buyer)
+     * @param offerId Offer ID
+     */
+    function cancelOffer(uint256 offerId) external nonReentrant {
+        DataTypes.Offer storage offer = _offers[offerId];
+
+        if (msg.sender != offer.buyer) revert Errors.NotOfferBuyer();
+        if (offer.accepted) revert Errors.OfferAlreadyAccepted();
+        if (offer.rejected) revert Errors.OfferAlreadyRejected();
+        if (offer.cancelled) revert Errors.OfferAlreadyCancelled();
+
+        offer.cancelled = true;
+
+        // Refund buyer
+        payable(msg.sender).transfer(offer.amount);
+
+        emit Events.OfferCancelled(offerId, msg.sender);
+    }
+
+    // ============ Blacklist Functions ============
+
+    /**
+     * @notice Blacklist a user
+     * @param user User address
+     * @param reason Blacklist reason
+     */
+    function blacklistUser(address user, string calldata reason)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        if (_blacklisted[user]) revert Errors.AlreadyBlacklisted();
+
+        _blacklisted[user] = true;
+        _blacklistReasons[user] = reason;
+
+        emit Events.UserBlacklisted(user, msg.sender, reason, block.timestamp);
+    }
+
+    /**
+     * @notice Remove user from blacklist
+     * @param user User address
+     */
+    function removeFromBlacklist(address user)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        if (!_blacklisted[user]) revert Errors.NotBlacklisted();
+
+        _blacklisted[user] = false;
+        delete _blacklistReasons[user];
+
+        emit Events.UserRemovedFromBlacklist(user, msg.sender, block.timestamp);
+    }
+
+    // ============ View Functions (UI-Optimized) ============
+
+    /**
+     * @notice Get active listings with pagination
+     * @param offset Starting index
+     * @param limit Number of results
+     * @return listings Array of listings
+     * @return total Total number of active listings
+     */
+    function getActiveListings(uint256 offset, uint256 limit)
+        external
+        view
+        returns (DataTypes.Listing[] memory listings, uint256 total)
+    {
+        total = _activeListingIds.length;
+
+        if (offset >= total) {
+            return (new DataTypes.Listing[](0), total);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) {
+            end = total;
+        }
+
+        uint256 resultCount = end - offset;
+        listings = new DataTypes.Listing[](resultCount);
+
+        for (uint256 i = 0; i < resultCount; i++) {
+            listings[i] = _listings[_activeListingIds[offset + i]];
+        }
+    }
+
+    /**
+     * @notice Get active auctions with pagination
+     * @param offset Starting index
+     * @param limit Number of results
+     * @return auctions Array of auctions
+     * @return total Total number of active auctions
+     */
+    function getActiveAuctions(uint256 offset, uint256 limit)
+        external
+        view
+        returns (DataTypes.Auction[] memory auctions, uint256 total)
+    {
+        total = _activeAuctionIds.length;
+
+        if (offset >= total) {
+            return (new DataTypes.Auction[](0), total);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) {
+            end = total;
+        }
+
+        uint256 resultCount = end - offset;
+        auctions = new DataTypes.Auction[](resultCount);
+
+        for (uint256 i = 0; i < resultCount; i++) {
+            auctions[i] = _auctions[_activeAuctionIds[offset + i]];
+        }
+    }
+
+    /**
+     * @notice Get offers for a token
+     * @param tokenId Token ID
+     * @return offers Array of offers
+     */
+    function getTokenOffers(uint256 tokenId)
+        external
+        view
+        returns (DataTypes.Offer[] memory offers)
+    {
+        uint256[] memory offerIds = _tokenIdToOfferIds[tokenId];
+        offers = new DataTypes.Offer[](offerIds.length);
+
+        for (uint256 i = 0; i < offerIds.length; i++) {
+            offers[i] = _offers[offerIds[i]];
+        }
+    }
+
+    /**
+     * @notice Get user's offers
+     * @param user User address
+     * @return offers Array of offers
+     */
+    function getUserOffers(address user)
+        external
+        view
+        returns (DataTypes.Offer[] memory offers)
+    {
+        uint256[] memory offerIds = _userOffers[user];
+        offers = new DataTypes.Offer[](offerIds.length);
+
+        for (uint256 i = 0; i < offerIds.length; i++) {
+            offers[i] = _offers[offerIds[i]];
+        }
+    }
+
+    /**
+     * @notice Get trading statistics
+     * @return stats Trade stats
+     */
+    function getTradeStats()
+        external
+        view
+        returns (DataTypes.TradeStats memory stats)
+    {
+        return _tradeStats;
+    }
+
+    /**
+     * @notice Check if user is blacklisted
+     * @param user User address
+     * @return blacklisted Whether user is blacklisted
+     * @return reason Blacklist reason
+     */
+    function isBlacklisted(address user)
+        external
+        view
+        returns (bool blacklisted, string memory reason)
+    {
+        return (_blacklisted[user], _blacklistReasons[user]);
+    }
+
+    /**
+     * @notice Get listing by ID
+     * @param listingId Listing ID
+     * @return listing Listing data
+     */
+    function getListing(uint256 listingId)
+        external
+        view
+        returns (DataTypes.Listing memory listing)
+    {
+        return _listings[listingId];
+    }
+
+    /**
+     * @notice Get auction by ID
+     * @param auctionId Auction ID
+     * @return auction Auction data
+     */
+    function getAuction(uint256 auctionId)
+        external
+        view
+        returns (DataTypes.Auction memory auction)
+    {
+        return _auctions[auctionId];
+    }
+
+    /**
+     * @notice Get offer by ID
+     * @param offerId Offer ID
+     * @return offer Offer data
+     */
+    function getOffer(uint256 offerId)
+        external
+        view
+        returns (DataTypes.Offer memory offer)
+    {
+        return _offers[offerId];
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Set trading fee
+     * @param fee Fee in basis points
+     */
+    function setTradingFee(uint256 fee) external onlyRole(ADMIN_ROLE) {
+        if (fee > MAX_FEE) revert Errors.InvalidParameter();
+
+        uint256 oldFee = tradingFee;
+        tradingFee = fee;
+
+        emit Events.FeeUpdated("trading", oldFee, fee);
+    }
+
+    /**
+     * @notice Set treasury address
+     * @param treasury_ Treasury address
+     */
+    function setTreasury(address treasury_) external onlyRole(ADMIN_ROLE) {
+        if (treasury_ == address(0)) revert Errors.ZeroAddress();
+
+        address oldTreasury = treasury;
+        treasury = treasury_;
+
+        emit Events.TreasuryUpdated(oldTreasury, treasury_);
+    }
+
+    /**
+     * @notice Set listing duration limits
+     * @param minDuration Minimum duration
+     * @param maxDuration Maximum duration
+     */
+    function setListingDurations(uint256 minDuration, uint256 maxDuration)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        if (minDuration >= maxDuration) revert Errors.InvalidParameter();
+
+        minListingDuration = minDuration;
+        maxListingDuration = maxDuration;
+    }
+
+    /**
+     * @notice Pause contract
+     */
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+        emit Events.ContractPaused(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Unpause contract
+     */
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+        emit Events.ContractUnpaused(msg.sender, block.timestamp);
+    }
+
+    // ============ Internal Functions ============
+
+    /**
+     * @dev Execute a trade
+     */
+    function _executeTrade(
+        uint256 listingId,
+        address buyer,
+        uint256 price
+    ) internal {
+        DataTypes.Listing storage listing = _listings[listingId];
+
+        listing.status = DataTypes.ListingStatus.SOLD;
+        _tradeStats.activeListings--;
+
+        // Calculate and distribute fees
+        uint256 fee = (price * tradingFee) / 10000;
+        uint256 sellerProceeds = price - fee;
+
+        payable(treasury).transfer(fee);
+        payable(listing.seller).transfer(sellerProceeds);
+
+        // Transfer token to buyer
+        IERC721Upgradeable(debtToken).safeTransferFrom(
+            address(this),
+            buyer,
+            listing.tokenId
+        );
+
+        // Update stats
+        _tradeStats.totalTrades++;
+        _tradeStats.totalVolume += price;
+        _tradeStats.last24hVolume += price;
+
+        if (price > _tradeStats.highestPrice) {
+            _tradeStats.highestPrice = price;
+        }
+        if (_tradeStats.lowestPrice == 0 || price < _tradeStats.lowestPrice) {
+            _tradeStats.lowestPrice = price;
+        }
+
+        _tradeStats.averagePrice = _tradeStats.totalVolume / _tradeStats.totalTrades;
+
+        _removeFromActiveListings(listingId);
+
+        emit Events.TradeExecuted(
+            listingId,
+            listing.tokenId,
+            buyer,
+            listing.seller,
+            price,
+            block.timestamp
+        );
+
+        // Refund excess payment
+        if (msg.value > price) {
+            payable(buyer).transfer(msg.value - price);
+        }
+    }
+
+    /**
+     * @dev Check compliance
+     */
+    function _checkCompliance(address user, DataTypes.KYCLevel requiredLevel) internal view {
+        IComplianceManager(complianceManager).isCompliant(user, requiredLevel);
+    }
+
+    /**
+     * @dev Check if user is not blacklisted
+     */
+    function _checkNotBlacklisted(address user) internal view {
+        if (_blacklisted[user]) revert Errors.UserBlacklisted();
+    }
+
+    /**
+     * @dev Remove listing from active list
+     */
+    function _removeFromActiveListings(uint256 listingId) internal {
+        for (uint256 i = 0; i < _activeListingIds.length; i++) {
+            if (_activeListingIds[i] == listingId) {
+                _activeListingIds[i] = _activeListingIds[_activeListingIds.length - 1];
+                _activeListingIds.pop();
+                break;
+            }
+        }
+    }
+
+    /**
+     * @dev Remove auction from active list
+     */
+    function _removeFromActiveAuctions(uint256 auctionId) internal {
+        for (uint256 i = 0; i < _activeAuctionIds.length; i++) {
+            if (_activeAuctionIds[i] == auctionId) {
+                _activeAuctionIds[i] = _activeAuctionIds[_activeAuctionIds.length - 1];
+                _activeAuctionIds.pop();
+                break;
+            }
+        }
+    }
+
+    /**
+     * @dev Authorize upgrade
+     */
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

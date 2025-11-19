@@ -1,0 +1,67 @@
+const { ethers, upgrades } = require("hardhat");
+
+async function main() {
+  console.log("🔄 Starting contract upgrade...\n");
+
+  const [upgrader] = await ethers.getSigners();
+  console.log("Upgrading with account:", upgrader.address);
+
+  // Load deployment info
+  const fs = require("fs");
+  const deployment = JSON.parse(fs.readFileSync("deployment.json", "utf8"));
+
+  console.log("Current deployment:");
+  console.log("  DAO:", deployment.contracts.dao);
+  console.log("  Bailout:", deployment.contracts.bailout);
+  console.log("  Asset Token:", deployment.contracts.assetToken);
+  console.log("  Governance Token:", deployment.contracts.governanceToken, "\n");
+
+  // Example: Upgrade DAO
+  console.log("Upgrading BancafiDAO...");
+  const BancafiDAOV2 = await ethers.getContractFactory("BancafiDAO");
+  const upgradedDAO = await upgrades.upgradeProxy(
+    deployment.contracts.dao,
+    BancafiDAOV2
+  );
+  await upgradedDAO.waitForDeployment();
+  console.log("✅ DAO upgraded successfully\n");
+
+  // Example: Upgrade Bailout
+  console.log("Upgrading BancafiBailout...");
+  const BancafiBailoutV2 = await ethers.getContractFactory("BancafiBailout");
+  const upgradedBailout = await upgrades.upgradeProxy(
+    deployment.contracts.bailout,
+    BancafiBailoutV2
+  );
+  await upgradedBailout.waitForDeployment();
+  console.log("✅ Bailout upgraded successfully\n");
+
+  // Example: Upgrade Asset Token
+  console.log("Upgrading BancafiAssetToken...");
+  const BancafiAssetTokenV2 = await ethers.getContractFactory("BancafiAssetToken");
+  const upgradedAssetToken = await upgrades.upgradeProxy(
+    deployment.contracts.assetToken,
+    BancafiAssetTokenV2
+  );
+  await upgradedAssetToken.waitForDeployment();
+  console.log("✅ Asset Token upgraded successfully\n");
+
+  // Example: Upgrade Governance Token
+  console.log("Upgrading BancafiGovernanceToken...");
+  const BancafiGovernanceTokenV2 = await ethers.getContractFactory("BancafiGovernanceToken");
+  const upgradedGovToken = await upgrades.upgradeProxy(
+    deployment.contracts.governanceToken,
+    BancafiGovernanceTokenV2
+  );
+  await upgradedGovToken.waitForDeployment();
+  console.log("✅ Governance Token upgraded successfully\n");
+
+  console.log("🎉 All contracts upgraded successfully!");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

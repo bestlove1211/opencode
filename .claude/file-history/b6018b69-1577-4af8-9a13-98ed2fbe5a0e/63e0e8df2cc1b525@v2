@@ -1,0 +1,23 @@
+const express = require('express');
+const router = express.Router();
+const statsController = require('../controllers/statsController');
+
+/**
+ * GET /api/stats/global
+ * Get global contract statistics
+ */
+router.get('/global', statsController.getGlobalStats);
+
+/**
+ * GET /api/stats/apy
+ * Get current APY rates
+ */
+router.get('/apy', statsController.getCurrentAPY);
+
+/**
+ * GET /api/stats/tokens
+ * Get supported tokens list
+ */
+router.get('/tokens', statsController.getSupportedTokens);
+
+module.exports = router;

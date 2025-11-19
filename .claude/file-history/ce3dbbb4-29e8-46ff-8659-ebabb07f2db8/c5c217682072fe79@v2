@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title IComplianceManager
+ * @dev Interface for compliance and KYC/AML management
+ */
+interface IComplianceManager {
+    enum KYCLevel {
+        NONE,           // No verification
+        BASIC,          // Email and phone verification
+        IDENTITY,       // Identity document verification
+        ACCREDITED,     // Accredited investor verification
+        INSTITUTIONAL   // Institutional verification
+    }
+
+    enum ComplianceStatus {
+        PENDING,
+        APPROVED,
+        REJECTED,
+        SUSPENDED,
+        REVOKED
+    }
+
+    event KYCStatusUpdated(
+        address indexed user,
+        KYCLevel level,
+        ComplianceStatus status
+    );
+
+    event UserWhitelisted(address indexed user, uint256 timestamp);
+    event UserBlacklisted(address indexed user, uint256 timestamp);
+    event GeographicRestrictionAdded(string countryCode);
+    event GeographicRestrictionRemoved(string countryCode);
+
+    /**
+     * @dev Check if a user is compliant for a specific action
+     * @param user Address of the user
+     * @param requiredLevel Minimum KYC level required
+     * @return bool True if user is compliant
+     */
+    function isCompliant(
+        address user,
+        KYCLevel requiredLevel
+    ) external view returns (bool);
+
+    /**
+     * @dev Get user's current KYC level
+     * @param user Address of the user
+     * @return KYCLevel Current KYC level
+     */
+    function getUserKYCLevel(address user) external view returns (KYCLevel);
+
+    /**
+     * @dev Get user's compliance status
+     * @param user Address of the user
+     * @return ComplianceStatus Current status
+     */
+    function getComplianceStatus(
+        address user
+    ) external view returns (ComplianceStatus);
+
+    /**
+     * @dev Update user's KYC level
+     * @param user Address of the user
+     * @param level New KYC level
+     * @param status New compliance status
+     */
+    function updateKYCStatus(
+        address user,
+        KYCLevel level,
+        ComplianceStatus status
+    ) external;
+
+    /**
+     * @dev Check if user is whitelisted
+     * @param user Address of the user
+     * @return bool True if whitelisted
+     */
+    function isWhitelisted(address user) external view returns (bool);
+
+    /**
+     * @dev Check if user is blacklisted
+     * @param user Address of the user
+     * @return bool True if blacklisted
+     */
+    function isBlacklisted(address user) external view returns (bool);
+
+    /**
+     * @dev Check if a country is restricted
+     * @param countryCode ISO country code
+     * @return bool True if restricted
+     */
+    function isCountryRestricted(
+        string calldata countryCode
+    ) external view returns (bool);
+}

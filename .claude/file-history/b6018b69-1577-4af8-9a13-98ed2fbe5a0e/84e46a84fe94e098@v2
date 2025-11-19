@@ -1,0 +1,191 @@
+const { ethers } = require('ethers');
+const { User, Account } = require('../models');
+const { provider, contractAddresses, savingsAccountABI } = require('../config/blockchain');
+const { logger } = require('../utils/logger');
+
+/**
+ * Get account information for a wallet address
+ */
+exports.getAccountInfo = async (req, res, next) => {
+  try {
+    const { walletAddress } = req.params;
+
+    // Find or create user
+    let user = await User.findOne({ where: { walletAddress: walletAddress.toLowerCase() } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Get all accounts for this user
+    const accounts = await Account.findAll({
+      where: { userId: user.id, isActive: true }
+    });
+
+    res.json({
+      walletAddress: user.walletAddress,
+      accounts: accounts.map(acc => ({
+        tokenAddress: acc.tokenAddress,
+        balance: acc.balance.toString(),
+        totalInterestEarned: acc.totalInterestEarned.toString(),
+        currentAPY: acc.currentAPY,
+        accountOpenDate: acc.accountOpenDate,
+        chainId: acc.chainId
+      }))
+    });
+  } catch (error) {
+    logger.error('Error getting account info:', error);
+    next(error);
+  }
+};
+
+/**
+ * Get specific token account information
+ */
+exports.getTokenAccountInfo = async (req, res, next) => {
+  try {
+    const { walletAddress, tokenAddress } = req.params;
+
+    // Get contract instance
+    const savingsContract = new ethers.Contract(
+      contractAddresses.savingsAccount,
+      savingsAccountABI,
+      provider
+    );
+
+    // Fetch on-chain data
+    const accountInfo = await savingsContract.getAccountInfo(walletAddress, tokenAddress);
+
+    res.json({
+      balance: accountInfo.balance.toString(),
+      totalInterestEarned: accountInfo.totalInterestEarned.toString(),
+      currentAPY: accountInfo.currentAPY.toString(),
+      pendingInterest: accountInfo.pendingInterest.toString(),
+      accountAge: accountInfo.accountAge.toString(),
+      isActive: accountInfo.isActive
+    });
+  } catch (error) {
+    logger.error('Error getting token account info:', error);
+    next(error);
+  }
+};
+
+/**
+ * Sync account data from blockchain
+ */
+exports.syncAccount = async (req, res, next) => {
+  try {
+    const { walletAddress } = req.body;
+
+    // Get contract instance
+    const savingsContract = new ethers.Contract(
+      contractAddresses.savingsAccount,
+      savingsAccountABI,
+      provider
+    );
+
+    // Find or create user
+    let user = await User.findOne({ where: { walletAddress: walletAddress.toLowerCase() } });
+
+    if (!user) {
+      user = await User.create({
+        walletAddress: walletAddress.toLowerCase(),
+        isActive: true,
+        lastLogin: new Date()
+      });
+    } else {
+      await user.update({ lastLogin: new Date() });
+    }
+
+    // Get supported tokens (this would be fetched from contract or database)
+    // For now, we'll sync all known tokens from database
+    const accounts = await Account.findAll({ where: { userId: user.id } });
+
+    const syncedAccounts = [];
+
+    for (const account of accounts) {
+      try {
+        const accountInfo = await savingsContract.getAccountInfo(
+          walletAddress,
+          account.tokenAddress
+        );
+
+        await account.update({
+          balance: accountInfo.balance.toString(),
+          totalInterestEarned: accountInfo.totalInterestEarned.toString(),
+          currentAPY: (Number(accountInfo.currentAPY) / 100).toString(),
+          isActive: accountInfo.isActive,
+          lastInterestUpdate: new Date()
+        });
+
+        syncedAccounts.push({
+          tokenAddress: account.tokenAddress,
+          balance: accountInfo.balance.toString(),
+          isActive: accountInfo.isActive
+        });
+      } catch (err) {
+        logger.error(`Error syncing account for token ${account.tokenAddress}:`, err);
+      }
+    }
+
+    res.json({
+      message: 'Account synced successfully',
+      walletAddress: user.walletAddress,
+      syncedAccounts
+    });
+  } catch (error) {
+    logger.error('Error syncing account:', error);
+    next(error);
+  }
+};
+
+/**
+ * Get pending interest for all accounts
+ */
+exports.getPendingInterest = async (req, res, next) => {
+  try {
+    const { walletAddress } = req.params;
+
+    const user = await User.findOne({ where: { walletAddress: walletAddress.toLowerCase() } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const accounts = await Account.findAll({
+      where: { userId: user.id, isActive: true }
+    });
+
+    const savingsContract = new ethers.Contract(
+      contractAddresses.savingsAccount,
+      savingsAccountABI,
+      provider
+    );
+
+    const pendingInterests = [];
+
+    for (const account of accounts) {
+      try {
+        const interest = await savingsContract.calculateInterest(
+          walletAddress,
+          account.tokenAddress
+        );
+
+        pendingInterests.push({
+          tokenAddress: account.tokenAddress,
+          pendingInterest: interest.toString()
+        });
+      } catch (err) {
+        logger.error(`Error calculating interest for token ${account.tokenAddress}:`, err);
+      }
+    }
+
+    res.json({
+      walletAddress: user.walletAddress,
+      pendingInterests
+    });
+  } catch (error) {
+    logger.error('Error getting pending interest:', error);
+    next(error);
+  }
+};

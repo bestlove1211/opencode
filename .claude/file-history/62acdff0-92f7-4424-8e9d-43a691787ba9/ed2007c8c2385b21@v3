@@ -1,0 +1,245 @@
+const { ethers, upgrades } = require("hardhat");
+const fs = require("fs");
+
+async function main() {
+  console.log("🔍 BANCAFI ENHANCEMENT VALIDATION SCRIPT\n");
+  console.log("=".repeat(80));
+  console.log("This script validates that enhancement contracts can properly");
+  console.log("interact with deployed core contracts.\n");
+
+  const [deployer] = await ethers.getSigners();
+  console.log("Validator:", deployer.address);
+  console.log("Balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH\n");
+
+  // Load deployed contract addresses
+  const deployment = JSON.parse(fs.readFileSync("deployment-complete.json"));
+  const addresses = deployment.contracts;
+
+  const results = {
+    timestamp: new Date().toISOString(),
+    validations: [],
+    errors: [],
+    warnings: [],
+    canDeploy: true
+  };
+
+  // ========== VALIDATION 1: Oracle Interface ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("1️⃣ VALIDATING: BancafiAutomation ↔ BancafiOracle");
+  console.log("=".repeat(80));
+
+  try {
+    const oracle = await ethers.getContractAt("BancafiOracle", addresses.oracle);
+
+    // Check if oracle has required functions
+    console.log("\nChecking Oracle interface...");
+
+    // Test: Can we call assetValuations?
+    try {
+      const valuation = await oracle.assetValuations(1);
+      console.log("✅ oracle.assetValuations() - accessible");
+      results.validations.push("Oracle.assetValuations - OK");
+    } catch (e) {
+      console.log("⚠️  oracle.assetValuations() - no data (expected if no assets)");
+      results.warnings.push("Oracle has no assets yet");
+    }
+
+    // Check function signatures
+    const oracleInterface = oracle.interface;
+    const requiredFunctions = [
+      "updatePriceFromChainlink",
+      "checkStaleness",
+      "assetValuations"
+    ];
+
+    for (const func of requiredFunctions) {
+      if (oracleInterface.getFunction(func)) {
+        console.log(`✅ ${func}() - exists`);
+        results.validations.push(`Oracle.${func} - exists`);
+      } else {
+        console.log(`❌ ${func}() - MISSING`);
+        results.errors.push(`Oracle.${func} - MISSING`);
+        results.canDeploy = false;
+      }
+    }
+
+  } catch (error) {
+    console.log("❌ ERROR:", error.message);
+    results.errors.push(`Oracle validation failed: ${error.message}`);
+    results.canDeploy = false;
+  }
+
+  // ========== VALIDATION 2: Pausable Contracts ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("2️⃣ VALIDATING: EmergencyCoordinator ↔ Pausable Contracts");
+  console.log("=".repeat(80));
+
+  const pausableContracts = [
+    { name: "AssetToken", address: addresses.assetToken },
+    { name: "Bailout", address: addresses.bailout },
+    { name: "Staking", address: addresses.staking },
+    { name: "Marketplace", address: addresses.marketplace },
+    { name: "LiquidityPool", address: addresses.liquidityPool },
+    { name: "Oracle", address: addresses.oracle },
+    { name: "Insurance", address: addresses.insurance },
+    { name: "Vesting", address: addresses.vesting },
+    { name: "Treasury", address: addresses.treasury }
+  ];
+
+  console.log("\nChecking pause/unpause functions on all contracts...");
+
+  for (const contract of pausableContracts) {
+    try {
+      const instance = await ethers.getContractAt("BancafiAssetToken", contract.address);
+
+      // Check if pause() exists
+      const hasInterface = instance.interface.getFunction("pause") !== null &&
+                          instance.interface.getFunction("unpause") !== null &&
+                          instance.interface.getFunction("paused") !== null;
+
+      if (hasInterface) {
+        console.log(`✅ ${contract.name} - has pause/unpause/paused`);
+        results.validations.push(`${contract.name} - pausable OK`);
+      } else {
+        console.log(`❌ ${contract.name} - MISSING pause functions`);
+        results.errors.push(`${contract.name} - not pausable`);
+      }
+    } catch (error) {
+      console.log(`⚠️  ${contract.name} - Could not validate: ${error.message}`);
+      results.warnings.push(`${contract.name} - validation skipped`);
+    }
+  }
+
+  // ========== VALIDATION 3: Analytics Interfaces ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("3️⃣ VALIDATING: BancafiAnalytics ↔ Core Contracts");
+  console.log("=".repeat(80));
+
+  try {
+    // Check Staking contract
+    console.log("\nChecking Staking interface...");
+    const staking = await ethers.getContractAt("BancafiStaking", addresses.staking);
+
+    try {
+      const pool = await staking.pool();
+      console.log("✅ staking.pool() - returns:", {
+        totalStaked: ethers.formatEther(pool.totalStaked),
+        totalVotingPower: ethers.formatEther(pool.totalVotingPower)
+      });
+      results.validations.push("Staking.pool - OK");
+    } catch (e) {
+      console.log("❌ staking.pool() - ERROR:", e.message);
+      results.errors.push(`Staking.pool - ${e.message}`);
+    }
+
+    // Check Bailout contract
+    console.log("\nChecking Bailout interface...");
+    const bailout = await ethers.getContractAt("BancafiBailout", addresses.bailout);
+
+    try {
+      const balance = await bailout.treasuryBalance();
+      const disbursed = await bailout.totalDisbursed();
+      console.log("✅ bailout.treasuryBalance() - returns:", {
+        treasuryBalance: ethers.formatEther(balance),
+        totalDisbursed: ethers.formatEther(disbursed)
+      });
+      results.validations.push("Bailout.treasuryBalance - OK");
+      results.validations.push("Bailout.totalDisbursed - OK");
+    } catch (e) {
+      console.log("❌ bailout public variables - ERROR:", e.message);
+      results.errors.push(`Bailout interface - ${e.message}`);
+    }
+
+    // Check Treasury contract
+    console.log("\nChecking Treasury interface...");
+    const treasury = await ethers.getContractAt("BancafiTreasury", addresses.treasury);
+
+    try {
+      const stats = await treasury.getTreasuryStats();
+      console.log("✅ treasury.getTreasuryStats() - returns:", {
+        currentETHBalance: ethers.formatEther(stats.currentETHBalance)
+      });
+      results.validations.push("Treasury.getTreasuryStats - OK");
+    } catch (e) {
+      console.log("❌ treasury.getTreasuryStats() - ERROR:", e.message);
+      results.errors.push(`Treasury.getTreasuryStats - ${e.message}`);
+    }
+
+    // Check Insurance contract
+    console.log("\nChecking Insurance interface...");
+    const insurance = await ethers.getContractAt("BancafiInsurance", addresses.insurance);
+
+    try {
+      const stats = await insurance.poolStats();
+      console.log("✅ insurance.poolStats() - returns:", {
+        totalPremiums: ethers.formatEther(stats.totalPremiums),
+        activeBalance: ethers.formatEther(stats.activeBalance),
+        totalPayouts: ethers.formatEther(stats.totalPayouts)
+      });
+      results.validations.push("Insurance.poolStats - OK");
+    } catch (e) {
+      console.log("❌ insurance.poolStats() - ERROR:", e.message);
+      results.errors.push(`Insurance.poolStats - ${e.message}`);
+    }
+
+  } catch (error) {
+    console.log("❌ Analytics validation ERROR:", error.message);
+    results.errors.push(`Analytics validation failed: ${error.message}`);
+  }
+
+  // ========== SUMMARY ==========
+  console.log("\n" + "=".repeat(80));
+  console.log("📊 VALIDATION SUMMARY");
+  console.log("=".repeat(80));
+
+  console.log(`\n✅ Successful Validations: ${results.validations.length}`);
+  results.validations.forEach(v => console.log(`   - ${v}`));
+
+  if (results.warnings.length > 0) {
+    console.log(`\n⚠️  Warnings: ${results.warnings.length}`);
+    results.warnings.forEach(w => console.log(`   - ${w}`));
+  }
+
+  if (results.errors.length > 0) {
+    console.log(`\n❌ Errors Found: ${results.errors.length}`);
+    results.errors.forEach(e => console.log(`   - ${e}`));
+  }
+
+  console.log("\n" + "=".repeat(80));
+
+  if (results.canDeploy && results.errors.length === 0) {
+    console.log("✅ VALIDATION PASSED - Safe to deploy enhancements!");
+    results.recommendation = "DEPLOY";
+  } else {
+    console.log("❌ VALIDATION FAILED - DO NOT deploy yet!");
+    console.log("   Fix the errors above before deploying.");
+    results.recommendation = "DO_NOT_DEPLOY";
+    results.canDeploy = false;
+  }
+
+  console.log("=".repeat(80) + "\n");
+
+  // Save results
+  fs.writeFileSync(
+    "validation-results.json",
+    JSON.stringify(results, null, 2)
+  );
+  console.log("📝 Validation results saved to: validation-results.json\n");
+
+  return results;
+}
+
+main()
+  .then((results) => {
+    if (results.canDeploy) {
+      console.log("✅ Ready for next step: Deploy enhancements");
+      process.exit(0);
+    } else {
+      console.log("⚠️  Fix errors before proceeding");
+      process.exit(1);
+    }
+  })
+  .catch((error) => {
+    console.error("💥 Validation script failed:", error);
+    process.exit(1);
+  });

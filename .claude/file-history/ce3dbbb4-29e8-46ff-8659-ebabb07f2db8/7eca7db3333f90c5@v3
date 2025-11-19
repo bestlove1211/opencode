@@ -1,0 +1,651 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+
+import "./libraries/DataTypes.sol";
+import "./libraries/Errors.sol";
+import "./libraries/Events.sol";
+import "./libraries/DebtCalculations.sol";
+
+/**
+ * @title DebtToken
+ * @notice Upgradeable ERC-721 contract for tokenizing debt as NFTs
+ * @dev Implements UUPS upgradeable pattern with comprehensive debt management features
+ */
+contract DebtToken is
+    Initializable,
+    ERC721Upgradeable,
+    ERC721EnumerableUpgradeable,
+    ERC721URIStorageUpgradeable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable
+{
+    using DebtCalculations for uint256;
+
+    // ============ Roles ============
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    // ============ State Variables ============
+    uint256 private _tokenIdCounter;
+
+    // Token ID => Debt Metadata
+    mapping(uint256 => DataTypes.DebtMetadata) private _debtMetadata;
+
+    // Token ID => Repayment Schedule
+    mapping(uint256 => DataTypes.RepaymentSchedule) private _repaymentSchedules;
+
+    // Token ID => Collateral Array
+    mapping(uint256 => DataTypes.Collateral[]) private _collaterals;
+
+    // Token ID => Payment Records
+    mapping(uint256 => DataTypes.PaymentRecord[]) private _paymentHistory;
+
+    // Debtor => Token IDs
+    mapping(address => uint256[]) private _debtorTokens;
+
+    // Token ID => Last Payment Timestamp
+    mapping(uint256 => uint256) private _lastPaymentDate;
+
+    // Address of ComplianceManager contract
+    address public complianceManager;
+
+    // Address of CollectionAutomator contract
+    address public collectionAutomator;
+
+    // Minimum principal amount (in wei or smallest unit)
+    uint256 public minPrincipalAmount;
+
+    // Maximum interest rate in basis points
+    uint256 public maxInterestRate;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the contract
+     * @param name_ Token name
+     * @param symbol_ Token symbol
+     * @param admin_ Admin address
+     */
+    function initialize(
+        string memory name_,
+        string memory symbol_,
+        address admin_
+    ) public initializer {
+        if (admin_ == address(0)) revert Errors.ZeroAddress();
+
+        __ERC721_init(name_, symbol_);
+        __ERC721Enumerable_init();
+        __ERC721URIStorage_init();
+        __AccessControl_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(ADMIN_ROLE, admin_);
+        _grantRole(MINTER_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, admin_);
+
+        _tokenIdCounter = 1;
+        minPrincipalAmount = 1e18; // 1 token as default
+        maxInterestRate = 10000; // 100% as default max
+    }
+
+    // ============ Minting Functions ============
+
+    /**
+     * @notice Mint a new debt token
+     * @param to Address to mint to (original creditor)
+     * @param debtor Address of the debtor
+     * @param metadata Debt metadata
+     * @param schedule Repayment schedule
+     * @param collaterals Array of collateral
+     * @param tokenURI URI for token metadata
+     * @return tokenId The minted token ID
+     */
+    function mintDebtToken(
+        address to,
+        address debtor,
+        DataTypes.DebtMetadata memory metadata,
+        DataTypes.RepaymentSchedule memory schedule,
+        DataTypes.Collateral[] memory collaterals,
+        string memory tokenURI
+    ) external whenNotPaused onlyRole(MINTER_ROLE) returns (uint256 tokenId) {
+        if (to == address(0) || debtor == address(0)) revert Errors.ZeroAddress();
+        if (metadata.principalAmount < minPrincipalAmount) revert Errors.PrincipalAmountTooLow();
+        if (metadata.interestRate > maxInterestRate) revert Errors.InterestRateTooHigh();
+        if (metadata.maturityDate <= block.timestamp) revert Errors.MaturityDateInPast();
+        if (schedule.numberOfPayments == 0) revert Errors.InvalidRepaymentSchedule();
+
+        tokenId = _tokenIdCounter++;
+
+        // Initialize debt metadata
+        metadata.debtor = debtor;
+        metadata.originalCreditor = to;
+        metadata.originationDate = block.timestamp;
+        metadata.status = DataTypes.DebtStatus.ACTIVE;
+        metadata.outstandingBalance = metadata.principalAmount;
+        metadata.totalPaid = 0;
+        metadata.missedPayments = 0;
+
+        _debtMetadata[tokenId] = metadata;
+        _repaymentSchedules[tokenId] = schedule;
+        _lastPaymentDate[tokenId] = block.timestamp;
+
+        // Add collaterals
+        for (uint256 i = 0; i < collaterals.length; i++) {
+            _collaterals[tokenId].push(collaterals[i]);
+
+            emit Events.CollateralAdded(
+                tokenId,
+                collaterals[i].collateralType,
+                collaterals[i].valuationAmount
+            );
+        }
+
+        // Track debtor's tokens
+        _debtorTokens[debtor].push(tokenId);
+
+        // Mint the NFT
+        _safeMint(to, tokenId);
+        _setTokenURI(tokenId, tokenURI);
+
+        emit Events.DebtTokenMinted(
+            tokenId,
+            debtor,
+            to,
+            metadata.principalAmount,
+            metadata.currency,
+            metadata.maturityDate
+        );
+    }
+
+    // ============ Payment Functions ============
+
+    /**
+     * @notice Record a payment for a debt token
+     * @param tokenId Token ID
+     * @param paymentAmount Total payment amount
+     */
+    function recordPayment(
+        uint256 tokenId,
+        uint256 paymentAmount
+    ) external whenNotPaused nonReentrant {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+        if (paymentAmount == 0) revert Errors.ZeroAmount();
+
+        // Only collection automator or token owner can record payments
+        if (msg.sender != collectionAutomator && msg.sender != ownerOf(tokenId)) {
+            revert Errors.Unauthorized();
+        }
+
+        DataTypes.DebtMetadata storage metadata = _debtMetadata[tokenId];
+
+        if (metadata.status == DataTypes.DebtStatus.PAID_OFF) {
+            revert Errors.DebtAlreadyPaidOff();
+        }
+
+        // Calculate payment breakdown
+        uint256 daysSinceLastPayment = DebtCalculations.calculateDaysBetween(
+            _lastPaymentDate[tokenId],
+            block.timestamp
+        );
+
+        (
+            uint256 remainingBalance,
+            uint256 interestPaid,
+            uint256 principalPaid
+        ) = DebtCalculations.calculateRemainingBalance(
+            metadata.outstandingBalance,
+            paymentAmount,
+            metadata.interestRate,
+            daysSinceLastPayment
+        );
+
+        // Update metadata
+        metadata.outstandingBalance = remainingBalance;
+        metadata.totalPaid += paymentAmount;
+        _lastPaymentDate[tokenId] = block.timestamp;
+
+        // Update repayment schedule
+        DataTypes.RepaymentSchedule storage schedule = _repaymentSchedules[tokenId];
+        schedule.paymentsMade++;
+
+        if (schedule.paymentsMade < schedule.numberOfPayments) {
+            schedule.nextPaymentDate = DebtCalculations.calculateNextPaymentDate(
+                block.timestamp,
+                schedule.frequency
+            );
+        }
+
+        // Record payment in history
+        DataTypes.PaymentRecord memory record = DataTypes.PaymentRecord({
+            recordId: _paymentHistory[tokenId].length,
+            tokenId: tokenId,
+            amount: paymentAmount,
+            principalPaid: principalPaid,
+            interestPaid: interestPaid,
+            lateFee: 0, // Will be set by CollectionAutomator if applicable
+            timestamp: block.timestamp,
+            daysLate: 0,
+            paidBy: msg.sender
+        });
+
+        _paymentHistory[tokenId].push(record);
+
+        // Check if debt is fully paid
+        if (remainingBalance == 0) {
+            metadata.status = DataTypes.DebtStatus.PAID_OFF;
+
+            emit Events.DebtPaidOff(
+                tokenId,
+                metadata.debtor,
+                metadata.totalPaid
+            );
+        }
+
+        emit Events.RepaymentMade(
+            tokenId,
+            msg.sender,
+            paymentAmount,
+            principalPaid,
+            interestPaid,
+            remainingBalance
+        );
+    }
+
+    /**
+     * @notice Mark a debt as defaulted
+     * @param tokenId Token ID
+     */
+    function markAsDefaulted(uint256 tokenId) external {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        // Only collection automator can mark as defaulted
+        if (msg.sender != collectionAutomator) {
+            revert Errors.Unauthorized();
+        }
+
+        DataTypes.DebtMetadata storage metadata = _debtMetadata[tokenId];
+
+        if (metadata.status == DataTypes.DebtStatus.DEFAULTED) {
+            revert Errors.AlreadyInDefault();
+        }
+
+        DataTypes.DebtStatus oldStatus = metadata.status;
+        metadata.status = DataTypes.DebtStatus.DEFAULTED;
+
+        emit Events.DebtStatusChanged(tokenId, oldStatus, DataTypes.DebtStatus.DEFAULTED);
+        emit Events.DebtDefaulted(
+            tokenId,
+            metadata.debtor,
+            metadata.missedPayments,
+            metadata.outstandingBalance
+        );
+    }
+
+    /**
+     * @notice Increment missed payment counter
+     * @param tokenId Token ID
+     */
+    function incrementMissedPayments(uint256 tokenId) external {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        // Only collection automator can increment
+        if (msg.sender != collectionAutomator) {
+            revert Errors.Unauthorized();
+        }
+
+        _debtMetadata[tokenId].missedPayments++;
+    }
+
+    // ============ Collateral Functions ============
+
+    /**
+     * @notice Add collateral to a debt token
+     * @param tokenId Token ID
+     * @param collateral Collateral to add
+     */
+    function addCollateral(
+        uint256 tokenId,
+        DataTypes.Collateral memory collateral
+    ) external {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+        if (msg.sender != ownerOf(tokenId)) revert Errors.NotTokenOwner();
+
+        _collaterals[tokenId].push(collateral);
+
+        emit Events.CollateralAdded(
+            tokenId,
+            collateral.collateralType,
+            collateral.valuationAmount
+        );
+    }
+
+    /**
+     * @notice Mark collateral as liquidated
+     * @param tokenId Token ID
+     * @param collateralIndex Index of collateral in array
+     * @param liquidationAmount Amount received from liquidation
+     */
+    function liquidateCollateral(
+        uint256 tokenId,
+        uint256 collateralIndex,
+        uint256 liquidationAmount
+    ) external {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        // Only collection automator can liquidate
+        if (msg.sender != collectionAutomator) {
+            revert Errors.Unauthorized();
+        }
+
+        if (collateralIndex >= _collaterals[tokenId].length) {
+            revert Errors.InvalidParameter();
+        }
+
+        DataTypes.Collateral storage collateral = _collaterals[tokenId][collateralIndex];
+
+        if (collateral.liquidated) {
+            revert Errors.CollateralAlreadyLiquidated();
+        }
+
+        collateral.liquidated = true;
+        collateral.liquidationAmount = liquidationAmount;
+
+        // Update debt status
+        _debtMetadata[tokenId].status = DataTypes.DebtStatus.IN_LIQUIDATION;
+
+        emit Events.CollateralLiquidated(tokenId, liquidationAmount, msg.sender);
+    }
+
+    // ============ Metadata Update Functions ============
+
+    /**
+     * @notice Update debt metadata
+     * @param tokenId Token ID
+     * @param newMetadataHash New metadata hash
+     */
+    function updateMetadata(
+        uint256 tokenId,
+        bytes32 newMetadataHash
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        bytes32 oldHash = _debtMetadata[tokenId].legalDocumentHash;
+        _debtMetadata[tokenId].legalDocumentHash = newMetadataHash;
+
+        emit Events.DebtMetadataUpdated(tokenId, oldHash, newMetadataHash);
+    }
+
+    /**
+     * @notice Update debt status
+     * @param tokenId Token ID
+     * @param newStatus New status
+     */
+    function updateDebtStatus(
+        uint256 tokenId,
+        DataTypes.DebtStatus newStatus
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        DataTypes.DebtStatus oldStatus = _debtMetadata[tokenId].status;
+        _debtMetadata[tokenId].status = newStatus;
+
+        emit Events.DebtStatusChanged(tokenId, oldStatus, newStatus);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get debt metadata
+     * @param tokenId Token ID
+     * @return metadata Debt metadata
+     */
+    function getDebtMetadata(uint256 tokenId)
+        external
+        view
+        returns (DataTypes.DebtMetadata memory metadata)
+    {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+        return _debtMetadata[tokenId];
+    }
+
+    /**
+     * @notice Get repayment schedule
+     * @param tokenId Token ID
+     * @return schedule Repayment schedule
+     */
+    function getRepaymentSchedule(uint256 tokenId)
+        external
+        view
+        returns (DataTypes.RepaymentSchedule memory schedule)
+    {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+        return _repaymentSchedules[tokenId];
+    }
+
+    /**
+     * @notice Get collaterals for a token
+     * @param tokenId Token ID
+     * @return collaterals Array of collaterals
+     */
+    function getCollaterals(uint256 tokenId)
+        external
+        view
+        returns (DataTypes.Collateral[] memory collaterals)
+    {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+        return _collaterals[tokenId];
+    }
+
+    /**
+     * @notice Get payment history
+     * @param tokenId Token ID
+     * @return history Array of payment records
+     */
+    function getPaymentHistory(uint256 tokenId)
+        external
+        view
+        returns (DataTypes.PaymentRecord[] memory history)
+    {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+        return _paymentHistory[tokenId];
+    }
+
+    /**
+     * @notice Get all debt tokens for a debtor
+     * @param debtor Debtor address
+     * @return tokenIds Array of token IDs
+     */
+    function getDebtorTokens(address debtor)
+        external
+        view
+        returns (uint256[] memory tokenIds)
+    {
+        return _debtorTokens[debtor];
+    }
+
+    /**
+     * @notice Get current outstanding balance with accrued interest
+     * @param tokenId Token ID
+     * @return balance Current balance including interest
+     */
+    function getCurrentBalance(uint256 tokenId)
+        external
+        view
+        returns (uint256 balance)
+    {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        DataTypes.DebtMetadata memory metadata = _debtMetadata[tokenId];
+
+        uint256 daysSinceLastPayment = DebtCalculations.calculateDaysBetween(
+            _lastPaymentDate[tokenId],
+            block.timestamp
+        );
+
+        uint256 accruedInterest = DebtCalculations.calculateSimpleInterest(
+            metadata.outstandingBalance,
+            metadata.interestRate,
+            daysSinceLastPayment
+        );
+
+        balance = metadata.outstandingBalance + accruedInterest;
+    }
+
+    /**
+     * @notice Check if payment is late
+     * @param tokenId Token ID
+     * @return isLate Whether payment is late
+     * @return daysLate Number of days late
+     */
+    function checkPaymentStatus(uint256 tokenId)
+        external
+        view
+        returns (bool isLate, uint256 daysLate)
+    {
+        if (!_ownerOf(tokenId)) revert Errors.TokenDoesNotExist();
+
+        DataTypes.RepaymentSchedule memory schedule = _repaymentSchedules[tokenId];
+
+        return DebtCalculations.checkIfLate(
+            schedule.nextPaymentDate,
+            block.timestamp,
+            schedule.gracePeriodDays
+        );
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Set compliance manager address
+     * @param complianceManager_ Compliance manager address
+     */
+    function setComplianceManager(address complianceManager_)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        if (complianceManager_ == address(0)) revert Errors.ZeroAddress();
+        complianceManager = complianceManager_;
+    }
+
+    /**
+     * @notice Set collection automator address
+     * @param collectionAutomator_ Collection automator address
+     */
+    function setCollectionAutomator(address collectionAutomator_)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        if (collectionAutomator_ == address(0)) revert Errors.ZeroAddress();
+        collectionAutomator = collectionAutomator_;
+    }
+
+    /**
+     * @notice Set minimum principal amount
+     * @param amount Minimum amount
+     */
+    function setMinPrincipalAmount(uint256 amount)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        minPrincipalAmount = amount;
+    }
+
+    /**
+     * @notice Set maximum interest rate
+     * @param rate Maximum rate in basis points
+     */
+    function setMaxInterestRate(uint256 rate)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        maxInterestRate = rate;
+    }
+
+    /**
+     * @notice Pause contract
+     */
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+        emit Events.ContractPaused(msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Unpause contract
+     */
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+        emit Events.ContractUnpaused(msg.sender, block.timestamp);
+    }
+
+    // ============ Override Functions ============
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    function _update(address to, uint256 tokenId, address auth)
+        internal
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+        returns (address)
+    {
+        return super._update(to, tokenId, auth);
+    }
+
+    function _increaseBalance(address account, uint128 value)
+        internal
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+    {
+        super._increaseBalance(account, value);
+    }
+
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override(ERC721Upgradeable, ERC721URIStorageUpgradeable)
+        returns (string memory)
+    {
+        return super.tokenURI(tokenId);
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(
+            ERC721Upgradeable,
+            ERC721EnumerableUpgradeable,
+            ERC721URIStorageUpgradeable,
+            AccessControlUpgradeable
+        )
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Helper function to check if token exists
+     */
+    function _ownerOf(uint256 tokenId) internal view returns (bool) {
+        return _ownerOf(tokenId) != address(0);
+    }
+}

@@ -1,0 +1,462 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IBancafiAssetToken {
+    function fractionalOwnership(uint256 tokenId, address owner) external view returns (uint256);
+    function transferFractional(uint256 tokenId, address to, uint256 amount) external;
+    function totalFractions(uint256 tokenId) external view returns (uint256);
+}
+
+/**
+ * @title BancafiLiquidityPool
+ * @notice Automated Market Maker (AMM) for trading fractional asset shares
+ * @dev Constant product AMM (x * y = k) with LP tokens
+ */
+contract BancafiLiquidityPool is
+    Initializable,
+    ERC20Upgradeable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant FEE_MANAGER_ROLE = keccak256("FEE_MANAGER_ROLE");
+
+    struct Pool {
+        uint256 tokenId;
+        uint256 reserveFractions;
+        uint256 reserveETH;
+        uint256 totalLiquidity;
+        uint256 lastPrice;
+        uint256 volume24h;
+        uint256 volumeTimestamp;
+        bool active;
+    }
+
+    struct LiquidityPosition {
+        uint256 poolId;
+        address provider;
+        uint256 lpTokens;
+        uint256 fractionsProvided;
+        uint256 ethProvided;
+        uint256 timestamp;
+    }
+
+    IBancafiAssetToken public assetToken;
+
+    uint256 private _poolIds;
+    uint256 public swapFeePercent; // in basis points (30 = 0.3%)
+    uint256 public constant MIN_LIQUIDITY = 1000; // Minimum liquidity to prevent division by zero
+
+    mapping(uint256 => Pool) public pools; // poolId => Pool
+    mapping(uint256 => uint256) public tokenToPool; // tokenId => poolId
+    mapping(uint256 => mapping(address => uint256)) public liquidityProvided; // poolId => user => LP tokens
+    mapping(address => uint256[]) public userPools;
+
+    // Events
+    event PoolCreated(
+        uint256 indexed poolId,
+        uint256 indexed tokenId,
+        uint256 initialFractions,
+        uint256 initialETH,
+        uint256 timestamp
+    );
+
+    event LiquidityAdded(
+        uint256 indexed poolId,
+        address indexed provider,
+        uint256 fractionsAmount,
+        uint256 ethAmount,
+        uint256 lpTokens,
+        uint256 timestamp
+    );
+
+    event LiquidityRemoved(
+        uint256 indexed poolId,
+        address indexed provider,
+        uint256 lpTokens,
+        uint256 fractionsAmount,
+        uint256 ethAmount,
+        uint256 timestamp
+    );
+
+    event Swap(
+        uint256 indexed poolId,
+        address indexed trader,
+        bool ethToFractions,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 fee,
+        uint256 timestamp
+    );
+
+    event SwapFeeUpdated(
+        uint256 oldFee,
+        uint256 newFee,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address assetTokenAddress_) public initializer {
+        __ERC20_init("Bancafi LP Token", "BLP");
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(FEE_MANAGER_ROLE, msg.sender);
+
+        assetToken = IBancafiAssetToken(assetTokenAddress_);
+        swapFeePercent = 30; // 0.3% default fee
+    }
+
+    /**
+     * @notice Create a new liquidity pool
+     */
+    function createPool(
+        uint256 tokenId_,
+        uint256 fractionsAmount_
+    ) external payable whenNotPaused nonReentrant returns (uint256) {
+        require(tokenToPool[tokenId_] == 0, "Pool exists");
+        require(fractionsAmount_ > 0, "Invalid fractions");
+        require(msg.value > 0, "Invalid ETH amount");
+        require(
+            assetToken.fractionalOwnership(tokenId_, msg.sender) >= fractionsAmount_,
+            "Insufficient fractions"
+        );
+
+        _poolIds++;
+        uint256 newPoolId = _poolIds;
+
+        // Calculate initial liquidity
+        uint256 liquidity = _sqrt(fractionsAmount_ * msg.value);
+        require(liquidity > MIN_LIQUIDITY, "Insufficient initial liquidity");
+
+        // Transfer fractions to pool
+        assetToken.transferFractional(tokenId_, address(this), fractionsAmount_);
+
+        // Create pool
+        pools[newPoolId] = Pool({
+            tokenId: tokenId_,
+            reserveFractions: fractionsAmount_,
+            reserveETH: msg.value,
+            totalLiquidity: liquidity,
+            lastPrice: (msg.value * 1e18) / fractionsAmount_,
+            volume24h: 0,
+            volumeTimestamp: block.timestamp,
+            active: true
+        });
+
+        tokenToPool[tokenId_] = newPoolId;
+
+        // Mint LP tokens
+        _mint(msg.sender, liquidity);
+        liquidityProvided[newPoolId][msg.sender] = liquidity;
+        userPools[msg.sender].push(newPoolId);
+
+        emit PoolCreated(newPoolId, tokenId_, fractionsAmount_, msg.value, block.timestamp);
+        emit LiquidityAdded(newPoolId, msg.sender, fractionsAmount_, msg.value, liquidity, block.timestamp);
+
+        return newPoolId;
+    }
+
+    /**
+     * @notice Add liquidity to an existing pool
+     */
+    function addLiquidity(
+        uint256 poolId_,
+        uint256 fractionsAmount_
+    ) external payable whenNotPaused nonReentrant {
+        Pool storage pool = pools[poolId_];
+        require(pool.active, "Pool not active");
+        require(fractionsAmount_ > 0, "Invalid fractions");
+        require(msg.value > 0, "Invalid ETH amount");
+
+        // Calculate optimal amounts based on current ratio
+        uint256 optimalETH = (fractionsAmount_ * pool.reserveETH) / pool.reserveFractions;
+        require(msg.value >= optimalETH, "Insufficient ETH for ratio");
+
+        // Calculate LP tokens to mint
+        uint256 liquidity = (fractionsAmount_ * pool.totalLiquidity) / pool.reserveFractions;
+
+        // Transfer fractions
+        assetToken.transferFractional(pool.tokenId, address(this), fractionsAmount_);
+
+        // Update pool reserves
+        pool.reserveFractions += fractionsAmount_;
+        pool.reserveETH += optimalETH;
+        pool.totalLiquidity += liquidity;
+
+        // Mint LP tokens
+        _mint(msg.sender, liquidity);
+        liquidityProvided[poolId_][msg.sender] += liquidity;
+
+        if (liquidityProvided[poolId_][msg.sender] == liquidity) {
+            userPools[msg.sender].push(poolId_);
+        }
+
+        // Refund excess ETH
+        if (msg.value > optimalETH) {
+            payable(msg.sender).transfer(msg.value - optimalETH);
+        }
+
+        emit LiquidityAdded(poolId_, msg.sender, fractionsAmount_, optimalETH, liquidity, block.timestamp);
+    }
+
+    /**
+     * @notice Remove liquidity from a pool
+     */
+    function removeLiquidity(
+        uint256 poolId_,
+        uint256 lpTokens_
+    ) external nonReentrant {
+        Pool storage pool = pools[poolId_];
+        require(pool.active, "Pool not active");
+        require(lpTokens_ > 0, "Invalid LP tokens");
+        require(balanceOf(msg.sender) >= lpTokens_, "Insufficient LP tokens");
+
+        // Calculate amounts to return
+        uint256 fractionsAmount = (lpTokens_ * pool.reserveFractions) / pool.totalLiquidity;
+        uint256 ethAmount = (lpTokens_ * pool.reserveETH) / pool.totalLiquidity;
+
+        // Burn LP tokens
+        _burn(msg.sender, lpTokens_);
+        liquidityProvided[poolId_][msg.sender] -= lpTokens_;
+
+        // Update pool reserves
+        pool.reserveFractions -= fractionsAmount;
+        pool.reserveETH -= ethAmount;
+        pool.totalLiquidity -= lpTokens_;
+
+        // Transfer assets back
+        assetToken.transferFractional(pool.tokenId, msg.sender, fractionsAmount);
+        payable(msg.sender).transfer(ethAmount);
+
+        emit LiquidityRemoved(poolId_, msg.sender, lpTokens_, fractionsAmount, ethAmount, block.timestamp);
+    }
+
+    /**
+     * @notice Swap ETH for fractions
+     */
+    function swapETHForFractions(
+        uint256 poolId_,
+        uint256 minFractionsOut_
+    ) external payable whenNotPaused nonReentrant returns (uint256) {
+        Pool storage pool = pools[poolId_];
+        require(pool.active, "Pool not active");
+        require(msg.value > 0, "Invalid ETH amount");
+
+        // Calculate output amount using constant product formula
+        uint256 amountInWithFee = msg.value * (10000 - swapFeePercent) / 10000;
+        uint256 fractionsOut = _getAmountOut(
+            amountInWithFee,
+            pool.reserveETH,
+            pool.reserveFractions
+        );
+
+        require(fractionsOut >= minFractionsOut_, "Slippage exceeded");
+        require(fractionsOut < pool.reserveFractions, "Insufficient liquidity");
+
+        uint256 fee = msg.value - amountInWithFee;
+
+        // Update reserves
+        pool.reserveETH += msg.value;
+        pool.reserveFractions -= fractionsOut;
+        pool.lastPrice = (pool.reserveETH * 1e18) / pool.reserveFractions;
+
+        // Update volume
+        _updateVolume(pool, msg.value);
+
+        // Transfer fractions
+        assetToken.transferFractional(pool.tokenId, msg.sender, fractionsOut);
+
+        emit Swap(poolId_, msg.sender, true, msg.value, fractionsOut, fee, block.timestamp);
+
+        return fractionsOut;
+    }
+
+    /**
+     * @notice Swap fractions for ETH
+     */
+    function swapFractionsForETH(
+        uint256 poolId_,
+        uint256 fractionsIn_,
+        uint256 minETHOut_
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        Pool storage pool = pools[poolId_];
+        require(pool.active, "Pool not active");
+        require(fractionsIn_ > 0, "Invalid fractions amount");
+        require(
+            assetToken.fractionalOwnership(pool.tokenId, msg.sender) >= fractionsIn_,
+            "Insufficient fractions"
+        );
+
+        // Calculate output amount
+        uint256 fractionsInWithFee = fractionsIn_ * (10000 - swapFeePercent) / 10000;
+        uint256 ethOut = _getAmountOut(
+            fractionsInWithFee,
+            pool.reserveFractions,
+            pool.reserveETH
+        );
+
+        require(ethOut >= minETHOut_, "Slippage exceeded");
+        require(ethOut < pool.reserveETH, "Insufficient liquidity");
+
+        uint256 fee = fractionsIn_ - fractionsInWithFee;
+
+        // Transfer fractions in
+        assetToken.transferFractional(pool.tokenId, address(this), fractionsIn_);
+
+        // Update reserves
+        pool.reserveFractions += fractionsIn_;
+        pool.reserveETH -= ethOut;
+        pool.lastPrice = (pool.reserveETH * 1e18) / pool.reserveFractions;
+
+        // Update volume
+        _updateVolume(pool, ethOut);
+
+        // Transfer ETH out
+        payable(msg.sender).transfer(ethOut);
+
+        emit Swap(poolId_, msg.sender, false, fractionsIn_, ethOut, fee, block.timestamp);
+
+        return ethOut;
+    }
+
+    /**
+     * @notice Get amount out for a swap (constant product formula)
+     */
+    function _getAmountOut(
+        uint256 amountIn_,
+        uint256 reserveIn_,
+        uint256 reserveOut_
+    ) internal pure returns (uint256) {
+        require(amountIn_ > 0, "Invalid input amount");
+        require(reserveIn_ > 0 && reserveOut_ > 0, "Insufficient liquidity");
+
+        uint256 numerator = amountIn_ * reserveOut_;
+        uint256 denominator = reserveIn_ + amountIn_;
+
+        return numerator / denominator;
+    }
+
+    /**
+     * @notice Get quote for adding liquidity
+     */
+    function getAddLiquidityQuote(
+        uint256 poolId_,
+        uint256 fractionsAmount_
+    ) external view returns (uint256 ethRequired, uint256 lpTokens) {
+        Pool storage pool = pools[poolId_];
+        require(pool.active, "Pool not active");
+
+        ethRequired = (fractionsAmount_ * pool.reserveETH) / pool.reserveFractions;
+        lpTokens = (fractionsAmount_ * pool.totalLiquidity) / pool.reserveFractions;
+    }
+
+    /**
+     * @notice Get quote for swap
+     */
+    function getSwapQuote(
+        uint256 poolId_,
+        uint256 amountIn_,
+        bool ethToFractions_
+    ) external view returns (uint256 amountOut, uint256 priceImpact) {
+        Pool storage pool = pools[poolId_];
+        require(pool.active, "Pool not active");
+
+        uint256 amountInWithFee = amountIn_ * (10000 - swapFeePercent) / 10000;
+
+        if (ethToFractions_) {
+            amountOut = _getAmountOut(amountInWithFee, pool.reserveETH, pool.reserveFractions);
+            priceImpact = ((amountIn_ * 10000) / pool.reserveETH);
+        } else {
+            amountOut = _getAmountOut(amountInWithFee, pool.reserveFractions, pool.reserveETH);
+            priceImpact = ((amountIn_ * 10000) / pool.reserveFractions);
+        }
+    }
+
+    /**
+     * @notice Update 24h volume
+     */
+    function _updateVolume(Pool storage pool, uint256 amount_) internal {
+        if (block.timestamp > pool.volumeTimestamp + 24 hours) {
+            pool.volume24h = amount_;
+            pool.volumeTimestamp = block.timestamp;
+        } else {
+            pool.volume24h += amount_;
+        }
+    }
+
+    /**
+     * @notice Calculate square root (Babylonian method)
+     */
+    function _sqrt(uint256 x) internal pure returns (uint256) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        uint256 y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+        return y;
+    }
+
+    /**
+     * @notice Update swap fee
+     */
+    function updateSwapFee(uint256 newFeePercent_) external onlyRole(FEE_MANAGER_ROLE) {
+        require(newFeePercent_ <= 500, "Fee too high"); // Max 5%
+
+        uint256 oldFee = swapFeePercent;
+        swapFeePercent = newFeePercent_;
+
+        emit SwapFeeUpdated(oldFee, newFeePercent_, block.timestamp);
+    }
+
+    /**
+     * @notice Get pool by token ID
+     */
+    function getPoolByToken(uint256 tokenId_) external view returns (Pool memory) {
+        uint256 poolId = tokenToPool[tokenId_];
+        require(poolId > 0, "Pool not found");
+        return pools[poolId];
+    }
+
+    /**
+     * @notice Get user's pools
+     */
+    function getUserPools(address user_) external view returns (uint256[] memory) {
+        return userPools[user_];
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

@@ -1,0 +1,801 @@
+# CRITICAL SECURITY FIXES REQUIRED
+
+**Date:** November 15, 2025
+**Severity:** CRITICAL - DO NOT DEPLOY WITHOUT THESE FIXES
+**Status:** 6 CRITICAL vulnerabilities identified, fixes detailed below
+
+---
+
+## OVERVIEW
+
+The security audit identified 6 CRITICAL vulnerabilities that MUST be fixed before production deployment. This document provides detailed fix instructions for each issue.
+
+---
+
+## C-1: Missing Asset Validation in CollateralManager Transfers
+
+**File:** `contracts/BancafiLending.sol:367-372`
+**Severity:** CRITICAL
+**Risk:** Users could lock collateral without actually transferring tokens
+
+### Current Vulnerable Code:
+```solidity
+// BancafiLending.sol createBorrowRequest()
+if (hasCollateral) {
+    require(supportedAssets[collateralAsset], "Collateral asset not supported");
+    IERC20(collateralAsset).safeTransferFrom(
+        msg.sender,
+        address(collateralManager),
+        collateralAmount
+    );
+    collateralManager.lockCollateral(msg.sender, collateralAsset, collateralAmount);
+}
+```
+
+### Problem:
+1. Tokens transferred to CollateralManager
+2. `lockCollateral()` called but doesn't verify receipt
+3. Malicious ERC20 with broken `transferFrom` could fake the transfer
+4. CollateralManager records lock without actually holding tokens
+
+### Fix Required:
+
+**Option 1: Add balance verification in CollateralManager.lockCollateral()**
+```solidity
+function lockCollateral(
+    address user,
+    address asset,
+    uint256 amount
+) external override onlyAuthorized whenNotPaused validAsset(asset) returns (uint256) {
+    require(user != address(0), "Invalid user address");
+    require(amount > 0, "Amount must be positive");
+
+    // SECURITY FIX: Verify tokens actually received
+    uint256 balanceBefore = IERC20(asset).balanceOf(address(this));
+
+    // Note: Caller should have transferred tokens before calling this
+    // This check ensures they were actually received
+    uint256 balanceAfter = IERC20(asset).balanceOf(address(this));
+
+    // For fee-on-transfer tokens, use actual received amount
+    uint256 actualReceived = balanceAfter - balanceBefore;
+    require(actualReceived > 0, "No tokens received");
+
+    // Rest of function using actualReceived instead of amount
+    uint256 lockId = nextLockId++;
+
+    collateralLocks[lockId] = CollateralLock({
+        id: lockId,
+        user: user,
+        asset: asset,
+        amount: actualReceived,  // Changed
+        lockedAt: block.timestamp,
+        isActive: true
+    });
+
+    userCollateralBalance[user][asset] += actualReceived;  // Changed
+    userLocks[user].push(lockId);
+
+    emit CollateralLocked(user, asset, actualReceived, lockId);  // Changed
+
+    return lockId;
+}
+```
+
+**Option 2 (Better): Modify BancafiLending to handle transfer inside CollateralManager**
+```solidity
+// In BancafiLending.sol
+if (hasCollateral) {
+    require(supportedAssets[collateralAsset], "Collateral asset not supported");
+
+    // Approve CollateralManager to pull tokens
+    IERC20(collateralAsset).safeTransferFrom(
+        msg.sender,
+        address(this),
+        collateralAmount
+    );
+    IERC20(collateralAsset).approve(address(collateralManager), collateralAmount);
+
+    // Let CollateralManager pull and verify
+    collateralManager.lockCollateralWithTransfer(
+        msg.sender,
+        collateralAsset,
+        collateralAmount
+    );
+}
+
+// In CollateralManager.sol - Add new function
+function lockCollateralWithTransfer(
+    address user,
+    address asset,
+    uint256 amount
+) external override onlyAuthorized whenNotPaused validAsset(asset) returns (uint256) {
+    require(user != address(0), "Invalid user address");
+    require(amount > 0, "Amount must be positive");
+
+    // Pull tokens and verify receipt
+    uint256 balanceBefore = IERC20(asset).balanceOf(address(this));
+    IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+    uint256 balanceAfter = IERC20(asset).balanceOf(address(this));
+
+    uint256 actualReceived = balanceAfter - balanceBefore;
+    require(actualReceived >= amount, "Transfer failed or fee-on-transfer");
+
+    // Continue with lock logic...
+}
+```
+
+**Recommendation:** Use Option 2 for maximum security
+
+---
+
+## C-2: Oracle Price Manipulation via Emergency Mode
+
+**File:** `contracts/BancafiPriceOracle.sol:461-471`
+**Severity:** CRITICAL
+**Risk:** Owner can set arbitrary prices bypassing circuit breakers
+
+### Current Vulnerable Code:
+```solidity
+function setEmergencyPrice(
+    address asset,
+    uint256 price
+) external onlyOwner supportedAsset(asset) {
+    require(emergencyMode, "Not in emergency mode");
+    require(price > 0, "Invalid price");
+
+    emergencyPrices[asset] = price;  // NO BOUNDS CHECKING!
+
+    emit EmergencyPriceSet(asset, price);
+}
+```
+
+### Problem:
+1. Emergency prices bypass `minPrice/maxPrice` circuit breakers
+2. Compromised owner account can manipulate prices
+3. Could set ETH = $1 and liquidate all positions unfairly
+4. Could set loan assets high and drain collateral
+
+### Fix Required:
+```solidity
+function setEmergencyPrice(
+    address asset,
+    uint256 price
+) external onlyOwner supportedAsset(asset) {
+    require(emergencyMode, "Not in emergency mode");
+    require(price > 0, "Invalid price");
+
+    PriceFeed memory feed = priceFeeds[asset];
+
+    // SECURITY FIX C-2: Emergency prices MUST respect circuit breakers
+    require(
+        _isWithinBounds(price, feed.minPrice, feed.maxPrice),
+        "Emergency price outside circuit breaker bounds"
+    );
+
+    // Additional protection: Cannot deviate more than 50% from last Chainlink price
+    if (feed.fallbackPrice > 0) {
+        uint256 maxDeviation = (feed.fallbackPrice * 5000) / 10000; // 50%
+        require(
+            price >= feed.fallbackPrice - maxDeviation &&
+            price <= feed.fallbackPrice + maxDeviation,
+            "Emergency price deviates too much from last known price"
+        );
+    }
+
+    emergencyPrices[asset] = price;
+
+    emit EmergencyPriceSet(asset, price);
+}
+```
+
+### Additional Recommendations:
+1. Use multi-sig wallet as owner
+2. Implement timelock for emergency mode activation (24-48 hours)
+3. Add event monitoring for emergency mode changes
+4. Require multiple admins to approve emergency prices
+
+---
+
+## C-3: Interest Calculation Overflow in BancafiLending
+
+**File:** `contracts/BancafiLending.sol:647`
+**Severity:** CRITICAL
+**Risk:** Overflow for large loans causing incorrect debt calculations
+
+### Current Vulnerable Code:
+```solidity
+function calculateTotalOwed(uint256 loanId) public view validLoan(loanId) returns (uint256) {
+    Loan memory loan = loans[loanId];
+    uint256 interest = (loan.principal * loan.interestRate * loan.duration) / (365 days * BASIS_POINTS);
+    return loan.principal + interest;
+}
+```
+
+### Problem:
+For large loans, `principal * interestRate * duration` can overflow BEFORE division:
+
+```
+principal = 1e30 (1 trillion USDC with 18 decimals)
+interestRate = 1000 (10%)
+duration = 365 days = 31536000
+
+Calculation: (1e30 * 1000 * 31536000) / (31536000 * 10000)
+            = 31.536e36 / 315360000
+            = OVERFLOW (exceeds uint256 max)
+```
+
+### Fix Required:
+```solidity
+function calculateTotalOwed(uint256 loanId) public view validLoan(loanId) returns (uint256) {
+    Loan memory loan = loans[loanId];
+
+    // SECURITY FIX C-3: Prevent overflow in interest calculation
+    // Refactor to calculate interest rate per second first
+
+    // Interest rate per second (scaled by 1e18 for precision)
+    uint256 ratePerSecond = (loan.interestRate * 1e18) / (365 days * BASIS_POINTS);
+
+    // Interest = principal * rate * duration (with proper scaling)
+    uint256 interest = (loan.principal * ratePerSecond * loan.duration) / 1e18;
+
+    return loan.principal + interest;
+}
+```
+
+### Alternative Fix (More Precise):
+```solidity
+function calculateTotalOwed(uint256 loanId) public view validLoan(loanId) returns (uint256) {
+    Loan memory loan = loans[loanId];
+
+    // Calculate interest using compound-safe formula
+    // Break into smaller operations to prevent overflow
+
+    uint256 annualRate = loan.interestRate; // basis points
+    uint256 durationInSeconds = loan.duration;
+    uint256 secondsPerYear = 365 days;
+
+    // Calculate: principal * (1 + rate * time / (BASIS_POINTS * secondsPerYear))
+    // Simplified for simple interest
+
+    uint256 rateMultiplier = (annualRate * durationInSeconds) / secondsPerYear;
+    uint256 interest = (loan.principal * rateMultiplier) / BASIS_POINTS;
+
+    return loan.principal + interest;
+}
+```
+
+**Recommendation:** Use alternative fix for better precision
+
+---
+
+## C-4: Reentrancy in CollateralManager.liquidateCollateral
+
+**File:** `contracts/CollateralManager.sol:171-190`
+**Severity:** CRITICAL
+**Risk:** Reentrancy through malicious ERC777 tokens
+
+### Current Vulnerable Code:
+```solidity
+function liquidateCollateral(
+    address user,
+    address recipient,
+    address asset,
+    uint256 amount
+) external override onlyAuthorized nonReentrant {
+    require(user != address(0), "Invalid user address");
+    require(recipient != address(0), "Invalid recipient address");
+    require(amount > 0, "Amount must be positive");
+    require(userCollateralBalance[user][asset] >= amount, "Insufficient collateral");
+
+    userCollateralBalance[user][asset] -= amount;  // State update
+
+    // Find and deactivate corresponding lock(s)
+    _deactivateLocks(user, asset, amount);  // State update
+
+    IERC20(asset).safeTransfer(recipient, amount);  // EXTERNAL CALL!
+
+    emit CollateralLiquidated(user, recipient, asset, amount);
+}
+```
+
+### Problem:
+1. External call (`safeTransfer`) happens BEFORE event emission
+2. If `asset` is ERC777, it has `tokensReceived` hook
+3. Malicious token can reenter through authorized callers (BancafiLending)
+4. Could manipulate state between balance update and lock deactivation
+
+### Fix Required:
+```solidity
+function liquidateCollateral(
+    address user,
+    address recipient,
+    address asset,
+    uint256 amount
+) external override onlyAuthorized nonReentrant {
+    require(user != address(0), "Invalid user address");
+    require(recipient != address(0), "Invalid recipient address");
+    require(amount > 0, "Amount must be positive");
+    require(userCollateralBalance[user][asset] >= amount, "Insufficient collateral");
+
+    // SECURITY FIX C-4: ALL state changes BEFORE external call
+    userCollateralBalance[user][asset] -= amount;
+
+    // Deactivate locks
+    _deactivateLocks(user, asset, amount);
+
+    // Emit event
+    emit CollateralLiquidated(user, recipient, asset, amount);
+
+    // External call LAST (Checks-Effects-Interactions pattern)
+    IERC20(asset).safeTransfer(recipient, amount);
+}
+```
+
+### Additional Protection:
+Add ERC777 detection and blocking:
+```solidity
+// Add to CollateralManager contract
+bytes4 private constant ERC777_INTERFACE_ID = 0xe58e113c;
+
+function configureAsset(...) external onlyOwner {
+    // ... existing code ...
+
+    // SECURITY: Block ERC777 tokens
+    try IERC165(asset).supportsInterface(ERC777_INTERFACE_ID) returns (bool isERC777) {
+        require(!isERC777, "ERC777 tokens not supported (reentrancy risk)");
+    } catch {
+        // Not ERC165 compliant, allow
+    }
+
+    // ... rest of function ...
+}
+```
+
+---
+
+## C-5: Flash Loan Protection Bypass via Block Number
+
+**File:** `contracts/libraries/FlashLoanProtection.sol:59-98`
+**Severity:** CRITICAL
+**Risk:** Block number manipulation on L2s and by miners/validators
+
+### Current Vulnerable Code:
+```solidity
+function checkAndRecordAction(
+    ProtectionState storage self,
+    address user
+) internal returns (bool allowed) {
+    if (!self.enabled) {
+        return true;
+    }
+
+    uint256 currentBlock = block.number;  // MANIPULATABLE!
+
+    // Reset counter if new block
+    if (self.lastActionBlock[user] != currentBlock) {
+        self.actionCountInBlock[user] = 0;
+        self.lastActionBlock[user] = currentBlock;
+    }
+
+    // Increment action count
+    self.actionCountInBlock[user]++;
+
+    // Check if exceeded max actions
+    if (self.actionCountInBlock[user] > self.maxActionsPerBlock) {
+        emit FlashLoanAttemptBlocked(
+            user,
+            "Too many actions in single block",
+            currentBlock
+        );
+        return false;
+    }
+
+    return true;
+}
+```
+
+### Problem:
+1. **L2 Networks:** Sequencers can include 100+ transactions in single block
+2. **Miners/Validators:** Can manipulate block.number by including/excluding transactions
+3. **Sybil Attack:** Attacker uses different addresses to bypass per-address limit
+4. **Same-block exploitation:** Multiple addresses can drain protocol in one block
+
+### Fix Required:
+Add timestamp-based rate limiting as backup:
+```solidity
+struct ProtectionState {
+    mapping(address => uint256) lastActionBlock;
+    mapping(address => uint256) actionCountInBlock;
+    mapping(bytes32 => bool) completedInSameBlock;
+    uint256 maxActionsPerBlock;
+    bool enabled;
+
+    // SECURITY FIX C-5: Add timestamp-based protection
+    mapping(address => uint256) lastActionTimestamp;
+    mapping(address => uint256) actionsInTimeWindow;
+    uint256 timeWindowSeconds;  // e.g., 60 seconds
+    uint256 minActionDelay;     // e.g., 12 seconds
+    uint256 maxActionsPerWindow;
+}
+
+function initialize(
+    ProtectionState storage self,
+    uint256 maxActionsPerBlock
+) internal {
+    self.maxActionsPerBlock = maxActionsPerBlock > 0 ? maxActionsPerBlock : DEFAULT_MAX_ACTIONS;
+    self.enabled = true;
+
+    // SECURITY FIX C-5: Initialize timestamp protection
+    self.timeWindowSeconds = 60;      // 1 minute window
+    self.minActionDelay = 12;          // Minimum 12 seconds between actions
+    self.maxActionsPerWindow = 5;     // Max 5 actions per minute
+}
+
+function checkAndRecordAction(
+    ProtectionState storage self,
+    address user
+) internal returns (bool allowed) {
+    if (!self.enabled) {
+        return true;
+    }
+
+    uint256 currentBlock = block.number;
+    uint256 currentTime = block.timestamp;
+
+    // SECURITY FIX C-5: Dual protection - block AND timestamp
+
+    // 1. Block-based protection (existing)
+    if (self.lastActionBlock[user] != currentBlock) {
+        self.actionCountInBlock[user] = 0;
+        self.lastActionBlock[user] = currentBlock;
+    }
+
+    self.actionCountInBlock[user]++;
+
+    if (self.actionCountInBlock[user] > self.maxActionsPerBlock) {
+        emit FlashLoanAttemptBlocked(
+            user,
+            "Too many actions in single block",
+            currentBlock
+        );
+        return false;
+    }
+
+    // 2. Timestamp-based protection (NEW)
+    // Reset counter if outside time window
+    if (currentTime > self.lastActionTimestamp[user] + self.timeWindowSeconds) {
+        self.actionsInTimeWindow[user] = 0;
+    }
+
+    // Check minimum delay between actions
+    if (currentTime < self.lastActionTimestamp[user] + self.minActionDelay) {
+        emit FlashLoanAttemptBlocked(
+            user,
+            "Actions too frequent (timestamp check)",
+            currentBlock
+        );
+        return false;
+    }
+
+    self.actionsInTimeWindow[user]++;
+    self.lastActionTimestamp[user] = currentTime;
+
+    // Check time window limit
+    if (self.actionsInTimeWindow[user] > self.maxActionsPerWindow) {
+        emit FlashLoanAttemptBlocked(
+            user,
+            "Too many actions in time window",
+            currentBlock
+        );
+        return false;
+    }
+
+    return true;
+}
+```
+
+### Additional Recommendations:
+1. Add global rate limiting (across all users)
+2. Implement exponential backoff for repeated violations
+3. Add cross-address pattern detection (identify Sybil attacks)
+
+---
+
+## C-6: Missing Slippage Protection in Liquidations
+
+**File:** `contracts/MultiAssetCollateralManager.sol:387-448`
+**Severity:** CRITICAL
+**Risk:** Liquidators profit from stale prices, lenders lose funds
+
+### Current Vulnerable Code:
+```solidity
+function liquidateBasket(uint256 basketId, address recipient)
+    external
+    nonReentrant
+    validBasket(basketId)
+    onlyRole(LIQUIDATOR_ROLE)
+    returns (uint256)
+{
+    require(recipient != address(0), "Invalid recipient");
+
+    CollateralBasket storage basket = collateralBaskets[basketId];
+    require(!basket.isLiquidated, "Already liquidated");
+
+    uint256 liquidationId = nextLiquidationId++;
+    uint256 totalLiquidatedValue;
+
+    // Liquidate all assets in basket
+    for (uint256 i = 0; i < basket.assets.length; i++) {
+        CollateralAsset memory collateral = basket.assets[i];
+
+        // Calculate liquidation bonus
+        uint256 bonus = assetConfigs[collateral.asset].liquidationBonus;
+        uint256 liquidationAmount = collateral.amount + (collateral.amount * bonus) / BASIS_POINTS;
+
+        // Transfer to liquidator
+        IERC20(collateral.asset).safeTransfer(recipient, liquidationAmount);
+
+        // NO PRICE CHECK! Uses stored amount without verifying current value
+        uint256 liquidatedValue = _getAssetValueUSD(collateral.asset, liquidationAmount);
+        totalLiquidatedValue += liquidatedValue;
+    }
+
+    // ... rest of function
+}
+```
+
+### Problem:
+1. Liquidation uses STORED collateral amounts without checking CURRENT prices
+2. If prices crash between liquidation trigger and execution, liquidator profits unfairly
+3. Example:
+   - ETH drops from $2000 → $1000 (50% crash)
+   - Liquidator gets collateral at $2000 price + 5% bonus
+   - Actual value is $1000
+   - Lender gets nothing, loses everything
+
+### Fix Required:
+```solidity
+function liquidateBasket(
+    uint256 basketId,
+    address recipient,
+    uint256 minTotalValueUSD  // ADDED: Slippage protection
+) external
+    nonReentrant
+    validBasket(basketId)
+    onlyRole(LIQUIDATOR_ROLE)
+    returns (uint256)
+{
+    require(recipient != address(0), "Invalid recipient");
+
+    CollateralBasket storage basket = collateralBaskets[basketId];
+    require(!basket.isLiquidated, "Already liquidated");
+
+    // SECURITY FIX C-6: Check current basket value with slippage protection
+    uint256 currentBasketValue = this.getBasketValue(basketId);
+    require(
+        currentBasketValue >= minTotalValueUSD,
+        "Slippage: basket value below minimum"
+    );
+
+    uint256 liquidationId = nextLiquidationId++;
+    uint256 totalLiquidatedValue;
+
+    address[] memory liquidatedAssets = new address[](basket.assets.length);
+    uint256[] memory liquidatedAmounts = new uint256[](basket.assets.length);
+
+    // Liquidate all assets in basket
+    for (uint256 i = 0; i < basket.assets.length; i++) {
+        CollateralAsset memory collateral = basket.assets[i];
+
+        // SECURITY FIX C-6: Verify current price before liquidation
+        uint256 currentAssetValue = _getAssetValueUSD(collateral.asset, collateral.amount);
+        require(currentAssetValue > 0, "Asset price unavailable");
+
+        // Calculate liquidation bonus
+        uint256 bonus = assetConfigs[collateral.asset].liquidationBonus;
+        uint256 liquidationAmount = collateral.amount + (collateral.amount * bonus) / BASIS_POINTS;
+
+        // Cap at available balance
+        uint256 contractBalance = IERC20(collateral.asset).balanceOf(address(this));
+        if (liquidationAmount > contractBalance) {
+            liquidationAmount = contractBalance;
+        }
+
+        // Transfer to liquidator
+        IERC20(collateral.asset).safeTransfer(recipient, liquidationAmount);
+
+        uint256 liquidatedValue = _getAssetValueUSD(collateral.asset, liquidationAmount);
+        totalLiquidatedValue += liquidatedValue;
+
+        liquidatedAssets[i] = collateral.asset;
+        liquidatedAmounts[i] = liquidationAmount;
+    }
+
+    // SECURITY FIX C-6: Final slippage check
+    require(
+        totalLiquidatedValue >= minTotalValueUSD,
+        "Slippage: total liquidation value below minimum"
+    );
+
+    // Record liquidation
+    liquidationHistory[liquidationId] = LiquidationInfo({
+        basketId: basketId,
+        liquidator: msg.sender,
+        liquidatedValueUSD: totalLiquidatedValue,
+        timestamp: block.timestamp,
+        assetsLiquidated: liquidatedAssets,
+        amountsLiquidated: liquidatedAmounts
+    });
+
+    basket.isActive = false;
+    basket.isLiquidated = true;
+    totalActiveBasks--;
+    totalLiquidations++;
+    totalValueLockedUSD -= basket.totalValueUSD;
+
+    emit BasketLiquidated(basketId, liquidationId, msg.sender, totalLiquidatedValue);
+
+    return liquidationId;
+}
+```
+
+### Additional Protection for BancafiLending.liquidateLoan():
+```solidity
+// In BancafiLending.sol
+function liquidateLoan(
+    uint256 loanId,
+    uint256 minCollateralValue  // ADDED: Slippage protection
+) external nonReentrant validLoan(loanId) {
+    Loan storage loan = loans[loanId];
+    require(
+        loan.status == LoanStatus.Active || loan.status == LoanStatus.PartiallyRepaid,
+        "Loan not active"
+    );
+    require(block.timestamp > loan.startTime + loan.duration, "Loan not overdue");
+    require(
+        msg.sender == loan.lender || msg.sender == owner(),
+        "Only lender or owner can liquidate"
+    );
+
+    uint256 totalOwed = calculateTotalOwed(loanId);
+    uint256 remainingDebt = totalOwed - loan.repaidAmount;
+
+    // Handle collateral if present
+    if (loan.hasCollateral) {
+        // SECURITY FIX C-6: Verify current collateral value
+        uint256 collateralValue = collateralManager.getCollateralValue(
+            loan.collateralAsset,
+            loan.collateralAmount
+        );
+
+        // Slippage protection
+        require(
+            collateralValue >= minCollateralValue,
+            "Slippage: collateral value too low"
+        );
+
+        collateralManager.liquidateCollateral(
+            loan.borrower,
+            loan.lender,
+            loan.collateralAsset,
+            loan.collateralAmount
+        );
+
+        // Use actual current value for debt coverage calculation
+        uint256 debtCovered = collateralValue < remainingDebt ? collateralValue : remainingDebt;
+
+        emit LoanLiquidated(loanId, loan.borrower, loan.collateralAmount, debtCovered, block.timestamp);
+
+        loan.status = LoanStatus.Liquidated;
+    }
+
+    loan.lastUpdateTime = block.timestamp;
+    totalActiveLoans--;
+
+    // ... rest of function
+}
+```
+
+---
+
+## IMPLEMENTATION CHECKLIST
+
+- [ ] **C-1: Asset Validation** - Modify `CollateralManager.lockCollateral()` to verify token receipt
+- [ ] **C-2: Oracle Emergency Mode** - Add circuit breaker enforcement to `setEmergencyPrice()`
+- [ ] **C-3: Interest Overflow** - Refactor `calculateTotalOwed()` to prevent overflow
+- [ ] **C-4: Reentrancy** - Move external calls to end of `liquidateCollateral()`
+- [ ] **C-5: Flash Loan Protection** - Add timestamp-based rate limiting to `FlashLoanProtection.sol`
+- [ ] **C-6: Slippage Protection** - Add `minValue` parameters to liquidation functions
+
+---
+
+## TESTING REQUIREMENTS
+
+After implementing fixes, MUST create tests for:
+
+1. **C-1 Tests:**
+   - Test with malicious ERC20 that doesn't transfer
+   - Test with fee-on-transfer tokens
+   - Test balance verification catches fake transfers
+
+2. **C-2 Tests:**
+   - Test emergency price cannot exceed circuit breakers
+   - Test 50% deviation limit enforcement
+   - Test emergency mode with various price scenarios
+
+3. **C-3 Tests:**
+   - Test interest calculation with max uint256 values
+   - Test with various loan amounts (1e18, 1e24, 1e30)
+   - Test long durations (10 years+)
+
+4. **C-4 Tests:**
+   - Test liquidation with malicious ERC777 token
+   - Test reentrancy attempt through authorized caller
+   - Verify Checks-Effects-Interactions pattern
+
+5. **C-5 Tests:**
+   - Test timestamp-based rate limiting
+   - Test minimum action delay enforcement
+   - Test time window limits
+   - Test on L2 networks with high TPS
+
+6. **C-6 Tests:**
+   - Test liquidation with 50% price drop
+   - Test slippage rejection when value too low
+   - Test minValue parameter enforcement
+
+---
+
+## DEPLOYMENT PROCEDURE
+
+1. ✅ Implement all 6 fixes in development environment
+2. ✅ Write comprehensive test suite (85%+ coverage)
+3. ✅ Run tests on local Hardhat network
+4. ✅ Deploy to testnet (Sepolia)
+5. ✅ Run testnet security tests
+6. ✅ Engage external audit firm (Trail of Bits, Quantstamp)
+7. ✅ Address audit findings
+8. ✅ Second audit review
+9. ✅ Set up multi-sig wallet
+10. ✅ Deploy to mainnet with TVL caps
+11. ✅ Monitor for 30 days before removing limits
+
+---
+
+## ESTIMATED TIMELINE
+
+- **Fix Implementation:** 1 week
+- **Testing:** 1 week
+- **External Audit:** 8-12 weeks
+- **Remediation:** 2 weeks
+- **Second Audit:** 4 weeks
+- **Deployment:** 1 week
+
+**Total: 16-20 weeks to production**
+
+---
+
+## COST ESTIMATES
+
+- Development time: $15,000
+- Testing & QA: $10,000
+- External audit #1: $75,000
+- External audit #2: $50,000
+- Deployment & monitoring: $5,000
+
+**Total: ~$155,000**
+
+---
+
+## PRIORITY
+
+🔴 **CRITICAL - BLOCK PRODUCTION DEPLOYMENT**
+
+These vulnerabilities represent CRITICAL security risks. DO NOT deploy to mainnet until all 6 issues are resolved and externally audited.
+
+---
+
+**Report End**
+
+*This document must be reviewed by the development team, security team, and external auditors before proceeding with fixes.*

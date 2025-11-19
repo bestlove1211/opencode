@@ -1,0 +1,82 @@
+const express = require('express');
+const router = express.Router();
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+// GET /api/analytics/tvl
+router.get('/tvl', async (req, res) => {
+  try {
+    const tvl = await blockchain.contracts.analytics.calculateTotalValueLocked();
+
+    res.json({
+      totalValueLocked: ethers.formatEther(tvl),
+      currency: 'ETH'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/analytics/health-score
+router.get('/health-score', async (req, res) => {
+  try {
+    const healthScore = await blockchain.contracts.analytics.calculateHealthScore();
+
+    res.json({
+      healthScore: Number(healthScore),
+      maxScore: 100,
+      rating: getHealthRating(Number(healthScore))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/analytics/snapshot
+router.get('/snapshot', async (req, res) => {
+  try {
+    const snapshot = await blockchain.contracts.analytics.getSystemSnapshot();
+
+    res.json({
+      totalValueLocked: ethers.formatEther(snapshot.totalValueLocked),
+      totalAssets: Number(snapshot.totalAssets),
+      totalStakers: Number(snapshot.totalStakers),
+      totalMarketplaceVolume: ethers.formatEther(snapshot.totalMarketplaceVolume),
+      dailyVolume: ethers.formatEther(snapshot.dailyVolume),
+      lastUpdated: Number(snapshot.lastUpdated),
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/analytics/metrics
+router.get('/metrics', async (req, res) => {
+  try {
+    const metrics = await blockchain.contracts.analytics.currentMetrics();
+
+    res.json({
+      totalValueLocked: ethers.formatEther(metrics.totalValueLocked),
+      totalAssets: Number(metrics.totalAssets),
+      totalFractionalizedAssets: Number(metrics.totalFractionalizedAssets),
+      totalActiveBailouts: Number(metrics.totalActiveBailouts),
+      totalStakers: Number(metrics.totalStakers),
+      totalMarketplaceVolume: ethers.formatEther(metrics.totalMarketplaceVolume),
+      totalInsurancePremiums: ethers.formatEther(metrics.totalInsurancePremiums),
+      lastUpdated: Number(metrics.lastUpdated)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function getHealthRating(score) {
+  if (score >= 80) return 'Excellent';
+  if (score >= 60) return 'Good';
+  if (score >= 40) return 'Fair';
+  if (score >= 20) return 'Poor';
+  return 'Critical';
+}
+
+module.exports = router;

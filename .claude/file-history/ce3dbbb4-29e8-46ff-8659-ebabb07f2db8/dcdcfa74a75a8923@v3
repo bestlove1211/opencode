@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title DataTypes
+ * @notice Central library for all data structures used across Bancafi contracts
+ */
+library DataTypes {
+    // ============ Enums ============
+
+    enum DebtType {
+        PHYSICAL,    // Traditional debt (loans, mortgages, etc.)
+        DIGITAL      // Crypto-native debt
+    }
+
+    enum InterestType {
+        FIXED,
+        VARIABLE
+    }
+
+    enum PaymentFrequency {
+        DAILY,
+        WEEKLY,
+        BIWEEKLY,
+        MONTHLY,
+        QUARTERLY,
+        SEMIANNUALLY,
+        ANNUALLY
+    }
+
+    enum DebtStatus {
+        ACTIVE,
+        DEFAULTED,
+        PAID_OFF,
+        RESTRUCTURED,
+        IN_LIQUIDATION
+    }
+
+    enum ListingType {
+        FIXED_PRICE,
+        AUCTION,
+        OFFER_ONLY
+    }
+
+    enum ListingStatus {
+        ACTIVE,
+        SOLD,
+        CANCELLED,
+        EXPIRED
+    }
+
+    enum OrderType {
+        MARKET,
+        LIMIT,
+        STOP_LOSS
+    }
+
+    enum KYCLevel {
+        NONE,           // 0 - No verification
+        BASIC,          // 1 - Email/phone
+        IDENTITY,       // 2 - Document verification
+        ACCREDITED,     // 3 - Accredited investor
+        INSTITUTIONAL   // 4 - Institutional verification
+    }
+
+    enum ComplianceStatus {
+        PENDING,
+        APPROVED,
+        REJECTED,
+        SUSPENDED,
+        REVOKED
+    }
+
+    enum CollateralType {
+        REAL_ESTATE,
+        VEHICLE,
+        CRYPTO_ASSET,
+        STOCK,
+        BOND,
+        EQUIPMENT,
+        INVENTORY,
+        OTHER
+    }
+
+    // ============ Structs ============
+
+    /**
+     * @notice Core debt metadata
+     */
+    struct DebtMetadata {
+        DebtType debtType;
+        uint256 principalAmount;
+        string currency;                    // e.g., "USD", "ETH", "USDC"
+        uint256 interestRate;               // Basis points (e.g., 500 = 5%)
+        InterestType interestType;
+        uint256 originationDate;
+        uint256 maturityDate;
+        address debtor;
+        address originalCreditor;
+        string riskRating;                  // e.g., "AAA", "BB+", etc.
+        bytes32 legalDocumentHash;          // IPFS hash of legal documents
+        DebtStatus status;
+        uint256 outstandingBalance;
+        uint256 totalPaid;
+        uint256 missedPayments;
+    }
+
+    /**
+     * @notice Repayment schedule information
+     */
+    struct RepaymentSchedule {
+        PaymentFrequency frequency;
+        uint256 installmentAmount;
+        uint256 numberOfPayments;
+        uint256 paymentsMade;
+        uint256 nextPaymentDate;
+        uint256 gracePeriodDays;
+        uint256 lateFeePercentage;          // Basis points
+    }
+
+    /**
+     * @notice Collateral information
+     */
+    struct Collateral {
+        CollateralType collateralType;
+        string description;
+        uint256 valuationAmount;
+        string valuationCurrency;
+        uint256 valuationDate;
+        bytes32 documentHash;               // IPFS hash of collateral docs
+        bool liquidated;
+        uint256 liquidationAmount;
+    }
+
+    /**
+     * @notice Marketplace listing
+     */
+    struct Listing {
+        uint256 listingId;
+        uint256 tokenId;
+        address seller;
+        uint256 price;
+        uint256 minOffer;                   // Minimum acceptable offer
+        ListingType listingType;
+        ListingStatus status;
+        uint256 createdAt;
+        uint256 expiresAt;
+        bool allowOffers;
+    }
+
+    /**
+     * @notice Auction information
+     */
+    struct Auction {
+        uint256 auctionId;
+        uint256 tokenId;
+        address seller;
+        uint256 startingBid;
+        uint256 currentBid;
+        address currentBidder;
+        uint256 bidIncrement;
+        uint256 startTime;
+        uint256 endTime;
+        bool ended;
+        address winner;
+        uint256 finalPrice;
+    }
+
+    /**
+     * @notice Buyer offer on a debt token
+     */
+    struct Offer {
+        uint256 offerId;
+        uint256 tokenId;
+        address buyer;
+        uint256 amount;
+        uint256 expiresAt;
+        bool accepted;
+        bool rejected;
+        bool cancelled;
+        string message;                     // Optional message to seller
+    }
+
+    /**
+     * @notice KYC data for users
+     */
+    struct KYCData {
+        KYCLevel level;
+        ComplianceStatus status;
+        uint256 verifiedAt;
+        uint256 expiresAt;
+        string verificationProvider;        // e.g., "Onfido", "Jumio"
+        bytes32 verificationHash;
+        bool isWhitelisted;
+        bool isBlacklisted;
+        string blacklistReason;
+        uint256 transactionLimit;           // Daily limit based on KYC level
+        uint256 dailyVolume;                // Tracked daily volume
+        uint256 lastTransactionDate;
+    }
+
+    /**
+     * @notice Institutional profile
+     */
+    struct InstitutionalProfile {
+        string entityName;
+        string registrationNumber;
+        string jurisdiction;
+        string entityType;                  // e.g., "Bank", "Hedge Fund", "Family Office"
+        address[] authorizedSigners;
+        uint256 verifiedAt;
+        bool isActive;
+        uint256 tradingLimit;
+        uint256 minimumInvestment;
+        bool otcAccessEnabled;
+        bytes32 documentsHash;              // IPFS hash of corporate docs
+    }
+
+    /**
+     * @notice Payment record
+     */
+    struct PaymentRecord {
+        uint256 recordId;
+        uint256 tokenId;
+        uint256 amount;
+        uint256 principalPaid;
+        uint256 interestPaid;
+        uint256 lateFee;
+        uint256 timestamp;
+        uint256 daysLate;
+        address paidBy;
+    }
+
+    /**
+     * @notice Default record for tracking defaults
+     */
+    struct DefaultRecord {
+        uint256 tokenId;
+        address debtor;
+        uint256 defaultDate;
+        uint256 outstandingAmount;
+        uint256 missedPayments;
+        uint256 penaltyAmount;
+        bool resolved;
+        uint256 resolvedDate;
+        string resolutionType;              // e.g., "paid", "restructured", "liquidated"
+    }
+
+    /**
+     * @notice Reputation score data
+     */
+    struct ReputationData {
+        uint256 score;                      // 0-1000
+        uint256 totalDebts;
+        uint256 onTimePayments;
+        uint256 latePayments;
+        uint256 defaults;
+        uint256 totalVolumeTraded;
+        uint256 successfulTrades;
+        uint256 disputes;
+        uint256 lastUpdated;
+    }
+
+    /**
+     * @notice Slashing record
+     */
+    struct SlashingRecord {
+        address user;
+        uint256 tokenId;
+        uint256 amount;
+        uint256 timestamp;
+        string reason;
+        uint256 reputationPenalty;
+    }
+
+    /**
+     * @notice Cross-chain bridge transfer
+     */
+    struct BridgeTransfer {
+        bytes32 transferId;
+        uint256 tokenId;
+        address sender;
+        address receiver;
+        uint256 sourceChain;
+        uint256 targetChain;
+        uint256 initiatedAt;
+        uint256 completedAt;
+        bool completed;
+        bool failed;
+        string failureReason;
+    }
+
+    /**
+     * @notice Trade statistics for UI
+     */
+    struct TradeStats {
+        uint256 totalVolume;
+        uint256 totalTrades;
+        uint256 averagePrice;
+        uint256 highestPrice;
+        uint256 lowestPrice;
+        uint256 activeListings;
+        uint256 last24hVolume;
+    }
+}

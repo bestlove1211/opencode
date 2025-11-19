@@ -1,0 +1,478 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IERC20Mintable {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/**
+ * @title BancafiStaking
+ * @notice Staking contract for BGT governance tokens
+ * @dev Supports multiple lock periods, rewards, and voting power boost
+ */
+contract BancafiStaking is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant REWARD_MANAGER_ROLE = keccak256("REWARD_MANAGER_ROLE");
+
+    enum LockPeriod {
+        None,        // No lock - 1x multiplier
+        ThreeMonths, // 3 months - 1.5x multiplier
+        SixMonths,   // 6 months - 2x multiplier
+        OneYear,     // 1 year - 3x multiplier
+        TwoYears     // 2 years - 5x multiplier
+    }
+
+    struct StakeInfo {
+        uint256 amount;
+        uint256 stakedAt;
+        uint256 unlockTime;
+        LockPeriod lockPeriod;
+        uint256 rewardDebt;
+        uint256 votingPower;
+        uint256 totalRewardsClaimed;
+        bool active;
+    }
+
+    struct PoolInfo {
+        uint256 totalStaked;
+        uint256 totalVotingPower;
+        uint256 rewardsPerSecond;
+        uint256 accRewardPerShare;
+        uint256 lastRewardTime;
+        uint256 totalRewardsDistributed;
+    }
+
+    IERC20Mintable public stakingToken;
+    IERC20Mintable public rewardToken;
+
+    PoolInfo public pool;
+
+    mapping(address => StakeInfo[]) public userStakes;
+    mapping(address => uint256) public totalUserStaked;
+    mapping(address => uint256) public userVotingPower;
+    mapping(LockPeriod => uint256) public lockDurations;
+    mapping(LockPeriod => uint256) public votingPowerMultipliers;
+
+    uint256 public constant PRECISION = 1e12;
+    uint256 public minStakeAmount;
+    uint256 public earlyUnstakePenalty; // 20%
+
+    // Events
+    event Staked(
+        address indexed user,
+        uint256 indexed stakeId,
+        uint256 amount,
+        LockPeriod lockPeriod,
+        uint256 unlockTime,
+        uint256 votingPower,
+        uint256 timestamp
+    );
+
+    event Unstaked(
+        address indexed user,
+        uint256 indexed stakeId,
+        uint256 amount,
+        uint256 penalty,
+        uint256 timestamp
+    );
+
+    event RewardsClaimed(
+        address indexed user,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event RewardsPerSecondUpdated(
+        uint256 oldRate,
+        uint256 newRate,
+        uint256 timestamp
+    );
+
+    event EarlyUnstakePenaltyUpdated(
+        uint256 oldPenalty,
+        uint256 newPenalty,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        address stakingToken_,
+        address rewardToken_,
+        uint256 rewardsPerSecond_
+    ) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(REWARD_MANAGER_ROLE, msg.sender);
+
+        stakingToken = IERC20Mintable(stakingToken_);
+        rewardToken = IERC20Mintable(rewardToken_);
+
+        pool.rewardsPerSecond = rewardsPerSecond_;
+        pool.lastRewardTime = block.timestamp;
+
+        // Set default values
+        minStakeAmount = 100 ether;
+        earlyUnstakePenalty = 2000; // 20%
+
+        // Set lock durations
+        lockDurations[LockPeriod.None] = 0;
+        lockDurations[LockPeriod.ThreeMonths] = 90 days;
+        lockDurations[LockPeriod.SixMonths] = 180 days;
+        lockDurations[LockPeriod.OneYear] = 365 days;
+        lockDurations[LockPeriod.TwoYears] = 730 days;
+
+        // Set voting power multipliers (in basis points, 10000 = 1x)
+        votingPowerMultipliers[LockPeriod.None] = 10000;      // 1x
+        votingPowerMultipliers[LockPeriod.ThreeMonths] = 15000; // 1.5x
+        votingPowerMultipliers[LockPeriod.SixMonths] = 20000;  // 2x
+        votingPowerMultipliers[LockPeriod.OneYear] = 30000;    // 3x
+        votingPowerMultipliers[LockPeriod.TwoYears] = 50000;   // 5x
+    }
+
+    /**
+     * @notice Stake tokens
+     */
+    function stake(
+        uint256 amount_,
+        LockPeriod lockPeriod_
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        require(amount_ >= minStakeAmount, "Below minimum stake");
+
+        updatePool();
+
+        // Transfer tokens
+        require(
+            stakingToken.transferFrom(msg.sender, address(this), amount_),
+            "Transfer failed"
+        );
+
+        uint256 unlockTime = block.timestamp + lockDurations[lockPeriod_];
+        uint256 votingPower = (amount_ * votingPowerMultipliers[lockPeriod_]) / 10000;
+
+        // Create stake
+        userStakes[msg.sender].push(StakeInfo({
+            amount: amount_,
+            stakedAt: block.timestamp,
+            unlockTime: unlockTime,
+            lockPeriod: lockPeriod_,
+            rewardDebt: (votingPower * pool.accRewardPerShare) / PRECISION,
+            votingPower: votingPower,
+            totalRewardsClaimed: 0,
+            active: true
+        }));
+
+        uint256 stakeId = userStakes[msg.sender].length - 1;
+
+        // Update totals
+        pool.totalStaked += amount_;
+        pool.totalVotingPower += votingPower;
+        totalUserStaked[msg.sender] += amount_;
+        userVotingPower[msg.sender] += votingPower;
+
+        emit Staked(
+            msg.sender,
+            stakeId,
+            amount_,
+            lockPeriod_,
+            unlockTime,
+            votingPower,
+            block.timestamp
+        );
+
+        return stakeId;
+    }
+
+    /**
+     * @notice Unstake tokens
+     */
+    function unstake(uint256 stakeId_) external nonReentrant {
+        require(stakeId_ < userStakes[msg.sender].length, "Invalid stake ID");
+
+        StakeInfo storage stakeInfo = userStakes[msg.sender][stakeId_];
+        require(stakeInfo.active, "Stake not active");
+
+        updatePool();
+
+        // Claim pending rewards first
+        uint256 pending = (stakeInfo.votingPower * pool.accRewardPerShare) / PRECISION - stakeInfo.rewardDebt;
+        if (pending > 0) {
+            _safeRewardTransfer(msg.sender, pending);
+            stakeInfo.totalRewardsClaimed += pending;
+            pool.totalRewardsDistributed += pending;
+        }
+
+        uint256 penalty = 0;
+        uint256 amountToReturn = stakeInfo.amount;
+
+        // Apply early unstake penalty if before unlock
+        if (block.timestamp < stakeInfo.unlockTime) {
+            penalty = (stakeInfo.amount * earlyUnstakePenalty) / 10000;
+            amountToReturn -= penalty;
+        }
+
+        // Update totals
+        pool.totalStaked -= stakeInfo.amount;
+        pool.totalVotingPower -= stakeInfo.votingPower;
+        totalUserStaked[msg.sender] -= stakeInfo.amount;
+        userVotingPower[msg.sender] -= stakeInfo.votingPower;
+
+        // Mark as inactive
+        stakeInfo.active = false;
+
+        // Transfer tokens
+        require(stakingToken.transfer(msg.sender, amountToReturn), "Transfer failed");
+
+        emit Unstaked(msg.sender, stakeId_, amountToReturn, penalty, block.timestamp);
+    }
+
+    /**
+     * @notice Claim rewards for specific stake
+     */
+    function claimRewards(uint256 stakeId_) external nonReentrant {
+        require(stakeId_ < userStakes[msg.sender].length, "Invalid stake ID");
+
+        StakeInfo storage stakeInfo = userStakes[msg.sender][stakeId_];
+        require(stakeInfo.active, "Stake not active");
+
+        updatePool();
+
+        uint256 pending = (stakeInfo.votingPower * pool.accRewardPerShare) / PRECISION - stakeInfo.rewardDebt;
+
+        if (pending > 0) {
+            _safeRewardTransfer(msg.sender, pending);
+            stakeInfo.totalRewardsClaimed += pending;
+            pool.totalRewardsDistributed += pending;
+
+            emit RewardsClaimed(msg.sender, pending, block.timestamp);
+        }
+
+        stakeInfo.rewardDebt = (stakeInfo.votingPower * pool.accRewardPerShare) / PRECISION;
+    }
+
+    /**
+     * @notice Claim all rewards
+     */
+    function claimAllRewards() external nonReentrant {
+        updatePool();
+
+        uint256 totalPending = 0;
+
+        for (uint256 i = 0; i < userStakes[msg.sender].length; i++) {
+            StakeInfo storage stakeInfo = userStakes[msg.sender][i];
+
+            if (stakeInfo.active) {
+                uint256 pending = (stakeInfo.votingPower * pool.accRewardPerShare) / PRECISION - stakeInfo.rewardDebt;
+
+                if (pending > 0) {
+                    totalPending += pending;
+                    stakeInfo.totalRewardsClaimed += pending;
+                    stakeInfo.rewardDebt = (stakeInfo.votingPower * pool.accRewardPerShare) / PRECISION;
+                }
+            }
+        }
+
+        if (totalPending > 0) {
+            _safeRewardTransfer(msg.sender, totalPending);
+            pool.totalRewardsDistributed += totalPending;
+
+            emit RewardsClaimed(msg.sender, totalPending, block.timestamp);
+        }
+    }
+
+    /**
+     * @notice Update reward variables
+     */
+    function updatePool() public {
+        if (block.timestamp <= pool.lastRewardTime) {
+            return;
+        }
+
+        if (pool.totalVotingPower == 0) {
+            pool.lastRewardTime = block.timestamp;
+            return;
+        }
+
+        uint256 timeElapsed = block.timestamp - pool.lastRewardTime;
+        uint256 reward = timeElapsed * pool.rewardsPerSecond;
+
+        pool.accRewardPerShare += (reward * PRECISION) / pool.totalVotingPower;
+        pool.lastRewardTime = block.timestamp;
+    }
+
+    /**
+     * @notice Get pending rewards for a stake
+     */
+    function pendingRewards(address user_, uint256 stakeId_) external view returns (uint256) {
+        if (stakeId_ >= userStakes[user_].length) {
+            return 0;
+        }
+
+        StakeInfo memory stakeInfo = userStakes[user_][stakeId_];
+        if (!stakeInfo.active) {
+            return 0;
+        }
+
+        uint256 accRewardPerShare = pool.accRewardPerShare;
+
+        if (block.timestamp > pool.lastRewardTime && pool.totalVotingPower > 0) {
+            uint256 timeElapsed = block.timestamp - pool.lastRewardTime;
+            uint256 reward = timeElapsed * pool.rewardsPerSecond;
+            accRewardPerShare += (reward * PRECISION) / pool.totalVotingPower;
+        }
+
+        return (stakeInfo.votingPower * accRewardPerShare) / PRECISION - stakeInfo.rewardDebt;
+    }
+
+    /**
+     * @notice Get total pending rewards for user
+     */
+    function totalPendingRewards(address user_) external view returns (uint256) {
+        uint256 total = 0;
+
+        uint256 accRewardPerShare = pool.accRewardPerShare;
+
+        if (block.timestamp > pool.lastRewardTime && pool.totalVotingPower > 0) {
+            uint256 timeElapsed = block.timestamp - pool.lastRewardTime;
+            uint256 reward = timeElapsed * pool.rewardsPerSecond;
+            accRewardPerShare += (reward * PRECISION) / pool.totalVotingPower;
+        }
+
+        for (uint256 i = 0; i < userStakes[user_].length; i++) {
+            StakeInfo memory stakeInfo = userStakes[user_][i];
+
+            if (stakeInfo.active) {
+                total += (stakeInfo.votingPower * accRewardPerShare) / PRECISION - stakeInfo.rewardDebt;
+            }
+        }
+
+        return total;
+    }
+
+    /**
+     * @notice Get user's stakes
+     */
+    function getUserStakes(address user_) external view returns (StakeInfo[] memory) {
+        return userStakes[user_];
+    }
+
+    /**
+     * @notice Get user's active stakes count
+     */
+    function getUserActiveStakesCount(address user_) external view returns (uint256) {
+        uint256 count = 0;
+        for (uint256 i = 0; i < userStakes[user_].length; i++) {
+            if (userStakes[user_][i].active) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * @notice Update rewards per second
+     */
+    function updateRewardsPerSecond(uint256 newRate_) external onlyRole(REWARD_MANAGER_ROLE) {
+        updatePool();
+
+        uint256 oldRate = pool.rewardsPerSecond;
+        pool.rewardsPerSecond = newRate_;
+
+        emit RewardsPerSecondUpdated(oldRate, newRate_, block.timestamp);
+    }
+
+    /**
+     * @notice Update early unstake penalty
+     */
+    function updateEarlyUnstakePenalty(uint256 newPenalty_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newPenalty_ <= 5000, "Penalty too high"); // Max 50%
+
+        uint256 oldPenalty = earlyUnstakePenalty;
+        earlyUnstakePenalty = newPenalty_;
+
+        emit EarlyUnstakePenaltyUpdated(oldPenalty, newPenalty_, block.timestamp);
+    }
+
+    /**
+     * @notice Update minimum stake amount
+     */
+    function updateMinStakeAmount(uint256 newMin_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        minStakeAmount = newMin_;
+    }
+
+    /**
+     * @notice Safe reward transfer
+     */
+    function _safeRewardTransfer(address to_, uint256 amount_) internal {
+        uint256 rewardBal = rewardToken.balanceOf(address(this));
+        if (amount_ > rewardBal) {
+            require(rewardToken.transfer(to_, rewardBal), "Transfer failed");
+        } else {
+            require(rewardToken.transfer(to_, amount_), "Transfer failed");
+        }
+    }
+
+    /**
+     * @notice Emergency withdraw (forfeit rewards)
+     */
+    function emergencyWithdraw(uint256 stakeId_) external nonReentrant {
+        require(stakeId_ < userStakes[msg.sender].length, "Invalid stake ID");
+
+        StakeInfo storage stakeInfo = userStakes[msg.sender][stakeId_];
+        require(stakeInfo.active, "Stake not active");
+
+        uint256 amount = stakeInfo.amount;
+
+        // Update totals
+        pool.totalStaked -= amount;
+        pool.totalVotingPower -= stakeInfo.votingPower;
+        totalUserStaked[msg.sender] -= amount;
+        userVotingPower[msg.sender] -= stakeInfo.votingPower;
+
+        // Mark as inactive
+        stakeInfo.active = false;
+
+        // Transfer tokens (no rewards)
+        require(stakingToken.transfer(msg.sender, amount), "Transfer failed");
+
+        emit Unstaked(msg.sender, stakeId_, amount, 0, block.timestamp);
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title BancafiInstitutional
+ * @notice Institutional investor onboarding and management
+ * @dev KYB (Know Your Business), accredited investor verification, and institutional features
+ */
+contract BancafiInstitutional is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant COMPLIANCE_OFFICER_ROLE = keccak256("COMPLIANCE_OFFICER_ROLE");
+    bytes32 public constant VERIFIER_ROLE = keccak256("VERIFIER_ROLE");
+
+    enum InstitutionType {
+        Bank,
+        InvestmentFund,
+        HedgeFund,
+        PensionFund,
+        InsuranceCompany,
+        FamilyOffice,
+        Corporation,
+        REIT,
+        SovereignWealthFund,
+        EndowmentFund
+    }
+
+    enum VerificationStatus {
+        Pending,
+        UnderReview,
+        Approved,
+        Rejected,
+        Suspended,
+        Revoked
+    }
+
+    enum TierLevel {
+        Standard,      // < $1M
+        Premium,       // $1M - $10M
+        Elite,         // $10M - $100M
+        Institutional  // > $100M
+    }
+
+    struct InstitutionalAccount {
+        address accountAddress;
+        string legalName;
+        string registrationNumber;
+        string jurisdiction;
+        InstitutionType institutionType;
+        VerificationStatus status;
+        TierLevel tier;
+        uint256 investmentLimit;
+        uint256 totalInvested;
+        uint256 kybExpiryDate;
+        address[] authorizedSigners;
+        string complianceDocuments; // IPFS hash
+        uint256 onboardedAt;
+        uint256 lastUpdated;
+        address verifiedBy;
+        bool isAccreditedInvestor;
+        bool multisigRequired;
+        uint256 minSignatures;
+    }
+
+    struct KYBDocument {
+        string documentType; // Articles of Incorporation, Tax ID, etc.
+        string documentHash; // IPFS hash
+        uint256 uploadedAt;
+        uint256 expiryDate;
+        bool isVerified;
+        address verifiedBy;
+    }
+
+    struct InvestmentRestriction {
+        uint256 minInvestment;
+        uint256 maxInvestment;
+        uint256 dailyLimit;
+        uint256 monthlyLimit;
+        bool canFractionalize;
+        bool canReceiveBailout;
+        bool canPropose;
+    }
+
+    // State variables
+    mapping(address => InstitutionalAccount) public institutions;
+    mapping(address => mapping(string => KYBDocument)) public kybDocuments;
+    mapping(address => InvestmentRestriction) public restrictions;
+    mapping(address => mapping(address => bool)) public authorizedSigners;
+    mapping(TierLevel => InvestmentRestriction) public tierRestrictions;
+
+    address[] public institutionList;
+    uint256 public totalInstitutions;
+    uint256 public approvedInstitutions;
+
+    // Events
+    event InstitutionRegistered(
+        address indexed institution,
+        string legalName,
+        InstitutionType institutionType,
+        uint256 timestamp
+    );
+
+    event InstitutionVerified(
+        address indexed institution,
+        VerificationStatus status,
+        address indexed verifier,
+        uint256 timestamp
+    );
+
+    event TierUpdated(
+        address indexed institution,
+        TierLevel oldTier,
+        TierLevel newTier,
+        uint256 timestamp
+    );
+
+    event SignerAdded(
+        address indexed institution,
+        address indexed signer,
+        uint256 timestamp
+    );
+
+    event SignerRemoved(
+        address indexed institution,
+        address indexed signer,
+        uint256 timestamp
+    );
+
+    event KYBDocumentUploaded(
+        address indexed institution,
+        string documentType,
+        string documentHash,
+        uint256 timestamp
+    );
+
+    event InvestmentLimitUpdated(
+        address indexed institution,
+        uint256 oldLimit,
+        uint256 newLimit,
+        uint256 timestamp
+    );
+
+    event ComplianceAlert(
+        address indexed institution,
+        string alertType,
+        string details,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(COMPLIANCE_OFFICER_ROLE, msg.sender);
+        _grantRole(VERIFIER_ROLE, msg.sender);
+
+        // Set default tier restrictions
+        _setTierRestrictions();
+    }
+
+    /**
+     * @notice Register a new institutional account
+     */
+    function registerInstitution(
+        string memory legalName_,
+        string memory registrationNumber_,
+        string memory jurisdiction_,
+        InstitutionType institutionType_,
+        string memory complianceDocuments_,
+        bool isAccreditedInvestor_
+    ) external whenNotPaused {
+        require(institutions[msg.sender].accountAddress == address(0), "Already registered");
+        require(bytes(legalName_).length > 0, "Legal name required");
+
+        institutions[msg.sender] = InstitutionalAccount({
+            accountAddress: msg.sender,
+            legalName: legalName_,
+            registrationNumber: registrationNumber_,
+            jurisdiction: jurisdiction_,
+            institutionType: institutionType_,
+            status: VerificationStatus.Pending,
+            tier: TierLevel.Standard,
+            investmentLimit: 0,
+            totalInvested: 0,
+            kybExpiryDate: block.timestamp + 365 days,
+            authorizedSigners: new address[](0),
+            complianceDocuments: complianceDocuments_,
+            onboardedAt: block.timestamp,
+            lastUpdated: block.timestamp,
+            verifiedBy: address(0),
+            isAccreditedInvestor: isAccreditedInvestor_,
+            multisigRequired: false,
+            minSignatures: 1
+        });
+
+        institutionList.push(msg.sender);
+        totalInstitutions++;
+
+        // Set initial restrictions based on tier
+        restrictions[msg.sender] = tierRestrictions[TierLevel.Standard];
+
+        emit InstitutionRegistered(msg.sender, legalName_, institutionType_, block.timestamp);
+    }
+
+    /**
+     * @notice Verify institutional account (KYB)
+     */
+    function verifyInstitution(
+        address institution_,
+        VerificationStatus status_,
+        TierLevel tier_,
+        uint256 investmentLimit_
+    ) external onlyRole(VERIFIER_ROLE) {
+        InstitutionalAccount storage inst = institutions[institution_];
+        require(inst.accountAddress != address(0), "Not registered");
+
+        VerificationStatus oldStatus = inst.status;
+        inst.status = status_;
+        inst.tier = tier_;
+        inst.investmentLimit = investmentLimit_;
+        inst.verifiedBy = msg.sender;
+        inst.lastUpdated = block.timestamp;
+
+        if (status_ == VerificationStatus.Approved && oldStatus != VerificationStatus.Approved) {
+            approvedInstitutions++;
+        } else if (status_ != VerificationStatus.Approved && oldStatus == VerificationStatus.Approved) {
+            approvedInstitutions--;
+        }
+
+        // Update restrictions based on tier
+        restrictions[institution_] = tierRestrictions[tier_];
+        restrictions[institution_].maxInvestment = investmentLimit_;
+
+        emit InstitutionVerified(institution_, status_, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Upload KYB documents
+     */
+    function uploadKYBDocument(
+        string memory documentType_,
+        string memory documentHash_,
+        uint256 expiryDate_
+    ) external whenNotPaused {
+        require(institutions[msg.sender].accountAddress != address(0), "Not registered");
+
+        kybDocuments[msg.sender][documentType_] = KYBDocument({
+            documentType: documentType_,
+            documentHash: documentHash_,
+            uploadedAt: block.timestamp,
+            expiryDate: expiryDate_,
+            isVerified: false,
+            verifiedBy: address(0)
+        });
+
+        emit KYBDocumentUploaded(msg.sender, documentType_, documentHash_, block.timestamp);
+    }
+
+    /**
+     * @notice Verify KYB document
+     */
+    function verifyKYBDocument(
+        address institution_,
+        string memory documentType_
+    ) external onlyRole(VERIFIER_ROLE) {
+        KYBDocument storage doc = kybDocuments[institution_][documentType_];
+        require(bytes(doc.documentHash).length > 0, "Document not found");
+
+        doc.isVerified = true;
+        doc.verifiedBy = msg.sender;
+    }
+
+    /**
+     * @notice Add authorized signer
+     */
+    function addAuthorizedSigner(address signer_) external {
+        InstitutionalAccount storage inst = institutions[msg.sender];
+        require(inst.accountAddress != address(0), "Not registered");
+        require(signer_ != address(0), "Invalid signer");
+        require(!authorizedSigners[msg.sender][signer_], "Already authorized");
+
+        inst.authorizedSigners.push(signer_);
+        authorizedSigners[msg.sender][signer_] = true;
+
+        emit SignerAdded(msg.sender, signer_, block.timestamp);
+    }
+
+    /**
+     * @notice Remove authorized signer
+     */
+    function removeAuthorizedSigner(address signer_) external {
+        InstitutionalAccount storage inst = institutions[msg.sender];
+        require(authorizedSigners[msg.sender][signer_], "Not authorized");
+
+        authorizedSigners[msg.sender][signer_] = false;
+
+        // Remove from array
+        for (uint i = 0; i < inst.authorizedSigners.length; i++) {
+            if (inst.authorizedSigners[i] == signer_) {
+                inst.authorizedSigners[i] = inst.authorizedSigners[inst.authorizedSigners.length - 1];
+                inst.authorizedSigners.pop();
+                break;
+            }
+        }
+
+        emit SignerRemoved(msg.sender, signer_, block.timestamp);
+    }
+
+    /**
+     * @notice Enable multisig requirement
+     */
+    function enableMultisig(uint256 minSignatures_) external {
+        InstitutionalAccount storage inst = institutions[msg.sender];
+        require(inst.accountAddress != address(0), "Not registered");
+        require(minSignatures_ > 0, "Invalid signatures count");
+
+        inst.multisigRequired = true;
+        inst.minSignatures = minSignatures_;
+    }
+
+    /**
+     * @notice Update tier level
+     */
+    function updateTier(address institution_, TierLevel newTier_)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        InstitutionalAccount storage inst = institutions[institution_];
+        require(inst.accountAddress != address(0), "Not registered");
+
+        TierLevel oldTier = inst.tier;
+        inst.tier = newTier_;
+        inst.lastUpdated = block.timestamp;
+
+        // Update restrictions
+        restrictions[institution_] = tierRestrictions[newTier_];
+
+        emit TierUpdated(institution_, oldTier, newTier_, block.timestamp);
+    }
+
+    /**
+     * @notice Check if address is approved institution
+     */
+    function isApprovedInstitution(address account_) external view returns (bool) {
+        return institutions[account_].status == VerificationStatus.Approved;
+    }
+
+    /**
+     * @notice Check if signer is authorized
+     */
+    function isAuthorizedSigner(address institution_, address signer_)
+        external
+        view
+        returns (bool)
+    {
+        return authorizedSigners[institution_][signer_];
+    }
+
+    /**
+     * @notice Get institution details
+     */
+    function getInstitution(address account_)
+        external
+        view
+        returns (InstitutionalAccount memory)
+    {
+        return institutions[account_];
+    }
+
+    /**
+     * @notice Get investment restrictions
+     */
+    function getRestrictions(address account_)
+        external
+        view
+        returns (InvestmentRestriction memory)
+    {
+        return restrictions[account_];
+    }
+
+    /**
+     * @notice Record investment
+     */
+    function recordInvestment(address institution_, uint256 amount_)
+        external
+        onlyRole(COMPLIANCE_OFFICER_ROLE)
+    {
+        InstitutionalAccount storage inst = institutions[institution_];
+        require(inst.status == VerificationStatus.Approved, "Not approved");
+
+        inst.totalInvested += amount_;
+
+        // Check if tier upgrade needed
+        if (inst.totalInvested >= 100000000 ether && inst.tier < TierLevel.Institutional) {
+            inst.tier = TierLevel.Institutional;
+            emit TierUpdated(institution_, inst.tier, TierLevel.Institutional, block.timestamp);
+        } else if (inst.totalInvested >= 10000000 ether && inst.tier < TierLevel.Elite) {
+            inst.tier = TierLevel.Elite;
+            emit TierUpdated(institution_, inst.tier, TierLevel.Elite, block.timestamp);
+        } else if (inst.totalInvested >= 1000000 ether && inst.tier < TierLevel.Premium) {
+            inst.tier = TierLevel.Premium;
+            emit TierUpdated(institution_, inst.tier, TierLevel.Premium, block.timestamp);
+        }
+    }
+
+    /**
+     * @notice Set tier restrictions (internal)
+     */
+    function _setTierRestrictions() internal {
+        // Standard Tier (< $1M)
+        tierRestrictions[TierLevel.Standard] = InvestmentRestriction({
+            minInvestment: 1000 ether,
+            maxInvestment: 1000000 ether,
+            dailyLimit: 100000 ether,
+            monthlyLimit: 500000 ether,
+            canFractionalize: true,
+            canReceiveBailout: false,
+            canPropose: false
+        });
+
+        // Premium Tier ($1M - $10M)
+        tierRestrictions[TierLevel.Premium] = InvestmentRestriction({
+            minInvestment: 1000 ether,
+            maxInvestment: 10000000 ether,
+            dailyLimit: 1000000 ether,
+            monthlyLimit: 5000000 ether,
+            canFractionalize: true,
+            canReceiveBailout: true,
+            canPropose: true
+        });
+
+        // Elite Tier ($10M - $100M)
+        tierRestrictions[TierLevel.Elite] = InvestmentRestriction({
+            minInvestment: 10000 ether,
+            maxInvestment: 100000000 ether,
+            dailyLimit: 10000000 ether,
+            monthlyLimit: 50000000 ether,
+            canFractionalize: true,
+            canReceiveBailout: true,
+            canPropose: true
+        });
+
+        // Institutional Tier (> $100M)
+        tierRestrictions[TierLevel.Institutional] = InvestmentRestriction({
+            minInvestment: 100000 ether,
+            maxInvestment: type(uint256).max,
+            dailyLimit: 100000000 ether,
+            monthlyLimit: 500000000 ether,
+            canFractionalize: true,
+            canReceiveBailout: true,
+            canPropose: true
+        });
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}

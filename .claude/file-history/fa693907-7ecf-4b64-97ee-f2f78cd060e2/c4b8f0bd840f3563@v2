@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IDebtCollection.sol";
+
+/**
+ * @title BancafiDebtPortfolio
+ * @notice NFT-based debt portfolio bundling for institutional buyers
+ * @dev Bundle multiple debts into tradeable portfolios represented as NFTs
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiDebtPortfolio is
+    Initializable,
+    ERC721Upgradeable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    // ============ Structs ============
+
+    struct DebtPortfolio {
+        uint256 id;
+        string name;
+        address creator;
+        uint256[] collectionIds;      // Debt collection IDs in portfolio
+        uint256 totalFaceValue;       // Total original debt amount
+        uint256 totalRemainingDebt;   // Total remaining debt
+        uint256 createdAt;
+        uint256 lastUpdatedAt;
+        PortfolioStatus status;
+        PortfolioTier tier;
+        uint256 averageDiscount;      // Average discount rate
+        uint256 expectedReturn;       // Expected return percentage
+    }
+
+    struct PortfolioMetrics {
+        uint256 numberOfDebts;
+        uint256 averageDebtSize;
+        uint256 totalCollected;
+        uint256 collectionRate;       // Percentage collected
+        uint256 averageAge;           // Average days since default
+        uint256 diversificationScore; // 0-100 based on variety
+    }
+
+    enum PortfolioStatus {
+        Active,
+        Locked,      // Being traded
+        Sold,
+        Dissolved
+    }
+
+    enum PortfolioTier {
+        Standard,    // Mixed quality debts
+        Premium,     // Higher quality debts
+        Distressed,  // High-risk, high-reward
+        Secured      // Collateralized debts only
+    }
+
+    // ============ State Variables ============
+
+    IDebtCollection public debtCollectionContract;
+
+    uint256 public nextPortfolioId;
+    uint256 public minPortfolioSize;           // Min debts per portfolio
+    uint256 public maxPortfolioSize;           // Max debts per portfolio
+    uint256 public portfolioCreationFee;       // Fee to create portfolio
+
+    mapping(uint256 => DebtPortfolio) public portfolios;
+    mapping(uint256 => PortfolioMetrics) public portfolioMetrics;
+    mapping(uint256 => bool) public debtInPortfolio; // collectionId => in portfolio
+    mapping(address => uint256[]) public creatorPortfolios;
+    mapping(uint256 => uint256) public debtToPortfolio; // collectionId => portfolioId
+
+    // Tier requirements
+    mapping(PortfolioTier => uint256) public tierMinValue;
+    mapping(PortfolioTier => uint256) public tierMinQuality;
+
+    // ============ Events ============
+
+    event PortfolioCreated(
+        uint256 indexed portfolioId,
+        address indexed creator,
+        string name,
+        uint256 numberOfDebts,
+        uint256 totalValue,
+        PortfolioTier tier
+    );
+
+    event DebtAddedToPortfolio(
+        uint256 indexed portfolioId,
+        uint256 indexed collectionId,
+        uint256 debtAmount
+    );
+
+    event DebtRemovedFromPortfolio(
+        uint256 indexed portfolioId,
+        uint256 indexed collectionId
+    );
+
+    event PortfolioListed(
+        uint256 indexed portfolioId,
+        uint256 askingPrice,
+        uint256 timestamp
+    );
+
+    event PortfolioSold(
+        uint256 indexed portfolioId,
+        address indexed seller,
+        address indexed buyer,
+        uint256 salePrice
+    );
+
+    event PortfolioDissolved(
+        uint256 indexed portfolioId,
+        address indexed owner,
+        uint256 timestamp
+    );
+
+    event PortfolioMetricsUpdated(
+        uint256 indexed portfolioId,
+        uint256 collectionRate,
+        uint256 totalCollected
+    );
+
+    event PortfolioTierUpdated(
+        uint256 indexed portfolioId,
+        PortfolioTier oldTier,
+        PortfolioTier newTier
+    );
+
+    // ============ Modifiers ============
+
+    modifier validPortfolio(uint256 portfolioId) {
+        require(_exists(portfolioId), "Portfolio does not exist");
+        _;
+    }
+
+    modifier onlyPortfolioOwner(uint256 portfolioId) {
+        require(ownerOf(portfolioId) == msg.sender, "Not portfolio owner");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        address _debtCollectionContract,
+        uint256 _minPortfolioSize,
+        uint256 _maxPortfolioSize,
+        uint256 _portfolioCreationFee
+    ) public initializer {
+        require(_debtCollectionContract != address(0), "Invalid debt collection address");
+        require(_minPortfolioSize >= 2, "Min size must be at least 2");
+        require(_maxPortfolioSize > _minPortfolioSize, "Max must exceed min");
+
+        __ERC721_init("Bancafi Debt Portfolio", "BDP");
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        debtCollectionContract = IDebtCollection(_debtCollectionContract);
+        minPortfolioSize = _minPortfolioSize;
+        maxPortfolioSize = _maxPortfolioSize;
+        portfolioCreationFee = _portfolioCreationFee;
+        nextPortfolioId = 1;
+
+        // Set default tier requirements
+        tierMinValue[PortfolioTier.Standard] = 10_000e18;
+        tierMinValue[PortfolioTier.Premium] = 50_000e18;
+        tierMinValue[PortfolioTier.Distressed] = 5_000e18;
+        tierMinValue[PortfolioTier.Secured] = 25_000e18;
+
+        tierMinQuality[PortfolioTier.Premium] = 70; // 70% quality score
+        tierMinQuality[PortfolioTier.Secured] = 80; // 80% must be secured
+    }
+
+    // ============ Portfolio Creation ============
+
+    /**
+     * @notice Create a debt portfolio from multiple collection IDs
+     * @param name Portfolio name
+     * @param collectionIds Array of debt collection IDs
+     * @param tier Desired portfolio tier
+     * @return portfolioId Created portfolio NFT ID
+     */
+    function createPortfolio(
+        string calldata name,
+        uint256[] calldata collectionIds,
+        PortfolioTier tier
+    ) external payable nonReentrant whenNotPaused returns (uint256) {
+        require(collectionIds.length >= minPortfolioSize, "Too few debts");
+        require(collectionIds.length <= maxPortfolioSize, "Too many debts");
+        require(msg.value >= portfolioCreationFee, "Insufficient creation fee");
+        require(bytes(name).length > 0, "Name required");
+
+        // Verify ownership and calculate totals
+        uint256 totalFaceValue = 0;
+        uint256 totalRemaining = 0;
+
+        for (uint256 i = 0; i < collectionIds.length; i++) {
+            uint256 collectionId = collectionIds[i];
+
+            // Verify not already in portfolio
+            require(!debtInPortfolio[collectionId], "Debt already in portfolio");
+
+            // Get debt details
+            (
+                ,
+                ,
+                address creditor,
+                uint256 originalAmount,
+                uint256 remainingAmount,
+
+            ) = debtCollectionContract.getCollectionDetails(collectionId);
+
+            // Verify caller owns the debt
+            require(creditor == msg.sender, "Not debt owner");
+
+            totalFaceValue += originalAmount;
+            totalRemaining += remainingAmount;
+
+            // Mark as in portfolio
+            debtInPortfolio[collectionId] = true;
+        }
+
+        // Validate tier requirements
+        require(_meetsRequirements(collectionIds, totalFaceValue, tier), "Does not meet tier requirements");
+
+        // Create portfolio
+        uint256 portfolioId = nextPortfolioId++;
+
+        uint256 avgDiscount = totalFaceValue > 0
+            ? ((totalFaceValue - totalRemaining) * 10000) / totalFaceValue
+            : 0;
+
+        portfolios[portfolioId] = DebtPortfolio({
+            id: portfolioId,
+            name: name,
+            creator: msg.sender,
+            collectionIds: collectionIds,
+            totalFaceValue: totalFaceValue,
+            totalRemainingDebt: totalRemaining,
+            createdAt: block.timestamp,
+            lastUpdatedAt: block.timestamp,
+            status: PortfolioStatus.Active,
+            tier: tier,
+            averageDiscount: avgDiscount,
+            expectedReturn: _calculateExpectedReturn(collectionIds)
+        });
+
+        // Calculate metrics
+        _updatePortfolioMetrics(portfolioId);
+
+        // Map debts to portfolio
+        for (uint256 i = 0; i < collectionIds.length; i++) {
+            debtToPortfolio[collectionIds[i]] = portfolioId;
+        }
+
+        // Mint NFT to creator
+        _safeMint(msg.sender, portfolioId);
+
+        creatorPortfolios[msg.sender].push(portfolioId);
+
+        emit PortfolioCreated(
+            portfolioId,
+            msg.sender,
+            name,
+            collectionIds.length,
+            totalFaceValue,
+            tier
+        );
+
+        // Refund excess
+        if (msg.value > portfolioCreationFee) {
+            payable(msg.sender).transfer(msg.value - portfolioCreationFee);
+        }
+
+        return portfolioId;
+    }
+
+    /**
+     * @notice Add debt to existing portfolio
+     * @param portfolioId Portfolio ID
+     * @param collectionId Debt collection ID to add
+     */
+    function addDebtToPortfolio(
+        uint256 portfolioId,
+        uint256 collectionId
+    ) external nonReentrant validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Active, "Portfolio not active");
+        require(!debtInPortfolio[collectionId], "Debt already in portfolio");
+        require(portfolio.collectionIds.length < maxPortfolioSize, "Portfolio full");
+
+        // Verify ownership
+        (
+            ,
+            ,
+            address creditor,
+            uint256 originalAmount,
+            uint256 remainingAmount,
+
+        ) = debtCollectionContract.getCollectionDetails(collectionId);
+
+        require(creditor == msg.sender, "Not debt owner");
+
+        // Add to portfolio
+        portfolio.collectionIds.push(collectionId);
+        portfolio.totalFaceValue += originalAmount;
+        portfolio.totalRemainingDebt += remainingAmount;
+        portfolio.lastUpdatedAt = block.timestamp;
+
+        debtInPortfolio[collectionId] = true;
+        debtToPortfolio[collectionId] = portfolioId;
+
+        // Update metrics
+        _updatePortfolioMetrics(portfolioId);
+
+        emit DebtAddedToPortfolio(portfolioId, collectionId, remainingAmount);
+    }
+
+    /**
+     * @notice Remove debt from portfolio (before sale)
+     * @param portfolioId Portfolio ID
+     * @param collectionId Debt collection ID to remove
+     */
+    function removeDebtFromPortfolio(
+        uint256 portfolioId,
+        uint256 collectionId
+    ) external nonReentrant validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Active, "Portfolio not active");
+        require(portfolio.collectionIds.length > minPortfolioSize, "Would go below minimum");
+
+        // Find and remove collection ID
+        bool found = false;
+        for (uint256 i = 0; i < portfolio.collectionIds.length; i++) {
+            if (portfolio.collectionIds[i] == collectionId) {
+                // Get debt details for updating totals
+                (
+                    ,
+                    ,
+                    ,
+                    uint256 originalAmount,
+                    uint256 remainingAmount,
+
+                ) = debtCollectionContract.getCollectionDetails(collectionId);
+
+                // Remove from array
+                portfolio.collectionIds[i] = portfolio.collectionIds[portfolio.collectionIds.length - 1];
+                portfolio.collectionIds.pop();
+
+                portfolio.totalFaceValue -= originalAmount;
+                portfolio.totalRemainingDebt -= remainingAmount;
+                portfolio.lastUpdatedAt = block.timestamp;
+
+                debtInPortfolio[collectionId] = false;
+                delete debtToPortfolio[collectionId];
+
+                found = true;
+                break;
+            }
+        }
+
+        require(found, "Debt not in portfolio");
+
+        // Update metrics
+        _updatePortfolioMetrics(portfolioId);
+
+        emit DebtRemovedFromPortfolio(portfolioId, collectionId);
+    }
+
+    /**
+     * @notice Dissolve portfolio and release debts
+     * @param portfolioId Portfolio ID to dissolve
+     */
+    function dissolvePortfolio(
+        uint256 portfolioId
+    ) external nonReentrant validPortfolio(portfolioId) onlyPortfolioOwner(portfolioId) {
+        DebtPortfolio storage portfolio = portfolios[portfolioId];
+        require(portfolio.status == PortfolioStatus.Active, "Portfolio not active");
+
+        // Release all debts
+        for (uint256 i = 0; i < portfolio.collectionIds.length; i++) {
+            uint256 collectionId = portfolio.collectionIds[i];
+            debtInPortfolio[collectionId] = false;
+            delete debtToPortfolio[collectionId];
+        }
+
+        portfolio.status = PortfolioStatus.Dissolved;
+
+        // Burn NFT
+        _burn(portfolioId);
+
+        emit PortfolioDissolved(portfolioId, msg.sender, block.timestamp);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get portfolio details
+     */
+    function getPortfolio(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (DebtPortfolio memory)
+    {
+        return portfolios[portfolioId];
+    }
+
+    /**
+     * @notice Get portfolio metrics
+     */
+    function getPortfolioMetrics(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (PortfolioMetrics memory)
+    {
+        return portfolioMetrics[portfolioId];
+    }
+
+    /**
+     * @notice Get debt collection IDs in portfolio
+     */
+    function getPortfolioDebts(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (uint256[] memory)
+    {
+        return portfolios[portfolioId].collectionIds;
+    }
+
+    /**
+     * @notice Get user's portfolios
+     */
+    function getUserPortfolios(address user) external view returns (uint256[] memory) {
+        return creatorPortfolios[user];
+    }
+
+    /**
+     * @notice Check if debt is in any portfolio
+     */
+    function isDebtInPortfolio(uint256 collectionId) external view returns (bool) {
+        return debtInPortfolio[collectionId];
+    }
+
+    /**
+     * @notice Get portfolio ID for a debt
+     */
+    function getPortfolioForDebt(uint256 collectionId) external view returns (uint256) {
+        return debtToPortfolio[collectionId];
+    }
+
+    /**
+     * @notice Calculate current portfolio value
+     */
+    function calculatePortfolioValue(uint256 portfolioId)
+        external
+        view
+        validPortfolio(portfolioId)
+        returns (uint256 currentValue, uint256 potentialValue)
+    {
+        DebtPortfolio memory portfolio = portfolios[portfolioId];
+
+        currentValue = 0;
+        potentialValue = portfolio.totalFaceValue;
+
+        // Calculate based on current remaining debt
+        for (uint256 i = 0; i < portfolio.collectionIds.length; i++) {
+            (
+                ,
+                ,
+                ,
+                ,
+                uint256 remainingAmount,
+
+            ) = debtCollectionContract.getCollectionDetails(portfolio.collectionIds[i]);
+
+            currentValue += remainingAmount;
+        }
+
+        return (currentValue, potentialValue);
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update portfolio creation fee
+     */
+    function updateCreationFee(uint256 newFee) external onlyOwner {
+        portfolioCreationFee = newFee;
+    }
+
+    /**
+     * @notice Update portfolio size limits
+     */
+    function updateSizeLimits(uint256 newMin, uint256 newMax) external onlyOwner {
+        require(newMin >= 2, "Min must be at least 2");
+        require(newMax > newMin, "Max must exceed min");
+
+        minPortfolioSize = newMin;
+        maxPortfolioSize = newMax;
+    }
+
+    /**
+     * @notice Update tier requirements
+     */
+    function updateTierRequirements(
+        PortfolioTier tier,
+        uint256 minValue,
+        uint256 minQuality
+    ) external onlyOwner {
+        tierMinValue[tier] = minValue;
+        tierMinQuality[tier] = minQuality;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ============ Internal Functions ============
+
+    function _updatePortfolioMetrics(uint256 portfolioId) internal {
+        DebtPortfolio memory portfolio = portfolios[portfolioId];
+
+        uint256 totalCollected = 0;
+        uint256 totalAge = 0;
+
+        for (uint256 i = 0; i < portfolio.collectionIds.length; i++) {
+            (
+                ,
+                ,
+                ,
+                uint256 originalAmount,
+                uint256 remainingAmount,
+
+            ) = debtCollectionContract.getCollectionDetails(portfolio.collectionIds[i]);
+
+            totalCollected += (originalAmount - remainingAmount);
+
+            // Calculate age (simplified - would need timestamp from collection)
+            totalAge += block.timestamp - portfolio.createdAt;
+        }
+
+        uint256 collectionRate = portfolio.totalFaceValue > 0
+            ? (totalCollected * 10000) / portfolio.totalFaceValue
+            : 0;
+
+        uint256 avgDebtSize = portfolio.collectionIds.length > 0
+            ? portfolio.totalFaceValue / portfolio.collectionIds.length
+            : 0;
+
+        uint256 avgAge = portfolio.collectionIds.length > 0
+            ? (totalAge / portfolio.collectionIds.length) / 1 days
+            : 0;
+
+        portfolioMetrics[portfolioId] = PortfolioMetrics({
+            numberOfDebts: portfolio.collectionIds.length,
+            averageDebtSize: avgDebtSize,
+            totalCollected: totalCollected,
+            collectionRate: collectionRate,
+            averageAge: avgAge,
+            diversificationScore: _calculateDiversification(portfolio.collectionIds)
+        });
+
+        emit PortfolioMetricsUpdated(portfolioId, collectionRate, totalCollected);
+    }
+
+    function _calculateDiversification(uint256[] memory collectionIds) internal pure returns (uint256) {
+        // Simplified diversification score based on number of debts
+        if (collectionIds.length >= 20) return 100;
+        if (collectionIds.length >= 15) return 80;
+        if (collectionIds.length >= 10) return 60;
+        if (collectionIds.length >= 5) return 40;
+        return 20;
+    }
+
+    function _calculateExpectedReturn(uint256[] memory collectionIds) internal pure returns (uint256) {
+        // Simplified expected return calculation
+        // In production, would factor in debt age, borrower credit, etc.
+        uint256 baseReturn = 15; // 15% base return
+
+        // Higher returns for larger portfolios (diversification)
+        if (collectionIds.length >= 20) return baseReturn + 10;
+        if (collectionIds.length >= 10) return baseReturn + 5;
+
+        return baseReturn;
+    }
+
+    function _meetsRequirements(
+        uint256[] memory collectionIds,
+        uint256 totalValue,
+        PortfolioTier tier
+    ) internal view returns (bool) {
+        // Check minimum value
+        if (totalValue < tierMinValue[tier]) return false;
+
+        // Additional checks for specific tiers
+        if (tier == PortfolioTier.Premium) {
+            // Require minimum quality score
+            // Simplified - in production would check actual debt quality
+            return collectionIds.length >= 5;
+        }
+
+        if (tier == PortfolioTier.Secured) {
+            // Would check if debts are secured in production
+            return true;
+        }
+
+        return true;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    uint256[50] private __gap;
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "content": "Fix DebtCalculations.sol docstring tag for daysBetween return parameter",
+    "status": "completed",
+    "activeForm": "Fixing DebtCalculations.sol docstring"
+  },
+  {
+    "content": "Fix BancafiDAO.sol override specifiers to include IGovernorUpgradeable",
+    "status": "completed",
+    "activeForm": "Fixing BancafiDAO.sol override specifiers"
+  },
+  {
+    "content": "Fix DebtToken.sol _ownerOf function name collision and return type",
+    "status": "completed",
+    "activeForm": "Fixing DebtToken.sol _ownerOf function"
+  },
+  {
+    "content": "Add missing _beforeTokenTransfer and _burn overrides to DebtToken.sol",
+    "status": "completed",
+    "activeForm": "Adding missing DebtToken.sol overrides"
+  },
+  {
+    "content": "Fix BancafiDAO.sol execute() and proposalNeedsQueuing() calls",
+    "status": "completed",
+    "activeForm": "Fixing BancafiDAO.sol function calls"
+  },
+  {
+    "content": "Run final compilation to verify all fixes",
+    "status": "in_progress",
+    "activeForm": "Running final compilation"
+  }
+]

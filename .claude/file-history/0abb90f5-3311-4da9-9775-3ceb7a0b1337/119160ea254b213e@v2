@@ -1,0 +1,239 @@
+# Bancafi Smart Contracts
+
+Complete smart contract system for Bancafi - tokenizing real-world assets with DAO-governed bailout mechanism.
+
+## 🏗️ Architecture
+
+### Core Contracts
+
+1. **BancafiGovernanceToken** (`contracts/core/BancafiGovernanceToken.sol`)
+   - ERC20 token with voting capabilities
+   - Upgradeable, pausable, burnable
+   - Role-based minting control
+
+2. **BancafiDAO** (`contracts/core/BancafiDAO.sol`)
+   - Full-featured DAO with OpenZeppelin Governor
+   - Timelock integration
+   - Proposal management with metadata
+   - Quorum and voting controls
+
+3. **BancafiAssetToken** (`contracts/core/BancafiAssetToken.sol`)
+   - ERC721 for Real-World Asset tokenization
+   - Support for: Real Estate, Minerals, Oil/Energy, Gold, Physical Assets
+   - Fractionalization capability
+   - Asset verification workflow
+   - Status tracking (Pending → Verified → Active → Locked → Defaulted)
+
+4. **BancafiBailout** (`contracts/core/BancafiBailout.sol`)
+   - DAO-governed emergency funding system
+   - Collateral-backed bailout requests
+   - Automated repayment schedules
+   - Treasury management
+   - Default handling with collateral seizure
+
+## 🔐 Security Features
+
+All contracts implement:
+- ✅ **Upgradeable (UUPS)** - Safe contract upgrades
+- ✅ **Pausable** - Emergency stop mechanism
+- ✅ **ReentrancyGuard** - Protection against reentrancy attacks
+- ✅ **AccessControl** - Role-based permissions
+- ✅ **Timestamp tracking** - All critical events timestamped
+- ✅ **Comprehensive events** - Full audit trail
+
+## 📦 Installation
+
+```bash
+npm install
+```
+
+## 🚀 Deployment
+
+### Deploy all contracts:
+```bash
+npx hardhat run scripts/deploy.js --network localhost
+```
+
+### Upgrade contracts:
+```bash
+npx hardhat run scripts/upgrade.js --network localhost
+```
+
+## 🧪 Testing
+
+```bash
+npx hardhat test
+```
+
+## 📋 Contract Functions
+
+### Asset Tokenization
+
+```solidity
+// Tokenize a new asset
+function tokenizeAsset(
+    address to,
+    AssetType assetType,
+    uint256 valuation,
+    string memory location,
+    string memory legalDocumentHash
+) returns (uint256 tokenId)
+
+// Verify asset
+function verifyAsset(uint256 tokenId)
+
+// Fractionalize asset
+function fractionalizeAsset(uint256 tokenId, uint256 totalFractions)
+
+// Transfer fractional ownership
+function transferFractional(uint256 tokenId, address to, uint256 amount)
+```
+
+### Bailout System
+
+```solidity
+// Request bailout
+function requestBailout(
+    uint256 amount,
+    string memory reason,
+    string memory solvencyProof,
+    uint256 collateralTokenId,
+    uint256 repaymentMonths
+) returns (uint256 requestId)
+
+// Approve bailout (DAO/Approver only)
+function approveBailout(uint256 requestId, uint256 interestRate)
+
+// Disburse funds (Treasury Manager only)
+function disburseBailout(uint256 requestId, uint256 installmentCount)
+
+// Make repayment
+function repayBailout(uint256 requestId) payable
+
+// Deposit to treasury
+function depositToTreasury() payable
+```
+
+### DAO Governance
+
+```solidity
+// Create proposal with metadata
+function proposeWithMetadata(
+    address[] memory targets,
+    uint256[] memory values,
+    bytes[] memory calldatas,
+    string memory description,
+    string memory title,
+    bool isBailoutProposal
+) returns (uint256 proposalId)
+
+// Cast vote
+function castVoteWithTimestamp(uint256 proposalId, uint8 support)
+
+// Execute proposal
+function executeWithTimestamp(
+    address[] memory targets,
+    uint256[] memory values,
+    bytes[] memory calldatas,
+    bytes32 descriptionHash
+)
+```
+
+## 🎯 Use Cases
+
+### Example 1: Tokenize Real Estate
+```javascript
+const tokenId = await assetToken.tokenizeAsset(
+    ownerAddress,
+    0, // AssetType.RealEstate
+    ethers.parseEther("1000000"), // $1M valuation
+    "123 Main St, New York",
+    "ipfs://Qm..." // Legal documents
+);
+```
+
+### Example 2: Request Bailout
+```javascript
+const requestId = await bailout.requestBailout(
+    ethers.parseEther("50000"), // 50K ETH
+    "Market downturn liquidity crisis",
+    "ipfs://Qm...", // Solvency proof
+    assetTokenId, // Collateral
+    12 // 12 months repayment
+);
+```
+
+### Example 3: Create DAO Proposal
+```javascript
+const proposalId = await dao.proposeWithMetadata(
+    [bailoutAddress],
+    [0],
+    [encodedFunctionCall],
+    "Approve 50K bailout for Company X",
+    "Emergency Bailout Proposal #1",
+    true // isBailoutProposal
+);
+```
+
+## 🔑 Roles
+
+### BancafiAssetToken
+- `DEFAULT_ADMIN_ROLE` - Contract administration
+- `MINTER_ROLE` - Can tokenize new assets
+- `PAUSER_ROLE` - Can pause/unpause
+- `UPGRADER_ROLE` - Can upgrade contract
+- `VERIFIER_ROLE` - Can verify assets
+
+### BancafiBailout
+- `DEFAULT_ADMIN_ROLE` - Contract administration
+- `PAUSER_ROLE` - Can pause/unpause
+- `UPGRADER_ROLE` - Can upgrade contract
+- `TREASURY_MANAGER_ROLE` - Manage treasury
+- `BAILOUT_APPROVER_ROLE` - Approve bailouts
+
+### BancafiGovernanceToken
+- `DEFAULT_ADMIN_ROLE` - Contract administration
+- `MINTER_ROLE` - Can mint tokens
+- `PAUSER_ROLE` - Can pause/unpause
+- `UPGRADER_ROLE` - Can upgrade contract
+
+## 📊 Events
+
+All contracts emit comprehensive events for monitoring:
+- Asset tokenization and verification
+- Bailout requests, approvals, disbursements, repayments
+- DAO proposals, votes, executions
+- Treasury deposits and withdrawals
+- Role changes and upgrades
+
+## ⚙️ Configuration
+
+Edit `hardhat.config.js` to configure:
+- Network settings
+- Solidity compiler version (0.8.25)
+- Optimization settings
+
+## 🛡️ Audit Recommendations
+
+Before mainnet deployment:
+1. Complete professional security audit
+2. Test on testnet extensively
+3. Implement multisig for admin roles
+4. Set appropriate timelock delays
+5. Configure proper role hierarchies
+
+## 📄 License
+
+MIT
+
+## 🤝 Contributing
+
+Contributions welcome! Please follow security best practices.
+
+---
+
+Built with ❤️ using:
+- Solidity 0.8.25
+- OpenZeppelin Contracts 5.0
+- Hardhat
+- UUPS Proxy Pattern

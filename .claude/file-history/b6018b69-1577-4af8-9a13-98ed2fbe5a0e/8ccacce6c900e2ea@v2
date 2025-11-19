@@ -1,0 +1,53 @@
+const { ethers } = require("hardhat");
+
+async function main() {
+  // Configuration
+  const SAVINGS_ACCOUNT_ADDRESS = process.env.SAVINGS_ACCOUNT_ADDRESS || "";
+  const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || "";
+
+  if (!SAVINGS_ACCOUNT_ADDRESS || !TOKEN_ADDRESS) {
+    console.error("❌ Error: Please set SAVINGS_ACCOUNT_ADDRESS and TOKEN_ADDRESS environment variables");
+    console.log("\nUsage:");
+    console.log("SAVINGS_ACCOUNT_ADDRESS=0x... TOKEN_ADDRESS=0x... npx hardhat run scripts/add-token.js --network <network>");
+    process.exit(1);
+  }
+
+  console.log("Adding token to Bancafi Savings Account...");
+  console.log("Savings Account:", SAVINGS_ACCOUNT_ADDRESS);
+  console.log("Token:", TOKEN_ADDRESS);
+
+  // Get signer
+  const [signer] = await ethers.getSigners();
+  console.log("Signer:", signer.address);
+
+  // Get contract instance
+  const BancafiSavingsAccount = await ethers.getContractFactory("BancafiSavingsAccount");
+  const savingsAccount = BancafiSavingsAccount.attach(SAVINGS_ACCOUNT_ADDRESS);
+
+  // Check if token is already supported
+  const isSupported = await savingsAccount.supportedTokens(TOKEN_ADDRESS);
+
+  if (isSupported) {
+    console.log("⚠️  Token is already supported");
+    return;
+  }
+
+  // Add token
+  console.log("\nAdding token...");
+  const tx = await savingsAccount.addSupportedToken(TOKEN_ADDRESS);
+  console.log("Transaction hash:", tx.hash);
+
+  await tx.wait();
+  console.log("✅ Token added successfully!");
+
+  // Verify
+  const nowSupported = await savingsAccount.supportedTokens(TOKEN_ADDRESS);
+  console.log("Token supported:", nowSupported);
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

@@ -1,0 +1,1092 @@
+# Bancafi Credit Platform - Project Flow Diagrams
+
+## 1. Overall System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           BANCAFI CREDIT PLATFORM                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          USER INTERFACE LAYER                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Web3 Wallets:  MetaMask │ WalletConnect │ Coinbase │ Gnosis Safe │ Ledger │
+│                                                                               │
+│  Frontend:      React + Next.js + Ethers.js + useWallet Hook                │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+┌────────────────────────────────┴────────────────────────────────────────────┐
+│                      WALLET INTEGRATION LAYER                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  BancafiWalletIntegration.sol                                               │
+│  • Multi-sig configuration                                                   │
+│  • Batch transactions                                                        │
+│  • Delegated access                                                          │
+│  • Session management                                                        │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+┌────────────────────────────────┴────────────────────────────────────────────┐
+│                        COMPLIANCE & KYC LAYER                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  BancafiCompliance.sol          │  InstitutionalOnboarding.sol              │
+│  • KYC/KYB Verification         │  • Institution verification                │
+│  • Blacklisting                 │  • Multi-signer management                 │
+│  • Slashing                     │  • KYB documentation                       │
+│  • Sanctioned countries         │  • Authorized signers                      │
+└────────────────────────────────┬────────────────────────────────────────────┘
+                                 │
+┌────────────────────────────────┴────────────────────────────────────────────┐
+│                         CORE LENDING LAYER                                   │
+├──────────────────────┬──────────────────────┬──────────────────────────────┤
+│  BancafiLending.sol  │ PrivateCreditLine.sol│   DebtCollection.sol         │
+│  • P2P lending       │ • Revolving credit   │   • Defaulted loans          │
+│  • Borrow requests   │ • 5 tiers (5-7% APY) │   • Payment plans            │
+│  • Loan management   │ • Bronze → Diamond   │   • Penalty calculation      │
+│  • Repayment         │ • Credit score based │   • Recovery process         │
+│  • Liquidation       │ • Flexible draw/repay│   • Debt transfer            │
+└──────────────────────┴──────────────────────┴──────────────────────────────┘
+                                 │
+┌────────────────────────────────┴────────────────────────────────────────────┐
+│                    COLLATERAL & RISK MANAGEMENT LAYER                        │
+├──────────────────────┬──────────────────────┬──────────────────────────────┤
+│ CollateralManager.sol│MultiAssetCollateral  │   CreditScore.sol            │
+│ • Single asset       │ • Basket (max 10)    │   • Score 0-1000             │
+│ • Lock/Release       │ • Diversification    │   • Payment history          │
+│ • Liquidation        │ • Weighted ratios    │   • Loan count               │
+│ • Health checks      │ • Auto-valuation     │   • Default tracking         │
+└──────────────────────┴──────────────────────┴──────────────────────────────┘
+                                 │
+┌────────────────────────────────┴────────────────────────────────────────────┐
+│                        MARKETPLACE & SERVICES LAYER                          │
+├──────────────────────┬──────────────────────┬──────────────────────────────┤
+│ BancafiBlockMarket   │ PortfolioManager.sol │   BancafiInsurance.sol       │
+│ • Debt marketplace   │ • Bundle 3-100 debts │   • Lender protection        │
+│ • 4 auction types    │ • 5 strategies       │   • Premium calculation      │
+│ • Fixed price        │ • Diversified        │   • Claims process           │
+│ • Dutch/English      │ • Geographic/Sector  │   • LP staking               │
+│ • Best offer         │ • Institutional sale │   • Pool solvency            │
+└──────────────────────┴──────────────────────┴──────────────────────────────┘
+                                 │
+┌────────────────────────────────┴────────────────────────────────────────────┐
+│                      INFRASTRUCTURE & SECURITY LAYER                         │
+├──────────────────────┬──────────────────────┬──────────────────────────────┤
+│ BancafiPriceOracle   │ FlashLoanProtection  │   Libraries                  │
+│ • Chainlink feeds    │ • Rate limiting      │   • ComplianceIntegration    │
+│ • Circuit breakers   │ • Bot detection      │   • Safe math operations     │
+│ • Fallback prices    │ • Same-block check   │   • Reentrancy guards        │
+│ • Multi-source       │ • Value limits       │   • Access control           │
+└──────────────────────┴──────────────────────┴──────────────────────────────┘
+```
+
+## 2. User Journey Flow
+
+### A. Borrower Journey - Standard Loan
+
+```
+┌─────────────┐
+│   START     │
+│  Borrower   │
+└──────┬──────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 1. Connect Wallet       │
+│    • MetaMask           │
+│    • WalletConnect      │
+│    • Coinbase Wallet    │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 2. Register Wallet      │
+│    registerWallet()     │
+│    • Choose wallet type │
+│    • Submit metadata    │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 3. Complete KYC         │
+│    verifyUser()         │
+│    • Submit documents   │
+│    • Wait for approval  │
+│    • Get verified ✓     │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 4. Deposit Collateral   │
+│    Choice:              │
+│    A) Single Asset      │
+│    B) Multi-Asset       │
+└──────┬──────────────────┘
+       │
+       ├─── A) Single Asset ────────────────┐
+       │                                     │
+       │    lockCollateral()                 │
+       │    • Approve token                  │
+       │    • Lock collateral                │
+       │                                     │
+       └─── B) Multi-Asset ─────────────────┤
+                                             │
+            createBasket()                   │
+            batchAddCollateral()             │
+            • Create basket                  │
+            • Add up to 10 assets            │
+            • Auto-calculate value           │
+                                             │
+       ┌─────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 5. Create Borrow Request│
+│    createBorrowRequest()│
+│    • Loan amount        │
+│    • Interest rate      │
+│    • Duration           │
+│    • Collateral ID      │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 6. Wait for Lender      │
+│    • Browse platform    │
+│    • Lender reviews     │
+│    • Lender accepts     │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 7. Loan Activated ✓     │
+│    • Receive funds      │
+│    • Loan starts        │
+│    • Interest accrues   │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 8. Repay Loan           │
+│    repayLoan()          │
+│    • Full/Partial repay │
+│    • Interest paid      │
+│    • Platform fee paid  │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 9. Collateral Released  │
+│    releaseCollateral()  │
+│    • Collateral unlocked│
+│    • Returned to wallet │
+│    • Credit score +     │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────┐
+│  END ✓      │
+│  Success    │
+└─────────────┘
+```
+
+### B. Lender Journey
+
+```
+┌─────────────┐
+│   START     │
+│   Lender    │
+└──────┬──────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 1. Connect & Register   │
+│    • Connect wallet     │
+│    • Complete KYC       │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 2. Browse Requests      │
+│    • Filter by:         │
+│      - Loan amount      │
+│      - Interest rate    │
+│      - Duration         │
+│      - Credit score     │
+│      - Collateral type  │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 3. Review Borrower      │
+│    • Check credit score │
+│    • View loan history  │
+│    • Assess collateral  │
+│    • Check health ratio │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 4. Optional: Buy        │
+│    Insurance            │
+│    purchasePolicy()     │
+│    • Pay premium        │
+│    • Get coverage       │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 5. Accept Request       │
+│    acceptBorrowRequest()│
+│    • Transfer funds     │
+│    • Loan activated     │
+└──────┬──────────────────┘
+       │
+       ▼
+┌─────────────────────────┐
+│ 6. Monitor Loan         │
+│    • Track payments     │
+│    • Watch health ratio │
+│    • Receive alerts     │
+└──────┬──────────────────┘
+       │
+       ├─── Healthy ─────────┐
+       │                      │
+       ▼                      │
+┌─────────────────────────┐  │
+│ 7a. Loan Repaid         │  │
+│     • Receive principal │  │
+│     • Receive interest  │  │
+│     • Credit score +    │  │
+└──────┬──────────────────┘  │
+       │                      │
+       ▼                      │
+┌─────────────┐              │
+│  END ✓      │              │
+│  Profit     │              │
+└─────────────┘              │
+                              │
+       └─── Unhealthy ────────┤
+                              │
+       ▼                      │
+┌─────────────────────────┐  │
+│ 7b. Liquidate Loan      │  │
+│     liquidateLoan()     │  │
+│     • Claim collateral  │  │
+│     • Sell on market    │  │
+│     • Recover funds     │  │
+└──────┬──────────────────┘  │
+       │                      │
+       ▼                      │
+┌─────────────────────────┐  │
+│ 8. Optional: Sell Debt  │  │
+│    listDebt()           │  │
+│    • List on BBM        │  │
+│    • Set price/auction  │  │
+│    • Recover partial    │  │
+└──────┬──────────────────┘  │
+       │                      │
+       ▼                      │
+┌─────────────┐              │
+│  END        │              │
+└─────────────┘              │
+                              │
+                              │
+       └──────────────────────┘
+```
+
+## 3. Multi-Asset Collateral Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│             MULTI-ASSET COLLATERAL WORKFLOW               │
+└───────────────────────────────────────────────────────────┘
+
+                    ┌──────────────┐
+                    │ User wants   │
+                    │ $100k loan   │
+                    └──────┬───────┘
+                           │
+                           ▼
+            ┌──────────────────────────────┐
+            │ Required: $150k collateral   │
+            │ (150% ratio)                 │
+            └──────┬───────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────┐
+    │ Create Basket                            │
+    │ createBasket(loanId)                     │
+    │ → Returns basketId                       │
+    └──────┬───────────────────────────────────┘
+           │
+           ▼
+    ┌──────────────────────────────────────────┐
+    │ Add Multiple Assets (Batch)              │
+    │ batchAddCollateral()                     │
+    │                                          │
+    │ Assets:                                  │
+    │ ├─ 40% WETH:  30 ETH  = $60,000         │
+    │ ├─ 30% WBTC:  1.5 BTC = $45,000         │
+    │ ├─ 20% stETH: 15 stETH= $30,000         │
+    │ └─ 10% USDC:  15k USDC= $15,000         │
+    │                                          │
+    │ Total Value: $150,000 ✓                 │
+    └──────┬───────────────────────────────────┘
+           │
+           ▼
+    ┌──────────────────────────────────────────┐
+    │ System Validates                         │
+    │ • Each asset < 70% (max allocation)     │
+    │ • Total value >= required               │
+    │ • Oracle prices valid                   │
+    │ • Assets supported                      │
+    └──────┬───────────────────────────────────┘
+           │
+           ▼
+    ┌──────────────────────────────────────────┐
+    │ Calculate Metrics                        │
+    │ • Weighted MCR: 139%                    │
+    │ • Weighted LT: 80.5%                    │
+    │ • Diversification: 7000/10000           │
+    └──────┬───────────────────────────────────┘
+           │
+           ▼
+    ┌──────────────────────────────────────────┐
+    │ Link to Loan                             │
+    │ loanToBasket[loanId] = basketId         │
+    └──────┬───────────────────────────────────┘
+           │
+           ▼
+    ┌──────────────────────────────────────────┐
+    │ Continuous Monitoring                    │
+    │                                          │
+    │ Every Block:                             │
+    │ • Fetch latest prices                   │
+    │ • Calculate basket value                │
+    │ • Check health ratio                    │
+    │ • Alert if LTV > 75%                    │
+    └──────┬───────────────────────────────────┘
+           │
+           ├─── Healthy ──────────────────┐
+           │                               │
+           ▼                               │
+    ┌────────────────────┐                │
+    │ Loan Repaid        │                │
+    │ releaseBasket()    │                │
+    │ • All assets       │                │
+    │   returned         │                │
+    └────────────────────┘                │
+                                           │
+           └─── Unhealthy ────────────────┤
+                                           │
+           ▼                               │
+    ┌────────────────────┐                │
+    │ Liquidate Basket   │                │
+    │ liquidateBasket()  │                │
+    │ • Sell all assets  │                │
+    │ • 5% bonus to      │                │
+    │   liquidator       │                │
+    └────────────────────┘                │
+                                           │
+                                           │
+           └───────────────────────────────┘
+```
+
+## 4. Private Credit Line Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│            PRIVATE CREDIT LINE WORKFLOW (5-7% APY)        │
+└───────────────────────────────────────────────────────────┘
+
+    ┌────────────────────┐
+    │ User applies for   │
+    │ credit line        │
+    └─────────┬──────────┘
+              │
+              ▼
+    ┌─────────────────────────────────────────┐
+    │ Check Credit Score                      │
+    │ creditScore.getScore(user)              │
+    │                                         │
+    │ Scores:                                 │
+    │ 0-599   → Bronze   (7% APR, $10k max)  │
+    │ 600-699 → Silver   (6.5% APR, $50k)    │
+    │ 700-799 → Gold     (6% APR, $100k)     │
+    │ 800-899 → Platinum (5.5% APR, $250k)   │
+    │ 900+    → Diamond  (5% APR, $500k)     │
+    └─────────┬───────────────────────────────┘
+              │
+              ▼
+    ┌─────────────────────────────────────────┐
+    │ Determine Eligible Tier                 │
+    │ Example: Score 750 → Gold Tier          │
+    │ • Max credit: $100,000                  │
+    │ • APR: 6%                               │
+    └─────────┬───────────────────────────────┘
+              │
+              ▼
+    ┌─────────────────────────────────────────┐
+    │ User Deposits Collateral                │
+    │ • Must cover max credit limit           │
+    │ • 150% collateralization                │
+    │ • $100k credit = $150k collateral       │
+    └─────────┬───────────────────────────────┘
+              │
+              ▼
+    ┌─────────────────────────────────────────┐
+    │ applyForCreditLine()                    │
+    │ • Asset: USDC                           │
+    │ • Requested: $100,000                   │
+    │ • Collateral locked                     │
+    │ → Returns creditLineId                  │
+    └─────────┬───────────────────────────────┘
+              │
+              ▼
+    ┌─────────────────────────────────────────┐
+    │ Admin/System Approval                   │
+    │ approveCreditLine(creditLineId)         │
+    │ • Verify documents                      │
+    │ • Check compliance                      │
+    │ • Activate credit line ✓                │
+    └─────────┬───────────────────────────────┘
+              │
+              ▼
+    ╔═════════════════════════════════════════╗
+    ║     CREDIT LINE ACTIVE                  ║
+    ║                                         ║
+    ║  Available: $100,000                    ║
+    ║  Used: $0                               ║
+    ║  APR: 6%                                ║
+    ╚═════════════════════════════════════════╝
+              │
+              ├─────────────────────────────────┐
+              │                                 │
+              ▼                                 │
+    ┌─────────────────────┐                    │
+    │ Draw Credit         │                    │
+    │ drawCredit($20k)    │                    │
+    │                     │                    │
+    │ Available: $80k     │                    │
+    │ Used: $20k          │                    │
+    │ Interest: 6% on 20k │                    │
+    └──────┬──────────────┘                    │
+           │                                    │
+           ▼                                    │
+    ┌─────────────────────┐                    │
+    │ Use Funds           │                    │
+    │ • Business expenses │                    │
+    │ • Inventory         │                    │
+    │ • Operations        │                    │
+    └──────┬──────────────┘                    │
+           │                                    │
+           ▼                                    │
+    ┌─────────────────────┐                    │
+    │ Repay Partial       │                    │
+    │ repayCreditLine($5k)│                    │
+    │                     │                    │
+    │ Available: $85k     │                    │
+    │ Used: $15k          │                    │
+    └──────┬──────────────┘                    │
+           │                                    │
+           └────────────────────────────────────┤
+                                                │
+           ┌────────────────────────────────────┘
+           │
+           ▼
+    ┌─────────────────────┐
+    │ Draw More           │
+    │ drawCredit($30k)    │
+    │                     │
+    │ Available: $55k     │
+    │ Used: $45k          │
+    └──────┬──────────────┘
+           │
+           │ (Revolving - can draw/repay anytime)
+           │
+           ▼
+    ┌─────────────────────┐
+    │ Build Credit        │
+    │ • On-time pays → +  │
+    │ • Score improves    │
+    │ • Upgrade tier      │
+    └──────┬──────────────┘
+           │
+           ▼
+    ┌─────────────────────┐
+    │ Score Now: 820      │
+    │ → Platinum Tier!    │
+    │                     │
+    │ New limit: $250k    │
+    │ New APR: 5.5%       │
+    └─────────────────────┘
+```
+
+## 5. Debt Trading Marketplace (BBM) Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│          BANCAFI BLOCK MARKET (BBM) - DEBT TRADING        │
+└───────────────────────────────────────────────────────────┘
+
+╔═══════════════════════════════════════════════════════════╗
+║                    LOAN DEFAULTS                          ║
+╚═══════════════════════════════════════════════════════════╝
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Loan Defaulted       │
+                │ • Payment missed     │
+                │ • Grace period over  │
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Transfer to          │
+                │ DebtCollection       │
+                │ recordDefault()      │
+                │ → collectionId       │
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Lender's Options:    │
+                │ 1. Direct recovery   │
+                │ 2. Payment plan      │
+                │ 3. Sell on BBM ←     │
+                └──────────┬───────────┘
+                           │
+                           ▼
+╔═══════════════════════════════════════════════════════════╗
+║              LIST DEBT ON BBM MARKETPLACE                 ║
+╚═══════════════════════════════════════════════════════════╝
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+        ▼                  ▼                  ▼
+┌───────────────┐ ┌────────────────┐ ┌──────────────┐
+│ Fixed Price   │ │ Dutch Auction  │ │ English      │
+│ listDebt()    │ │ listDebt()     │ │ Auction      │
+│               │ │                │ │ listDebt()   │
+│ • Set price   │ │ • Start: $10k  │ │ • Start: $2k │
+│   $5,000      │ │ • End: $5k     │ │ • Min bid:   │
+│ • First come  │ │ • Decay: 10%/hr│ │   $100       │
+└───────┬───────┘ └────────┬───────┘ └──────┬───────┘
+        │                  │                  │
+        │                  │                  │
+╔═══════╩══════════════════╩══════════════════╩═══════════╗
+║           BUYERS BROWSE MARKETPLACE                     ║
+╠═════════════════════════════════════════════════════════╣
+║  Filters:                                               ║
+║  • Debt amount                                          ║
+║  • Discount %                                           ║
+║  • Debtor credit score                                  ║
+║  • Collateral type                                      ║
+║  • Days overdue                                         ║
+║  • Recovery probability                                 ║
+╚═════════════════════════════════════════════════════════╝
+        │                  │                  │
+        ▼                  ▼                  ▼
+┌───────────────┐ ┌────────────────┐ ┌──────────────┐
+│ Buy Now       │ │ Wait for price │ │ Place bids   │
+│ buyDebt()     │ │ to drop        │ │ placeBid()   │
+│               │ │ • $10k → $9k   │ │ • Bid $3k    │
+│ Pay $5k       │ │ • $9k → $8k    │ │ • Bid $3.5k  │
+│ Get debt      │ │ buyDebt($7k)   │ │ • Winner at  │
+│ ownership     │ │                │ │   auction end│
+└───────┬───────┘ └────────┬───────┘ └──────┬───────┘
+        │                  │                  │
+        └──────────────────┴──────────────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Transfer Ownership   │
+                │ • Debt → new owner   │
+                │ • Payment → seller   │
+                │ • Platform fee (1%)  │
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ New Owner Options:   │
+                │ 1. Direct recovery   │
+                │ 2. Negotiate payment │
+                │ 3. Bundle & resell   │
+                │ 4. Legal action      │
+                └──────────────────────┘
+
+╔═══════════════════════════════════════════════════════════╗
+║           PORTFOLIO BUNDLING (INSTITUTIONAL)              ║
+╚═══════════════════════════════════════════════════════════╝
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Create Portfolio     │
+                │ createPortfolio()    │
+                │ Strategy: Diversified│
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Add Multiple Debts   │
+                │ batchAddDebts()      │
+                │                      │
+                │ Debt 1: $10k (30d)   │
+                │ Debt 2: $25k (60d)   │
+                │ Debt 3: $15k (45d)   │
+                │ Debt 4: $30k (90d)   │
+                │ ...                  │
+                │ Total: 10 debts      │
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Calculate Analytics  │
+                │ • Total: $200k       │
+                │ • Avg overdue: 52d   │
+                │ • Est recovery: 65%  │
+                │ • Diversification: 8/10│
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ List Portfolio       │
+                │ listPortfolio()      │
+                │ Asking: $100k        │
+                │ (50% discount)       │
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ Institutional Buyer  │
+                │ buyPortfolio()       │
+                │ • Buys all 10 debts  │
+                │ • Single transaction │
+                │ • Diversified risk   │
+                └──────────────────────┘
+```
+
+## 6. Compliance & KYC Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│               KYC/KYB COMPLIANCE WORKFLOW                 │
+└───────────────────────────────────────────────────────────┘
+
+                    ┌──────────────┐
+                    │ New User     │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ Choose Type: │
+                    │ Individual   │
+                    │ or Business  │
+                    └──────┬───────┘
+                           │
+         ┌─────────────────┴─────────────────┐
+         │                                   │
+         ▼                                   ▼
+┌────────────────────┐           ┌────────────────────┐
+│ INDIVIDUAL KYC     │           │ BUSINESS KYB       │
+└────────────────────┘           └────────────────────┘
+         │                                   │
+         ▼                                   ▼
+┌────────────────────┐           ┌────────────────────┐
+│ Level 1: Basic     │           │ Business Documents │
+│ • Gov ID           │           │ • Registration     │
+│ • Address proof    │           │ • Tax ID (EIN)     │
+│ • Selfie           │           │ • Financials       │
+│ Max: $10k loan     │           │ • Ownership info   │
+└────────┬───────────┘           └────────┬───────────┘
+         │                                   │
+         ▼                                   ▼
+┌────────────────────┐           ┌────────────────────┐
+│ Level 2: Enhanced  │           │ Verification       │
+│ • Bank statements  │           │ verifyInstitution()│
+│ • Tax returns      │           │ • Compliance check │
+│ • Employment       │           │ • Background check │
+│ Max: $50k loan     │           │ • Regulatory docs  │
+└────────────────────┘           └────────┬───────────┘
+                                           │
+                                           ▼
+                                 ┌────────────────────┐
+                                 │ KYB Approved       │
+                                 │ Access to:         │
+                                 │ • Institutional    │
+                                 │   features         │
+                                 │ • Multi-sig        │
+                                 │ • Higher limits    │
+                                 │ • Priority support │
+                                 └────────────────────┘
+         │
+         │
+         ▼
+╔════════════════════════════════════════════════════════╗
+║            COMPLIANCE SYSTEM ACTIVE                    ║
+╠════════════════════════════════════════════════════════╣
+║  Continuous Monitoring:                                ║
+║  • Transaction patterns                                ║
+║  • Suspicious activity                                 ║
+║  • Sanctions list check                                ║
+║  • KYC expiry (365 days)                               ║
+╚════════════════════════════════════════════════════════╝
+         │
+         ├─── Clean ───────────────┐
+         │                          │
+         ▼                          │
+┌────────────────────┐              │
+│ Full Platform      │              │
+│ Access ✓           │              │
+│ • Lending          │              │
+│ • Borrowing        │              │
+│ • Trading          │              │
+└────────────────────┘              │
+                                    │
+         └─── Suspicious ───────────┤
+                                    │
+         ▼                          │
+┌────────────────────┐              │
+│ Compliance Review  │              │
+│ • Flag account     │              │
+│ • Request docs     │              │
+│ • Temporary hold   │              │
+└────────┬───────────┘              │
+         │                          │
+         ├─── Cleared ──────────────┤
+         │                          │
+         └─── Violation ────────────┤
+                                    │
+         ▼                          │
+┌────────────────────┐              │
+│ BLACKLIST          │              │
+│ addToBlacklist()   │              │
+│                    │              │
+│ Reasons:           │              │
+│ • Fraud            │              │
+│ • Money laundering │              │
+│ • Sanctioned       │              │
+│ • Repeated default │              │
+│                    │              │
+│ Duration:          │              │
+│ • Permanent        │              │
+│ • Temporary (days) │              │
+└────────┬───────────┘              │
+         │                          │
+         ▼                          │
+┌────────────────────┐              │
+│ SLASHING (if severe)│             │
+│ slashUser()        │              │
+│                    │              │
+│ • Confiscate funds │              │
+│ • Permanent ban    │              │
+│ • Legal action     │              │
+└────────────────────┘              │
+                                    │
+                                    │
+         └────────────────────────────┘
+```
+
+## 7. Liquidation Flow
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                  LIQUIDATION WORKFLOW                     │
+└───────────────────────────────────────────────────────────┘
+
+              ┌────────────────────┐
+              │ Active Loan        │
+              │ $50k borrowed      │
+              │ $75k collateral    │
+              │ LTV: 67%           │
+              └─────────┬──────────┘
+                        │
+                        │ (Continuous monitoring)
+                        │
+                        ▼
+              ┌────────────────────┐
+              │ Price Monitoring   │
+              │ Every Block:       │
+              │ • Fetch prices     │
+              │ • Calculate LTV    │
+              │ • Check threshold  │
+              └─────────┬──────────┘
+                        │
+                        │
+         ┌──────────────┴──────────────┐
+         │                             │
+         ▼ Healthy                     ▼ Warning
+┌────────────────┐          ┌─────────────────────┐
+│ LTV < 75%      │          │ LTV 75-80%          │
+│ Status: Good ✓ │          │ Status: Warning ⚠️   │
+│ Continue...    │          │ Alert borrower:     │
+└────────────────┘          │ "Add collateral or  │
+                            │  repay to improve   │
+                            │  health ratio"      │
+                            └──────────┬──────────┘
+                                       │
+                                       │
+                                       ▼ LTV > 80%
+                            ┌─────────────────────┐
+                            │ LIQUIDATION ZONE    │
+                            │ Health < Threshold  │
+                            │ Can be liquidated   │
+                            └──────────┬──────────┘
+                                       │
+                                       ▼
+                            ┌─────────────────────┐
+                            │ Liquidator Detects  │
+                            │ • Bot monitoring    │
+                            │ • Sees opportunity  │
+                            │ • Checks profit:    │
+                            │   $75k collateral   │
+                            │   $50k debt         │
+                            │   + 5% bonus        │
+                            │   = $3.75k profit   │
+                            └──────────┬──────────┘
+                                       │
+                                       ▼
+                            ┌─────────────────────┐
+                            │ Execute Liquidation │
+                            │ liquidateLoan()     │
+                            │                     │
+                            │ Single Asset:       │
+                            │ • Transfer tokens   │
+                            │ • Repay lender      │
+                            │ • Bonus to          │
+                            │   liquidator        │
+                            │                     │
+                            │ Multi-Asset:        │
+                            │ liquidateBasket()   │
+                            │ • Sell all assets   │
+                            │ • Distribute funds  │
+                            │ • 5% bonus split    │
+                            └──────────┬──────────┘
+                                       │
+                                       ▼
+                            ┌─────────────────────┐
+                            │ Distribution        │
+                            │                     │
+                            │ From $75k:          │
+                            │ • Lender: $50k      │
+                            │ • Liquidator bonus: │
+                            │   $3.75k (5%)       │
+                            │ • Platform fee:     │
+                            │   $0.50k (1%)       │
+                            │ • Remaining: $20.75k│
+                            │   → Borrower        │
+                            └──────────┬──────────┘
+                                       │
+                                       ▼
+                            ┌─────────────────────┐
+                            │ Update States       │
+                            │ • Loan closed       │
+                            │ • Collateral freed  │
+                            │ • Credit score -50  │
+                            │ • History logged    │
+                            └─────────────────────┘
+```
+
+## 8. System Integration Map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SYSTEM INTEGRATION MAP                        │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  EXTERNAL INTEGRATIONS                                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Chainlink Oracles ──→ BancafiPriceOracle                      │
+│  (Price feeds)          • ETH/USD                               │
+│                         • BTC/USD                               │
+│                         • Stablecoin rates                      │
+│                                                                  │
+│  IPFS ──────────────→ Compliance System                        │
+│  (Document storage)     • KYC documents (encrypted)             │
+│                         • KYB certificates                      │
+│                         • Legal documents                       │
+│                                                                  │
+│  Wallet Providers ──→ BancafiWalletIntegration                 │
+│  • MetaMask            • Connection management                  │
+│  • WalletConnect       • Multi-sig support                     │
+│  • Coinbase Wallet     • Batch transactions                    │
+│  • Gnosis Safe                                                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  INTERNAL CONTRACT INTERACTIONS                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+BancafiLending
+  │
+  ├──→ CreditScore.recordRepayment()
+  ├──→ CollateralManager.lockCollateral()
+  ├──→ CollateralManager.releaseCollateral()
+  ├──→ CollateralManager.liquidateCollateral()
+  ├──→ Compliance.isUserVerified()
+  ├──→ Compliance.isBlacklisted()
+  └──→ DebtCollection.recordDefault()
+
+DebtCollection
+  │
+  ├──→ BancafiBlockMarket (debt listing)
+  ├──→ PortfolioManager (bundling)
+  ├──→ CreditScore.recordDefault()
+  └──→ Compliance checks
+
+MultiAssetCollateralManager
+  │
+  ├──→ PriceOracle.getLatestPrice() (per asset)
+  ├──→ Compliance checks
+  └──→ FlashLoanProtection library
+
+BancafiInsurance
+  │
+  ├──→ PriceOracle.getLatestPrice()
+  ├──→ BancafiLending (loan info)
+  └──→ Compliance checks
+
+BancafiPrivateCreditLine
+  │
+  ├──→ CreditScore.getScore()
+  ├──→ CollateralManager.lockCollateral()
+  ├──→ Compliance.isUserVerified()
+  └──→ FlashLoanProtection library
+
+InstitutionalOnboarding
+  │
+  ├──→ Compliance.verifyUser() (Institutional level)
+  ├──→ WalletIntegration (multi-sig setup)
+  └──→ CreditScore (institutional rating)
+```
+
+## 9. Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       DATA FLOW                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+USER ACTION              SMART CONTRACT                  RESULT
+───────────              ──────────────                  ──────
+
+Register Wallet
+    │                        │
+    ├──────────────→ WalletIntegration
+    │                  registerWallet()
+    │                        │
+    │                   Store profile
+    │                        │
+    └────────────────────────┴──────────→ Wallet ID created
+
+Complete KYC
+    │                        │
+    ├──────────────→ Compliance
+    │                  verifyUser()
+    │                        │
+    │                   IPFS hash stored
+    │                   Expiry set
+    │                        │
+    └────────────────────────┴──────────→ KYC verified ✓
+
+Create Loan
+    │                        │
+    ├──────────────→ BancafiLending
+    │                  createBorrowRequest()
+    │                        │
+    │                   ├──→ Compliance.check()
+    │                   ├──→ CreditScore.get()
+    │                   ├──→ Collateral.lock()
+    │                   │
+    │                   └──→ Emit event
+    │                        │
+    └────────────────────────┴──────────→ Loan created
+
+Accept Loan
+    │                        │
+    ├──────────────→ BancafiLending
+    │                  acceptBorrowRequest()
+    │                        │
+    │                   ├──→ FlashLoanCheck()
+    │                   ├──→ Transfer funds
+    │                   ├──→ Activate loan
+    │                   │
+    │                   └──→ Emit event
+    │                        │
+    └────────────────────────┴──────────→ Loan active
+
+Repay Loan
+    │                        │
+    ├──────────────→ BancafiLending
+    │                  repayLoan()
+    │                        │
+    │                   ├──→ Calculate interest
+    │                   ├──→ Transfer payment
+    │                   ├──→ CreditScore.update(+)
+    │                   ├──→ Collateral.release()
+    │                   │
+    │                   └──→ Emit event
+    │                        │
+    └────────────────────────┴──────────→ Loan closed ✓
+
+Price Update (Oracle)
+    │                        │
+    Chainlink ────────→ PriceOracle
+                         updatePrice()
+                              │
+                         ├──→ Circuit breaker check
+                         ├──→ Staleness check
+                         ├──→ Store price
+                         │
+                         └──→ Emit PriceUpdated
+                              │
+                         ┌────┴────┐
+                         │         │
+                         ▼         ▼
+                   Collateral   Insurance
+                   (revalue)    (revalue)
+```
+
+---
+
+## Quick Reference
+
+### Key Contract Addresses (After Deployment)
+
+```
+Core:
+├─ BancafiLending: 0x...
+├─ CollateralManager: 0x...
+├─ MultiAssetCollateral: 0x...
+└─ CreditScore: 0x...
+
+Features:
+├─ PrivateCreditLine: 0x...
+├─ DebtCollection: 0x...
+├─ BlockMarket: 0x...
+└─ PortfolioManager: 0x...
+
+Infrastructure:
+├─ PriceOracle: 0x...
+├─ Compliance: 0x...
+├─ Insurance: 0x...
+└─ WalletIntegration: 0x...
+```
+
+### Important Constants
+
+```
+BASIS_POINTS = 10000
+MIN_COLLATERAL_RATIO = 15000 (150%)
+LIQUIDATION_THRESHOLD = 8000 (80%)
+PLATFORM_FEE = 50 (0.5%)
+MAX_ASSETS_PER_BASKET = 10
+KYC_EXPIRY = 365 days
+MAX_INTEREST_RATE = 10000 (100%)
+```
+
+---
+
+**For detailed implementation, see individual contract documentation**

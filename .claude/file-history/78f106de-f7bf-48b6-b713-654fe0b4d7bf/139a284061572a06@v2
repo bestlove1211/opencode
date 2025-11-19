@@ -1,0 +1,246 @@
+import { expect, ethers, upgrades } from "./helpers/setup.js";
+import { deployFullSystem } from "./helpers/setup.js";
+
+describe("BancafiToken", function () {
+    let system, token, admin, user1, user2, user3;
+
+    beforeEach(async function () {
+        system = await deployFullSystem();
+        ({ token, admin, user1, user2, user3 } = system);
+    });
+
+    describe("Initialization", function () {
+        it("Should have correct name and symbol", async function () {
+            expect(await token.name()).to.equal("Bancafi Token");
+            expect(await token.symbol()).to.equal("BAFI");
+        });
+
+        it("Should have correct max supply", async function () {
+            expect(await token.MAX_SUPPLY()).to.equal(ethers.parseEther("1000000000"));
+        });
+
+        it("Should mint initial supply to admin", async function () {
+            const balance = await token.balanceOf(admin.address);
+            expect(balance).to.equal(ethers.parseEther("1000000"));
+        });
+
+        it("Should set correct allocations", async function () {
+            const maxSupply = await token.MAX_SUPPLY();
+            expect(await token.communityAllocation()).to.equal((maxSupply * 50n) / 100n);
+            expect(await token.teamAllocation()).to.equal((maxSupply * 20n) / 100n);
+            expect(await token.treasuryAllocation()).to.equal((maxSupply * 20n) / 100n);
+            expect(await token.ecosystemAllocation()).to.equal((maxSupply * 10n) / 100n);
+        });
+
+        it("Should grant admin roles", async function () {
+            const ADMIN_ROLE = await token.ADMIN_ROLE();
+            const MINTER_ROLE = await token.MINTER_ROLE();
+
+            expect(await token.hasRole(ADMIN_ROLE, admin.address)).to.be.true;
+            expect(await token.hasRole(MINTER_ROLE, admin.address)).to.be.true;
+        });
+    });
+
+    describe("Minting", function () {
+        it("Should mint tokens", async function () {
+            const amount = ethers.parseEther("1000");
+            await token.mint(user1.address, amount);
+
+            expect(await token.balanceOf(user1.address)).to.equal(amount);
+        });
+
+        it("Should emit Transfer event on mint", async function () {
+            const amount = ethers.parseEther("1000");
+
+            await expect(token.mint(user1.address, amount))
+                .to.emit(token, "Transfer")
+                .withArgs(ethers.ZeroAddress, user1.address, amount);
+        });
+
+        it("Should not mint beyond max supply", async function () {
+            const maxSupply = await token.MAX_SUPPLY();
+            const currentSupply = await token.totalSupply();
+            const remaining = maxSupply - currentSupply;
+
+            await expect(
+                token.mint(user1.address, remaining + 1n)
+            ).to.be.reverted;
+        });
+
+        it("Should revert if minting to zero address", async function () {
+            await expect(
+                token.mint(ethers.ZeroAddress, ethers.parseEther("1000"))
+            ).to.be.reverted;
+        });
+
+        it("Should only allow minter role to mint", async function () {
+            await expect(
+                token.connect(user1).mint(user2.address, ethers.parseEther("1000"))
+            ).to.be.reverted;
+        });
+
+        it("Should revert when paused", async function () {
+            await token.pause();
+
+            await expect(
+                token.mint(user1.address, ethers.parseEther("1000"))
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Burning", function () {
+        beforeEach(async function () {
+            await token.mint(user1.address, ethers.parseEther("1000"));
+        });
+
+        it("Should burn tokens", async function () {
+            const amount = ethers.parseEther("500");
+            await token.connect(user1).burn(amount);
+
+            expect(await token.balanceOf(user1.address)).to.equal(ethers.parseEther("500"));
+        });
+
+        it("Should decrease total supply", async function () {
+            const supplyBefore = await token.totalSupply();
+            await token.connect(user1).burn(ethers.parseEther("500"));
+            const supplyAfter = await token.totalSupply();
+
+            expect(supplyAfter).to.equal(supplyBefore - ethers.parseEther("500"));
+        });
+
+        it("Should emit Transfer event on burn", async function () {
+            await expect(token.connect(user1).burn(ethers.parseEther("500")))
+                .to.emit(token, "Transfer")
+                .withArgs(user1.address, ethers.ZeroAddress, ethers.parseEther("500"));
+        });
+
+        it("Should revert if burning more than balance", async function () {
+            await expect(
+                token.connect(user1).burn(ethers.parseEther("2000"))
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Voting Power", function () {
+        beforeEach(async function () {
+            await token.mint(user1.address, ethers.parseEther("1000"));
+        });
+
+        it("Should delegate voting power", async function () {
+            await token.connect(user1).delegate(user2.address);
+
+            expect(await token.delegates(user1.address)).to.equal(user2.address);
+        });
+
+        it("Should track voting power correctly", async function () {
+            await token.connect(user1).delegate(user1.address);
+
+            expect(await token.getVotes(user1.address)).to.equal(ethers.parseEther("1000"));
+        });
+
+        it("Should update voting power on transfer", async function () {
+            await token.connect(user1).delegate(user1.address);
+            await token.connect(user1).transfer(user2.address, ethers.parseEther("200"));
+
+            expect(await token.getVotes(user1.address)).to.equal(ethers.parseEther("800"));
+        });
+
+        it("Should get past votes", async function () {
+            await token.connect(user1).delegate(user1.address);
+
+            // Mine a block
+            await ethers.provider.send("evm_mine", []);
+
+            const blockNumber = await ethers.provider.getBlockNumber();
+            const pastVotes = await token.getPastVotes(user1.address, blockNumber - 1);
+
+            expect(pastVotes).to.equal(ethers.parseEther("1000"));
+        });
+    });
+
+    describe("Transfers", function () {
+        beforeEach(async function () {
+            await token.mint(user1.address, ethers.parseEther("1000"));
+        });
+
+        it("Should transfer tokens", async function () {
+            await token.connect(user1).transfer(user2.address, ethers.parseEther("200"));
+
+            expect(await token.balanceOf(user1.address)).to.equal(ethers.parseEther("800"));
+            expect(await token.balanceOf(user2.address)).to.equal(ethers.parseEther("200"));
+        });
+
+        it("Should revert transfer when paused", async function () {
+            await token.pause();
+
+            await expect(
+                token.connect(user1).transfer(user2.address, ethers.parseEther("200"))
+            ).to.be.reverted;
+        });
+
+        it("Should approve and transferFrom", async function () {
+            await token.connect(user1).approve(user2.address, ethers.parseEther("200"));
+            await token.connect(user2).transferFrom(user1.address, user3.address, ethers.parseEther("200"));
+
+            expect(await token.balanceOf(user3.address)).to.equal(ethers.parseEther("200"));
+        });
+    });
+
+    describe("Access Control", function () {
+        it("Should grant minter role", async function () {
+            const MINTER_ROLE = await token.MINTER_ROLE();
+            await token.grantRole(MINTER_ROLE, user1.address);
+
+            expect(await token.hasRole(MINTER_ROLE, user1.address)).to.be.true;
+        });
+
+        it("Should revoke minter role", async function () {
+            const MINTER_ROLE = await token.MINTER_ROLE();
+            await token.grantRole(MINTER_ROLE, user1.address);
+            await token.revokeRole(MINTER_ROLE, user1.address);
+
+            expect(await token.hasRole(MINTER_ROLE, user1.address)).to.be.false;
+        });
+
+        it("Should not allow non-admin to grant roles", async function () {
+            const MINTER_ROLE = await token.MINTER_ROLE();
+
+            await expect(
+                token.connect(user1).grantRole(MINTER_ROLE, user2.address)
+            ).to.be.reverted;
+        });
+    });
+
+    describe("Pausable", function () {
+        it("Should pause token", async function () {
+            await token.pause();
+            expect(await token.paused()).to.be.true;
+        });
+
+        it("Should unpause token", async function () {
+            await token.pause();
+            await token.unpause();
+            expect(await token.paused()).to.be.false;
+        });
+
+        it("Should not allow non-admin to pause", async function () {
+            await expect(token.connect(user1).pause()).to.be.reverted;
+        });
+    });
+
+    describe("Upgradability", function () {
+        it("Should upgrade contract", async function () {
+            const BancafiTokenV2 = await ethers.getContractFactory("BancafiToken");
+            const upgraded = await upgrades.upgradeProxy(await token.getAddress(), BancafiTokenV2);
+
+            // State should persist
+            expect(await upgraded.name()).to.equal("Bancafi Token");
+            expect(await upgraded.totalSupply()).to.equal(ethers.parseEther("1000000"));
+        });
+
+        it("Should only allow upgrader role to upgrade", async function () {
+            const UPGRADER_ROLE = await token.UPGRADER_ROLE();
+            expect(await token.hasRole(UPGRADER_ROLE, admin.address)).to.be.true;
+        });
+    });
+});

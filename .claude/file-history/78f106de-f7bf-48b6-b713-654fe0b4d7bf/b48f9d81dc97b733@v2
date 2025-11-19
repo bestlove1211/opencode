@@ -1,0 +1,620 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "../interfaces/IBTTBInterfaces.sol";
+
+/**
+ * @title CollateralManager
+ * @dev Centralized collateral tracking, monitoring, and liquidation management
+ * @notice Monitors collateralization ratios across all bond tokens and triggers
+ * liquidations when necessary to protect the system
+ * @custom:security-contact security@bancafi.io
+ */
+contract CollateralManager is ReentrancyGuard, AccessControl, Pausable {
+
+    bytes32 public constant LIQUIDATOR_ROLE = keccak256("LIQUIDATOR_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+
+    struct BondCollateral {
+        address bondToken;
+        address custodian;
+        uint256 totalCollateral;        // Total underlying bond value
+        uint256 totalSupply;            // Total bond tokens issued
+        uint256 lastUpdateTime;
+        uint256 healthRatio;            // In basis points (10000 = 100%)
+        CollateralStatus status;
+        AggregatorV3Interface priceFeed; // Chainlink price feed
+        uint256 liquidationThreshold;   // Minimum health ratio before liquidation
+        uint256 targetHealthRatio;      // Target health ratio
+    }
+
+    struct LiquidationEvent {
+        uint256 liquidationId;
+        address bondToken;
+        uint256 deficit;                // Amount of collateral deficit
+        uint256 timestamp;
+        address liquidator;
+        LiquidationStatus status;
+        uint256 amountLiquidated;
+        uint256 resolvedAt;
+    }
+
+    struct InsuranceFund {
+        address token;
+        uint256 balance;
+        uint256 totalDeposits;
+        uint256 totalClaims;
+        uint256 reserveRatio;           // Minimum reserve in basis points
+    }
+
+    enum CollateralStatus {
+        HEALTHY,            // Above target ratio
+        WARNING,            // Below target but above liquidation threshold
+        CRITICAL,           // Below liquidation threshold
+        LIQUIDATING,        // Currently being liquidated
+        SUSPENDED           // Suspended by admin
+    }
+
+    enum LiquidationStatus {
+        PENDING,
+        IN_PROGRESS,
+        COMPLETED,
+        FAILED,
+        CANCELLED
+    }
+
+    // State variables
+    mapping(address => BondCollateral) public bondCollaterals;
+    address[] public allBonds;
+    mapping(address => bool) public isBondRegistered;
+    mapping(IBondFactory.BondType => address[]) public bondsByType; // ✅ FIX: New efficient index
+
+    uint256 public nextLiquidationId;
+    mapping(uint256 => LiquidationEvent) public liquidations;
+    mapping(address => uint256[]) public bondLiquidations;
+
+    InsuranceFund public insuranceFund;
+
+    // Global configuration
+    uint256 public globalMinHealthRatio = 9500;      // 95% minimum
+    uint256 public globalTargetHealthRatio = 10500;  // 105% target
+    uint256 public liquidationPenalty = 500;         // 5% penalty
+    uint256 public maxHealthRatioDeviation = 2000;   // 20% max deviation
+    uint256 public maxInsuranceDeposit = 1_000_000e18; // ✅ FIX: Max deposit limit
+
+    // Alert thresholds
+    uint256 public warningThreshold = 10000;         // 100%
+    uint256 public criticalThreshold = 9500;         // 95%
+
+    // Events
+    event BondRegistered(
+        address indexed bondToken,
+        address indexed custodian,
+        uint256 liquidationThreshold
+    );
+    event CollateralUpdated(
+        address indexed bondToken,
+        uint256 totalCollateral,
+        uint256 totalSupply,
+        uint256 healthRatio
+    );
+    event CollateralStatusChanged(
+        address indexed bondToken,
+        CollateralStatus oldStatus,
+        CollateralStatus newStatus
+    );
+    event LiquidationTriggered(
+        uint256 indexed liquidationId,
+        address indexed bondToken,
+        uint256 deficit
+    );
+    event LiquidationCompleted(
+        uint256 indexed liquidationId,
+        uint256 amountLiquidated
+    );
+    event InsuranceFundDeposit(address indexed token, uint256 amount);
+    event InsuranceFundClaim(address indexed bondToken, uint256 amount);
+    event HealthRatioAlert(
+        address indexed bondToken,
+        uint256 healthRatio,
+        CollateralStatus status
+    );
+
+    /**
+     * @dev Constructor
+     * @param insuranceToken Token used for insurance fund
+     */
+    constructor(address insuranceToken) {
+        require(insuranceToken != address(0), "Invalid insurance token"); // ✅ FIX: Validation
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(LIQUIDATOR_ROLE, msg.sender);
+
+        insuranceFund.token = insuranceToken;
+        insuranceFund.reserveRatio = 2000; // 20% reserve
+    }
+
+    /**
+     * @dev Register bond token for collateral tracking
+     * @param bondToken Address of bond token
+     * @param custodian Address of custodian
+     * @param priceFeed Chainlink price feed address
+     * @param liquidationThreshold Liquidation threshold in basis points
+     * @param targetHealthRatio Target health ratio in basis points
+     */
+    function registerBond(
+        address bondToken,
+        address custodian,
+        address priceFeed,
+        uint256 liquidationThreshold,
+        uint256 targetHealthRatio
+    ) external onlyRole(OPERATOR_ROLE) {
+        require(!isBondRegistered[bondToken], "Already registered");
+        require(bondToken != address(0), "Invalid bond token");
+        require(custodian != address(0), "Invalid custodian");
+        require(priceFeed != address(0), "Invalid price feed"); // ✅ FIX: Added validation
+
+        bondCollaterals[bondToken] = BondCollateral({
+            bondToken: bondToken,
+            custodian: custodian,
+            totalCollateral: 0,
+            totalSupply: 0,
+            lastUpdateTime: block.timestamp,
+            healthRatio: 10000, // Start at 100%
+            status: CollateralStatus.HEALTHY,
+            priceFeed: AggregatorV3Interface(priceFeed),
+            liquidationThreshold: liquidationThreshold > 0
+                ? liquidationThreshold
+                : globalMinHealthRatio,
+            targetHealthRatio: targetHealthRatio > 0
+                ? targetHealthRatio
+                : globalTargetHealthRatio
+        });
+
+        allBonds.push(bondToken);
+        isBondRegistered[bondToken] = true;
+
+        emit BondRegistered(bondToken, custodian, liquidationThreshold);
+    }
+
+    /**
+     * @dev Update collateral for a bond token
+     * @param bondToken Address of bond token
+     * @param collateralAmount New collateral amount
+     */
+    function updateCollateral(
+        address bondToken,
+        uint256 collateralAmount
+    ) external onlyRole(OPERATOR_ROLE) {
+        require(isBondRegistered[bondToken], "Bond not registered");
+
+        BondCollateral storage collateral = bondCollaterals[bondToken];
+        CollateralStatus oldStatus = collateral.status;
+
+        collateral.totalCollateral = collateralAmount;
+        collateral.totalSupply = IBondToken(bondToken).totalSupply();
+        collateral.lastUpdateTime = block.timestamp;
+
+        // Calculate health ratio
+        if (collateral.totalSupply > 0) {
+            collateral.healthRatio = (collateral.totalCollateral * 10000) / collateral.totalSupply;
+        } else {
+            collateral.healthRatio = 10000;
+        }
+
+        // Update status based on health ratio
+        _updateCollateralStatus(bondToken);
+
+        emit CollateralUpdated(
+            bondToken,
+            collateralAmount,
+            collateral.totalSupply,
+            collateral.healthRatio
+        );
+
+        if (collateral.status != oldStatus) {
+            emit CollateralStatusChanged(bondToken, oldStatus, collateral.status);
+        }
+    }
+
+    /**
+     * @dev Update collateral status based on health ratio
+     * @param bondToken Address of bond token
+     */
+    function _updateCollateralStatus(address bondToken) internal {
+        BondCollateral storage collateral = bondCollaterals[bondToken];
+
+        if (collateral.status == CollateralStatus.SUSPENDED) {
+            return; // Don't change if manually suspended
+        }
+
+        if (collateral.healthRatio < collateral.liquidationThreshold) {
+            collateral.status = CollateralStatus.CRITICAL;
+            emit HealthRatioAlert(bondToken, collateral.healthRatio, CollateralStatus.CRITICAL);
+        } else if (collateral.healthRatio < warningThreshold) {
+            collateral.status = CollateralStatus.WARNING;
+            emit HealthRatioAlert(bondToken, collateral.healthRatio, CollateralStatus.WARNING);
+        } else if (collateral.healthRatio >= collateral.targetHealthRatio) {
+            collateral.status = CollateralStatus.HEALTHY;
+        } else {
+            collateral.status = CollateralStatus.WARNING;
+        }
+    }
+
+    /**
+     * @dev Trigger liquidation for undercollateralized bond
+     * @param bondToken Address of bond token
+     * @return liquidationId ID of created liquidation event
+     */
+    function triggerLiquidation(address bondToken)
+        external
+        onlyRole(LIQUIDATOR_ROLE)
+        nonReentrant
+        returns (uint256)
+    {
+        require(isBondRegistered[bondToken], "Bond not registered");
+
+        BondCollateral storage collateral = bondCollaterals[bondToken];
+        require(
+            collateral.status == CollateralStatus.CRITICAL,
+            "Not eligible for liquidation"
+        );
+        require(
+            collateral.healthRatio < collateral.liquidationThreshold,
+            "Above liquidation threshold"
+        );
+
+        // Calculate deficit
+        uint256 requiredCollateral = (collateral.totalSupply * collateral.targetHealthRatio) / 10000;
+        uint256 deficit = requiredCollateral > collateral.totalCollateral
+            ? requiredCollateral - collateral.totalCollateral
+            : 0;
+
+        require(deficit > 0, "No deficit");
+
+        uint256 liquidationId = nextLiquidationId++;
+
+        liquidations[liquidationId] = LiquidationEvent({
+            liquidationId: liquidationId,
+            bondToken: bondToken,
+            deficit: deficit,
+            timestamp: block.timestamp,
+            liquidator: msg.sender,
+            status: LiquidationStatus.PENDING,
+            amountLiquidated: 0,
+            resolvedAt: 0
+        });
+
+        bondLiquidations[bondToken].push(liquidationId);
+        collateral.status = CollateralStatus.LIQUIDATING;
+
+        emit LiquidationTriggered(liquidationId, bondToken, deficit);
+
+        return liquidationId;
+    }
+
+    /**
+     * @dev Complete liquidation by providing collateral
+     * @param liquidationId ID of liquidation event
+     * @param amountProvided Amount of collateral provided
+     */
+    function completeLiquidation(
+        uint256 liquidationId,
+        uint256 amountProvided
+    ) external onlyRole(LIQUIDATOR_ROLE) nonReentrant {
+        LiquidationEvent storage liquidation = liquidations[liquidationId];
+
+        require(
+            liquidation.status == LiquidationStatus.PENDING ||
+            liquidation.status == LiquidationStatus.IN_PROGRESS,
+            "Invalid status"
+        );
+        require(amountProvided > 0, "Invalid amount"); // ✅ FIX: Added validation
+
+        liquidation.amountLiquidated += amountProvided;
+
+        if (liquidation.amountLiquidated >= liquidation.deficit) {
+            liquidation.status = LiquidationStatus.COMPLETED;
+            liquidation.resolvedAt = block.timestamp;
+
+            // Update bond collateral
+            BondCollateral storage collateral = bondCollaterals[liquidation.bondToken];
+            collateral.totalCollateral += liquidation.amountLiquidated;
+            collateral.healthRatio = (collateral.totalCollateral * 10000) / collateral.totalSupply;
+
+            _updateCollateralStatus(liquidation.bondToken);
+
+            emit LiquidationCompleted(liquidationId, liquidation.amountLiquidated);
+        } else {
+            liquidation.status = LiquidationStatus.IN_PROGRESS;
+        }
+    }
+
+    /**
+     * @dev Use insurance fund to cover deficit
+     * @param bondToken Address of bond token
+     * @param amount Amount to use from insurance fund
+     */
+    function useInsuranceFund(
+        address bondToken,
+        uint256 amount
+    ) external onlyRole(OPERATOR_ROLE) nonReentrant {
+        require(isBondRegistered[bondToken], "Bond not registered");
+        require(amount > 0, "Invalid amount"); // ✅ FIX: Added validation
+        require(amount <= insuranceFund.balance, "Insufficient insurance fund");
+
+        BondCollateral storage collateral = bondCollaterals[bondToken];
+        require(
+            collateral.status == CollateralStatus.CRITICAL ||
+            collateral.status == CollateralStatus.LIQUIDATING,
+            "Not eligible"
+        );
+
+        insuranceFund.balance -= amount;
+        insuranceFund.totalClaims += amount;
+
+        collateral.totalCollateral += amount;
+        collateral.healthRatio = (collateral.totalCollateral * 10000) / collateral.totalSupply;
+
+        _updateCollateralStatus(bondToken);
+
+        emit InsuranceFundClaim(bondToken, amount);
+    }
+
+    /**
+     * @dev Deposit to insurance fund
+     * @param amount Amount to deposit
+     */
+    function depositInsuranceFund(uint256 amount)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        require(amount > 0, "Invalid amount");
+        require(amount <= maxInsuranceDeposit, "Amount too large"); // ✅ FIX: Added limit
+
+        insuranceFund.balance += amount;
+        insuranceFund.totalDeposits += amount;
+
+        emit InsuranceFundDeposit(insuranceFund.token, amount);
+    }
+
+    /**
+     * @dev Batch update collateral for multiple bonds
+     * @param bondTokens Array of bond token addresses
+     * @param collateralAmounts Array of collateral amounts
+     */
+    function batchUpdateCollateral(
+        address[] calldata bondTokens,
+        uint256[] calldata collateralAmounts
+    ) external onlyRole(OPERATOR_ROLE) {
+        require(bondTokens.length == collateralAmounts.length, "Length mismatch");
+        require(bondTokens.length <= 50, "Batch too large"); // ✅ FIX: Added limit
+
+        uint256 length = bondTokens.length; // ✅ FIX: Cache length
+        for (uint256 i = 0; i < length; ) {
+            if (isBondRegistered[bondTokens[i]]) {
+                BondCollateral storage collateral = bondCollaterals[bondTokens[i]];
+                CollateralStatus oldStatus = collateral.status;
+
+                collateral.totalCollateral = collateralAmounts[i];
+                collateral.totalSupply = IBondToken(bondTokens[i]).totalSupply();
+                collateral.lastUpdateTime = block.timestamp;
+
+                if (collateral.totalSupply > 0) {
+                    collateral.healthRatio = (collateral.totalCollateral * 10000) / collateral.totalSupply;
+                }
+
+                _updateCollateralStatus(bondTokens[i]);
+
+                emit CollateralUpdated(
+                    bondTokens[i],
+                    collateralAmounts[i],
+                    collateral.totalSupply,
+                    collateral.healthRatio
+                );
+
+                if (collateral.status != oldStatus) {
+                    emit CollateralStatusChanged(bondTokens[i], oldStatus, collateral.status);
+                }
+            }
+
+            unchecked { ++i; } // ✅ FIX: Gas optimization
+        }
+    }
+
+    /**
+     * @dev Get all bonds with critical status
+     * @return Array of critical bond addresses
+     */
+    function getCriticalBonds() external view returns (address[] memory) {
+        uint256 criticalCount = 0;
+        uint256 length = allBonds.length;
+
+        // Count critical bonds
+        for (uint256 i = 0; i < length; ) {
+            if (bondCollaterals[allBonds[i]].status == CollateralStatus.CRITICAL) {
+                criticalCount++;
+            }
+            unchecked { ++i; }
+        }
+
+        // Create array of critical bonds
+        address[] memory criticalBonds = new address[](criticalCount);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < length; ) {
+            if (bondCollaterals[allBonds[i]].status == CollateralStatus.CRITICAL) {
+                criticalBonds[index] = allBonds[i];
+                index++;
+            }
+            unchecked { ++i; }
+        }
+
+        return criticalBonds;
+    }
+
+    /**
+     * @dev Get all registered bonds
+     * @return Array of all bond addresses
+     */
+    function getAllBonds() external view returns (address[] memory) {
+        return allBonds;
+    }
+
+    /**
+     * @dev Get bond liquidation history
+     * @param bondToken Address of bond token
+     * @return Array of liquidation IDs
+     */
+    function getBondLiquidations(address bondToken)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        return bondLiquidations[bondToken];
+    }
+
+    /**
+     * @dev Check if bond needs liquidation
+     * @param bondToken Address of bond token
+     * @return True if liquidation needed
+     */
+    function needsLiquidation(address bondToken) external view returns (bool) {
+        BondCollateral memory collateral = bondCollaterals[bondToken]; // ✅ FIX: Use memory
+        return collateral.status == CollateralStatus.CRITICAL &&
+               collateral.healthRatio < collateral.liquidationThreshold;
+    }
+
+    /**
+     * @dev Get system health overview
+     * @return totalBonds Total number of bonds
+     * @return healthyBonds Number of healthy bonds
+     * @return warningBonds Number of warning bonds
+     * @return criticalBonds Number of critical bonds
+     * @return insuranceBalance Insurance fund balance
+     */
+    function getSystemHealth()
+        external
+        view
+        returns (
+            uint256 totalBonds,
+            uint256 healthyBonds,
+            uint256 warningBonds,
+            uint256 criticalBonds,
+            uint256 insuranceBalance
+        )
+    {
+        uint256 length = allBonds.length;
+        for (uint256 i = 0; i < length; ) {
+            CollateralStatus status = bondCollaterals[allBonds[i]].status;
+
+            if (status == CollateralStatus.HEALTHY) {
+                healthyBonds++;
+            } else if (status == CollateralStatus.WARNING) {
+                warningBonds++;
+            } else if (status == CollateralStatus.CRITICAL || status == CollateralStatus.LIQUIDATING) {
+                criticalBonds++;
+            }
+
+            unchecked { ++i; }
+        }
+
+        return (
+            allBonds.length,
+            healthyBonds,
+            warningBonds,
+            criticalBonds,
+            insuranceFund.balance
+        );
+    }
+
+    /**
+     * @dev Update global configuration
+     * @param _minHealthRatio New minimum health ratio
+     * @param _targetHealthRatio New target health ratio
+     * @param _liquidationPenalty New liquidation penalty
+     * @param _warningThreshold New warning threshold
+     * @param _criticalThreshold New critical threshold
+     */
+    function updateGlobalConfig(
+        uint256 _minHealthRatio,
+        uint256 _targetHealthRatio,
+        uint256 _liquidationPenalty,
+        uint256 _warningThreshold,
+        uint256 _criticalThreshold
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_minHealthRatio < _targetHealthRatio, "Invalid ratios");
+        require(_liquidationPenalty <= 1000, "Penalty too high"); // Max 10%
+
+        globalMinHealthRatio = _minHealthRatio;
+        globalTargetHealthRatio = _targetHealthRatio;
+        liquidationPenalty = _liquidationPenalty;
+        warningThreshold = _warningThreshold;
+        criticalThreshold = _criticalThreshold;
+    }
+
+    /**
+     * @dev Update max insurance deposit limit
+     * @param _maxInsuranceDeposit New max deposit amount
+     */
+    function updateMaxInsuranceDeposit(uint256 _maxInsuranceDeposit)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(_maxInsuranceDeposit > 0, "Invalid amount");
+        maxInsuranceDeposit = _maxInsuranceDeposit;
+    }
+
+    /**
+     * @dev Suspend bond collateral tracking (emergency)
+     * @param bondToken Address of bond token to suspend
+     */
+    function suspendBond(address bondToken)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(isBondRegistered[bondToken], "Bond not registered");
+
+        BondCollateral storage collateral = bondCollaterals[bondToken];
+        CollateralStatus oldStatus = collateral.status;
+        collateral.status = CollateralStatus.SUSPENDED;
+
+        emit CollateralStatusChanged(bondToken, oldStatus, CollateralStatus.SUSPENDED);
+    }
+
+    /**
+     * @dev Resume bond collateral tracking
+     * @param bondToken Address of bond token to resume
+     */
+    function resumeBond(address bondToken)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(isBondRegistered[bondToken], "Bond not registered");
+
+        BondCollateral storage collateral = bondCollaterals[bondToken];
+        require(collateral.status == CollateralStatus.SUSPENDED, "Not suspended");
+
+        _updateCollateralStatus(bondToken);
+    }
+
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause contract
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+}

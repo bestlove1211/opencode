@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title ICollateralManager
+ * @notice Interface for managing loan collateral
+ */
+interface ICollateralManager {
+    // Events
+    event CollateralLocked(address indexed user, address indexed asset, uint256 amount, uint256 indexed lockId);
+    event CollateralReleased(address indexed user, address indexed asset, uint256 amount, uint256 indexed lockId);
+    event CollateralLiquidated(address indexed user, address indexed recipient, address indexed asset, uint256 amount);
+    event CollateralValueUpdated(address indexed asset, uint256 oldValue, uint256 newValue);
+    event PriceOracleUpdated(address indexed oldOracle, address indexed newOracle);
+
+    /**
+     * @notice Lock collateral for a loan
+     * @param user User address
+     * @param asset Collateral asset address
+     * @param amount Amount to lock
+     * @return lockId Unique identifier for this collateral lock
+     */
+    function lockCollateral(address user, address asset, uint256 amount) external returns (uint256 lockId);
+
+    /**
+     * @notice Release locked collateral
+     * @param user User address
+     * @param asset Collateral asset address
+     * @param amount Amount to release
+     */
+    function releaseCollateral(address user, address asset, uint256 amount) external;
+
+    /**
+     * @notice Liquidate collateral
+     * @param user User address
+     * @param recipient Recipient of liquidated collateral
+     * @param asset Collateral asset address
+     * @param amount Amount to liquidate
+     */
+    function liquidateCollateral(address user, address recipient, address asset, uint256 amount) external;
+
+    /**
+     * @notice Get collateral value in USD
+     * @param asset Collateral asset address
+     * @param amount Amount of collateral
+     * @return value Value in USD (18 decimals)
+     */
+    function getCollateralValue(address asset, uint256 amount) external view returns (uint256 value);
+
+    /**
+     * @notice Get user's total locked collateral
+     * @param user User address
+     * @param asset Asset address
+     * @return Total locked amount
+     */
+    function getUserCollateral(address user, address asset) external view returns (uint256);
+
+    /**
+     * @notice Check if user has sufficient collateral
+     * @param user User address
+     * @param asset Asset address
+     * @param requiredAmount Required amount
+     * @return Whether user has sufficient collateral
+     */
+    function hasSufficientCollateral(address user, address asset, uint256 requiredAmount) external view returns (bool);
+}

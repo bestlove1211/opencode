@@ -1,0 +1,209 @@
+const express = require('express');
+const router = express.Router();
+const blockchain = require('../services/blockchain');
+const { ethers } = require('ethers');
+
+/**
+ * GET /api/assets/:tokenId
+ * Get asset details by token ID
+ */
+router.get('/:tokenId', async (req, res) => {
+  try {
+    const { tokenId } = req.params;
+
+    const asset = await blockchain.contracts.assetToken.assets(tokenId);
+    const owner = await blockchain.contracts.assetToken.ownerOf(tokenId);
+
+    res.json({
+      tokenId: parseInt(tokenId),
+      owner,
+      assetType: Number(asset.assetType),
+      assetTypeName: getAssetTypeName(Number(asset.assetType)),
+      valuation: ethers.formatEther(asset.valuation),
+      location: asset.location,
+      legalDocumentHash: asset.legalDocumentHash,
+      status: Number(asset.status),
+      statusName: getStatusName(Number(asset.status)),
+      verifiedAt: Number(asset.verifiedAt),
+      isFractionalized: asset.fractionalized,
+      totalFractions: asset.totalFractions ? Number(asset.totalFractions) : 0,
+      createdAt: Number(asset.tokenizedAt)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/assets/:tokenId/fractional-ownership/:address
+ * Get fractional ownership for an address
+ */
+router.get('/:tokenId/fractional-ownership/:address', async (req, res) => {
+  try {
+    const { tokenId, address } = req.params;
+
+    const ownership = await blockchain.contracts.assetToken.fractionalOwnership(tokenId, address);
+    const asset = await blockchain.contracts.assetToken.assets(tokenId);
+
+    res.json({
+      tokenId: parseInt(tokenId),
+      owner: address,
+      fractionsOwned: Number(ownership),
+      totalFractions: Number(asset.totalFractions),
+      ownershipPercentage: asset.totalFractions > 0
+        ? ((Number(ownership) / Number(asset.totalFractions)) * 100).toFixed(2)
+        : 0
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/assets/tokenize
+ * Tokenize a new asset
+ */
+router.post('/tokenize', async (req, res) => {
+  try {
+    const { to, assetType, valuation, location, legalDocumentHash, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('assetToken', privateKey);
+
+    const tx = await contract.tokenizeAsset(
+      to,
+      assetType,
+      ethers.parseEther(valuation),
+      location,
+      legalDocumentHash
+    );
+
+    const receipt = await tx.wait();
+
+    // Extract token ID from event
+    const event = receipt.logs.find(log => {
+      try {
+        return contract.interface.parseLog(log).name === 'AssetTokenized';
+      } catch {
+        return false;
+      }
+    });
+
+    let tokenId = null;
+    if (event) {
+      const parsed = contract.interface.parseLog(event);
+      tokenId = Number(parsed.args.tokenId);
+    }
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      tokenId,
+      gasUsed: receipt.gasUsed.toString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/assets/:tokenId/verify
+ * Verify an asset (VERIFIER_ROLE required)
+ */
+router.post('/:tokenId/verify', async (req, res) => {
+  try {
+    const { tokenId } = req.params;
+    const { privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('assetToken', privateKey);
+
+    const tx = await contract.verifyAsset(tokenId);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/assets/:tokenId/fractionalize
+ * Fractionalize an asset
+ */
+router.post('/:tokenId/fractionalize', async (req, res) => {
+  try {
+    const { tokenId } = req.params;
+    const { totalFractions, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('assetToken', privateKey);
+
+    const tx = await contract.fractionalizeAsset(tokenId, totalFractions);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      totalFractions
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/assets/:tokenId/transfer-fractional
+ * Transfer fractional ownership
+ */
+router.post('/:tokenId/transfer-fractional', async (req, res) => {
+  try {
+    const { tokenId } = req.params;
+    const { to, amount, privateKey } = req.body;
+
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Private key required' });
+    }
+
+    const contract = blockchain.getContractWithSigner('assetToken', privateKey);
+
+    const tx = await contract.transferFractional(tokenId, to, amount);
+    const receipt = await tx.wait();
+
+    res.json({
+      success: true,
+      transactionHash: receipt.hash,
+      blockNumber: receipt.blockNumber
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper functions
+function getAssetTypeName(type) {
+  const types = ['RealEstate', 'Minerals', 'OilAndEnergy', 'Gold', 'PhysicalAsset'];
+  return types[type] || 'Unknown';
+}
+
+function getStatusName(status) {
+  const statuses = ['Pending', 'Verified', 'Active', 'Locked', 'Defaulted'];
+  return statuses[status] || 'Unknown';
+}
+
+module.exports = router;

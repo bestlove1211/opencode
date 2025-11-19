@@ -1,0 +1,731 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title FlashLoanProtection - SECURITY FIXED VERSION
+ * @notice Library to protect against flash loan attacks
+ * @dev SECURITY FIXES IMPLEMENTED:
+ *      - C-5: Enhanced flash loan protection with timestamp-based rate limiting
+ *      - Dual-mode protection: block number (L1) + timestamp (L2/all chains)
+ *      - Configurable minimum action delay to prevent rapid exploitation
+ */
+library FlashLoanProtection {
+    // ============ Structs ============
+
+    struct ProtectionState {
+        // Block-based protection (original)
+        mapping(address => uint256) lastActionBlock;
+        mapping(address => uint256) actionCountInBlock;
+        mapping(bytes32 => bool) completedInSameBlock;
+        uint256 maxActionsPerBlock;
+
+        // SECURITY FIX C-5: Timestamp-based protection
+        mapping(address => uint256) lastActionTimestamp;
+        mapping(address => uint256) actionCountInWindow;
+        uint256 minActionDelay; // Minimum seconds between actions
+        uint256 rateLimitWindow; // Time window for rate limiting (e.g., 60 seconds)
+        uint256 maxActionsPerWindow; // Maximum actions within time window
+
+        // SECURITY FIX C-5: Sybil attack prevention
+        mapping(address => mapping(address => uint256)) lastInteractionTimestamp; // user => counterparty => timestamp
+        uint256 minInteractionDelay; // Minimum delay for same user-pair interactions
+
+        bool enabled;
+        bool timestampProtectionEnabled; // Toggle for timestamp-based protection
+    }
+
+    // ============ Events ============
+
+    event FlashLoanAttemptBlocked(
+        address indexed user,
+        string reason,
+        uint256 blockNumber
+    );
+
+    event SuspiciousActivity(
+        address indexed user,
+        uint256 actionCount,
+        uint256 blockNumber
+    );
+
+    // SECURITY FIX C-5: New events for enhanced protection
+    event RateLimitExceeded(
+        address indexed user,
+        uint256 actionCount,
+        uint256 windowDuration,
+        uint256 timestamp
+    );
+
+    event MinimumDelayViolation(
+        address indexed user,
+        uint256 timeSinceLastAction,
+        uint256 requiredDelay,
+        uint256 timestamp
+    );
+
+    event SybilAttackDetected(
+        address indexed user,
+        address indexed counterparty,
+        uint256 timeSinceLastInteraction,
+        uint256 timestamp
+    );
+
+    // ============ Constants ============
+
+    uint256 private constant DEFAULT_MAX_ACTIONS = 3;
+
+    // SECURITY FIX C-5: Default protection parameters
+    uint256 private constant DEFAULT_MIN_ACTION_DELAY = 12 seconds; // ~1 block on mainnet
+    uint256 private constant DEFAULT_RATE_LIMIT_WINDOW = 60 seconds;
+    uint256 private constant DEFAULT_MAX_ACTIONS_PER_WINDOW = 5;
+    uint256 private constant DEFAULT_MIN_INTERACTION_DELAY = 30 seconds;
+
+    // ============ Core Protection Functions ============
+
+    /**
+     * @notice Initialize protection state with enhanced parameters
+     * @param self ProtectionState storage
+     * @param maxActionsPerBlock Maximum actions allowed per block
+     */
+    function initialize(
+        ProtectionState storage self,
+        uint256 maxActionsPerBlock
+    ) internal {
+        self.maxActionsPerBlock = maxActionsPerBlock > 0 ? maxActionsPerBlock : DEFAULT_MAX_ACTIONS;
+
+        // SECURITY FIX C-5: Initialize timestamp-based protection
+        self.minActionDelay = DEFAULT_MIN_ACTION_DELAY;
+        self.rateLimitWindow = DEFAULT_RATE_LIMIT_WINDOW;
+        self.maxActionsPerWindow = DEFAULT_MAX_ACTIONS_PER_WINDOW;
+        self.minInteractionDelay = DEFAULT_MIN_INTERACTION_DELAY;
+
+        self.enabled = true;
+        self.timestampProtectionEnabled = true; // Enable by default for L2 compatibility
+    }
+
+    /**
+     * @notice Initialize with custom parameters
+     * @param self ProtectionState storage
+     * @param maxActionsPerBlock Maximum actions per block
+     * @param minActionDelay Minimum seconds between actions
+     * @param rateLimitWindow Rate limit window in seconds
+     * @param maxActionsPerWindow Maximum actions per window
+     */
+    function initializeWithParams(
+        ProtectionState storage self,
+        uint256 maxActionsPerBlock,
+        uint256 minActionDelay,
+        uint256 rateLimitWindow,
+        uint256 maxActionsPerWindow
+    ) internal {
+        self.maxActionsPerBlock = maxActionsPerBlock > 0 ? maxActionsPerBlock : DEFAULT_MAX_ACTIONS;
+        self.minActionDelay = minActionDelay;
+        self.rateLimitWindow = rateLimitWindow;
+        self.maxActionsPerWindow = maxActionsPerWindow;
+        self.minInteractionDelay = DEFAULT_MIN_INTERACTION_DELAY;
+
+        self.enabled = true;
+        self.timestampProtectionEnabled = true;
+    }
+
+    /**
+     * @notice Check and record action with ENHANCED protection
+     * @param self ProtectionState storage
+     * @param user User address
+     * @return allowed Whether action is allowed
+     * @dev SECURITY FIX C-5: Adds timestamp-based checks alongside block-based checks
+     */
+    function checkAndRecordAction(
+        ProtectionState storage self,
+        address user
+    ) internal returns (bool allowed) {
+        if (!self.enabled) {
+            return true;
+        }
+
+        uint256 currentBlock = block.number;
+        uint256 currentTimestamp = block.timestamp;
+
+        // ORIGINAL: Block-based protection (for L1)
+        if (self.lastActionBlock[user] != currentBlock) {
+            self.actionCountInBlock[user] = 0;
+            self.lastActionBlock[user] = currentBlock;
+        }
+
+        self.actionCountInBlock[user]++;
+
+        if (self.actionCountInBlock[user] > self.maxActionsPerBlock) {
+            emit FlashLoanAttemptBlocked(
+                user,
+                "Too many actions in single block",
+                currentBlock
+            );
+            return false;
+        }
+
+        // SECURITY FIX C-5: Timestamp-based protection (for all chains, especially L2)
+        if (self.timestampProtectionEnabled) {
+            // Check 1: Minimum delay between actions
+            if (self.lastActionTimestamp[user] > 0) {
+                uint256 timeSinceLastAction = currentTimestamp - self.lastActionTimestamp[user];
+
+                if (timeSinceLastAction < self.minActionDelay) {
+                    emit MinimumDelayViolation(
+                        user,
+                        timeSinceLastAction,
+                        self.minActionDelay,
+                        currentTimestamp
+                    );
+                    emit FlashLoanAttemptBlocked(
+                        user,
+                        "Minimum action delay not met",
+                        currentBlock
+                    );
+                    return false;
+                }
+            }
+
+            // Check 2: Rate limiting within time window
+            uint256 windowStart = currentTimestamp - self.rateLimitWindow;
+
+            // Reset counter if outside window
+            if (self.lastActionTimestamp[user] < windowStart) {
+                self.actionCountInWindow[user] = 0;
+            }
+
+            self.actionCountInWindow[user]++;
+
+            if (self.actionCountInWindow[user] > self.maxActionsPerWindow) {
+                emit RateLimitExceeded(
+                    user,
+                    self.actionCountInWindow[user],
+                    self.rateLimitWindow,
+                    currentTimestamp
+                );
+                emit FlashLoanAttemptBlocked(
+                    user,
+                    "Rate limit exceeded",
+                    currentBlock
+                );
+                return false;
+            }
+
+            // Update last action timestamp
+            self.lastActionTimestamp[user] = currentTimestamp;
+        }
+
+        // Alert if suspicious
+        if (self.actionCountInBlock[user] >= self.maxActionsPerBlock) {
+            emit SuspiciousActivity(
+                user,
+                self.actionCountInBlock[user],
+                currentBlock
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * @notice Check interaction between two parties (prevent Sybil flash loans)
+     * @param self ProtectionState storage
+     * @param user First party
+     * @param counterparty Second party
+     * @return allowed Whether interaction is allowed
+     * @dev SECURITY FIX C-5: Prevents rapid back-and-forth between same parties
+     */
+    function checkInteraction(
+        ProtectionState storage self,
+        address user,
+        address counterparty
+    ) internal returns (bool allowed) {
+        if (!self.enabled || !self.timestampProtectionEnabled) {
+            return true;
+        }
+
+        uint256 currentTimestamp = block.timestamp;
+        uint256 lastInteraction = self.lastInteractionTimestamp[user][counterparty];
+
+        if (lastInteraction > 0) {
+            uint256 timeSinceLastInteraction = currentTimestamp - lastInteraction;
+
+            if (timeSinceLastInteraction < self.minInteractionDelay) {
+                emit SybilAttackDetected(
+                    user,
+                    counterparty,
+                    timeSinceLastInteraction,
+                    currentTimestamp
+                );
+                return false;
+            }
+        }
+
+        // Record this interaction
+        self.lastInteractionTimestamp[user][counterparty] = currentTimestamp;
+        self.lastInteractionTimestamp[counterparty][user] = currentTimestamp;
+
+        return true;
+    }
+
+    /**
+     * @notice Prevent borrow and repay in same block
+     * @param self ProtectionState storage
+     * @param actionId Unique action identifier
+     * @return allowed Whether action is allowed
+     */
+    function preventSameBlockCompletion(
+        ProtectionState storage self,
+        bytes32 actionId
+    ) internal returns (bool allowed) {
+        if (!self.enabled) {
+            return true;
+        }
+
+        // Check if action already completed this block
+        if (self.completedInSameBlock[actionId]) {
+            emit FlashLoanAttemptBlocked(
+                msg.sender,
+                "Action already completed in same block",
+                block.number
+            );
+            return false;
+        }
+
+        // Mark as completed this block
+        self.completedInSameBlock[actionId] = true;
+
+        return true;
+    }
+
+    /**
+     * @notice Clear same-block completion flag (call in next block)
+     * @param self ProtectionState storage
+     * @param actionId Unique action identifier
+     */
+    function clearCompletionFlag(
+        ProtectionState storage self,
+        bytes32 actionId
+    ) internal {
+        delete self.completedInSameBlock[actionId];
+    }
+
+    /**
+     * @notice Get user action count in current block
+     * @param self ProtectionState storage
+     * @param user User address
+     * @return Action count
+     */
+    function getActionCount(
+        ProtectionState storage self,
+        address user
+    ) internal view returns (uint256) {
+        if (self.lastActionBlock[user] == block.number) {
+            return self.actionCountInBlock[user];
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Get user action count in current time window
+     * @param self ProtectionState storage
+     * @param user User address
+     * @return Action count
+     * @dev SECURITY FIX C-5: New function for timestamp-based rate limit checking
+     */
+    function getActionCountInWindow(
+        ProtectionState storage self,
+        address user
+    ) internal view returns (uint256) {
+        uint256 windowStart = block.timestamp - self.rateLimitWindow;
+
+        if (self.lastActionTimestamp[user] >= windowStart) {
+            return self.actionCountInWindow[user];
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Enable/disable protection
+     * @param self ProtectionState storage
+     * @param enabled Whether protection is enabled
+     */
+    function setEnabled(
+        ProtectionState storage self,
+        bool enabled
+    ) internal {
+        self.enabled = enabled;
+    }
+
+    /**
+     * @notice Enable/disable timestamp-based protection
+     * @param self ProtectionState storage
+     * @param enabled Whether timestamp protection is enabled
+     * @dev SECURITY FIX C-5: Toggle for timestamp-based protection
+     */
+    function setTimestampProtectionEnabled(
+        ProtectionState storage self,
+        bool enabled
+    ) internal {
+        self.timestampProtectionEnabled = enabled;
+    }
+
+    /**
+     * @notice Update max actions per block
+     * @param self ProtectionState storage
+     * @param maxActions New maximum
+     */
+    function setMaxActions(
+        ProtectionState storage self,
+        uint256 maxActions
+    ) internal {
+        require(maxActions > 0, "Max actions must be positive");
+        self.maxActionsPerBlock = maxActions;
+    }
+
+    /**
+     * @notice Update minimum action delay
+     * @param self ProtectionState storage
+     * @param delaySeconds New minimum delay in seconds
+     * @dev SECURITY FIX C-5: Configure minimum time between actions
+     */
+    function setMinActionDelay(
+        ProtectionState storage self,
+        uint256 delaySeconds
+    ) internal {
+        require(delaySeconds > 0, "Delay must be positive");
+        self.minActionDelay = delaySeconds;
+    }
+
+    /**
+     * @notice Update rate limit parameters
+     * @param self ProtectionState storage
+     * @param windowSeconds Time window in seconds
+     * @param maxActions Maximum actions within window
+     * @dev SECURITY FIX C-5: Configure rate limiting window
+     */
+    function setRateLimit(
+        ProtectionState storage self,
+        uint256 windowSeconds,
+        uint256 maxActions
+    ) internal {
+        require(windowSeconds > 0, "Window must be positive");
+        require(maxActions > 0, "Max actions must be positive");
+        self.rateLimitWindow = windowSeconds;
+        self.maxActionsPerWindow = maxActions;
+    }
+
+    // ============ Advanced Protection Functions ============
+
+    /**
+     * @notice Check for flash loan pattern (borrow -> action -> repay)
+     * @param borrowBlock Block when borrowed
+     * @param repayBlock Block when repaying
+     * @return isFlashLoan Whether this matches flash loan pattern
+     */
+    function detectFlashLoanPattern(
+        uint256 borrowBlock,
+        uint256 repayBlock
+    ) internal view returns (bool isFlashLoan) {
+        return borrowBlock == repayBlock;
+    }
+
+    /**
+     * @notice Check for flash loan pattern using timestamps
+     * @param borrowTimestamp Timestamp when borrowed
+     * @param repayTimestamp Timestamp when repaying
+     * @param maxFlashLoanDuration Maximum duration considered a flash loan
+     * @return isFlashLoan Whether this matches flash loan pattern
+     * @dev SECURITY FIX C-5: Timestamp-based flash loan detection
+     */
+    function detectFlashLoanPatternByTime(
+        uint256 borrowTimestamp,
+        uint256 repayTimestamp,
+        uint256 maxFlashLoanDuration
+    ) internal pure returns (bool isFlashLoan) {
+        if (repayTimestamp <= borrowTimestamp) {
+            return false; // Invalid timestamps
+        }
+
+        uint256 loanDuration = repayTimestamp - borrowTimestamp;
+        return loanDuration <= maxFlashLoanDuration;
+    }
+
+    /**
+     * @notice Calculate time-weighted action score (detect rapid transactions)
+     * @param lastActionTime Last action timestamp
+     * @param actionCount Number of actions
+     * @return suspicionScore Score indicating suspicious activity (0-100)
+     */
+    function calculateSuspicionScore(
+        uint256 lastActionTime,
+        uint256 actionCount
+    ) internal view returns (uint256 suspicionScore) {
+        if (actionCount == 0) {
+            return 0;
+        }
+
+        uint256 timeSinceLastAction = block.timestamp - lastActionTime;
+
+        // Score based on frequency
+        if (timeSinceLastAction < 1 minutes) {
+            if (actionCount >= 5) return 100; // Very suspicious
+            if (actionCount >= 3) return 75;  // Suspicious
+            if (actionCount >= 2) return 50;  // Moderately suspicious
+        } else if (timeSinceLastAction < 5 minutes) {
+            if (actionCount >= 10) return 75;
+            if (actionCount >= 5) return 50;
+        }
+
+        return 25; // Low suspicion
+    }
+
+    /**
+     * @notice Verify oracle price hasn't been manipulated
+     * @param currentPrice Current price
+     * @param lastPrice Last known price
+     * @param maxDeviationBps Maximum allowed deviation in basis points
+     * @return isValid Whether price change is within acceptable range
+     */
+    function validatePriceChange(
+        uint256 currentPrice,
+        uint256 lastPrice,
+        uint256 maxDeviationBps
+    ) internal pure returns (bool isValid) {
+        if (lastPrice == 0 || currentPrice == 0) {
+            return false;
+        }
+
+        uint256 priceDiff;
+        if (currentPrice > lastPrice) {
+            priceDiff = currentPrice - lastPrice;
+        } else {
+            priceDiff = lastPrice - currentPrice;
+        }
+
+        uint256 deviationBps = (priceDiff * 10000) / lastPrice;
+
+        return deviationBps <= maxDeviationBps;
+    }
+
+    /**
+     * @notice Check if transaction is likely from a flash loan bot
+     * @param gasPrice Transaction gas price
+     * @param averageGasPrice Network average gas price
+     * @return isLikelyBot Whether transaction characteristics match bot behavior
+     */
+    function detectBotBehavior(
+        uint256 gasPrice,
+        uint256 averageGasPrice
+    ) internal pure returns (bool isLikelyBot) {
+        // Bots often use very high gas prices for MEV
+        if (gasPrice > averageGasPrice * 3) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ============ Helper Functions ============
+
+    /**
+     * @notice Generate unique action ID
+     * @param user User address
+     * @param actionType Type of action
+     * @param nonce Action nonce
+     * @return actionId Unique identifier
+     */
+    function generateActionId(
+        address user,
+        string memory actionType,
+        uint256 nonce
+    ) internal pure returns (bytes32 actionId) {
+        return keccak256(abi.encodePacked(user, actionType, nonce));
+    }
+
+    /**
+     * @notice Check if same block as deployment (protect against same-block exploits)
+     * @param deploymentBlock Block contract was deployed
+     * @return isSameBlock Whether current block equals deployment block
+     */
+    function isSameBlockAsDeployment(
+        uint256 deploymentBlock
+    ) internal view returns (bool isSameBlock) {
+        return block.number == deploymentBlock;
+    }
+}
+
+/**
+ * @title FlashLoanGuard - SECURITY FIXED VERSION
+ * @notice Abstract contract to inherit flash loan protection
+ * @dev SECURITY FIX C-5: Enhanced with timestamp-based protection
+ */
+abstract contract FlashLoanGuard {
+    using FlashLoanProtection for FlashLoanProtection.ProtectionState;
+
+    FlashLoanProtection.ProtectionState internal _flashLoanProtection;
+
+    event FlashLoanProtectionEnabled();
+    event FlashLoanProtectionDisabled();
+    event MaxActionsPerBlockUpdated(uint256 oldMax, uint256 newMax);
+
+    // SECURITY FIX C-5: New events
+    event TimestampProtectionEnabled();
+    event TimestampProtectionDisabled();
+    event MinActionDelayUpdated(uint256 oldDelay, uint256 newDelay);
+    event RateLimitUpdated(uint256 windowSeconds, uint256 maxActions);
+
+    /**
+     * @notice Initialize flash loan protection
+     * @param maxActionsPerBlock Maximum actions per block
+     */
+    function _initializeFlashLoanProtection(uint256 maxActionsPerBlock) internal {
+        _flashLoanProtection.initialize(maxActionsPerBlock);
+        emit FlashLoanProtectionEnabled();
+        emit TimestampProtectionEnabled();
+    }
+
+    /**
+     * @notice Initialize with custom parameters
+     * @param maxActionsPerBlock Maximum actions per block
+     * @param minActionDelay Minimum seconds between actions
+     * @param rateLimitWindow Rate limit window in seconds
+     * @param maxActionsPerWindow Maximum actions per window
+     * @dev SECURITY FIX C-5: Enhanced initialization
+     */
+    function _initializeFlashLoanProtectionWithParams(
+        uint256 maxActionsPerBlock,
+        uint256 minActionDelay,
+        uint256 rateLimitWindow,
+        uint256 maxActionsPerWindow
+    ) internal {
+        _flashLoanProtection.initializeWithParams(
+            maxActionsPerBlock,
+            minActionDelay,
+            rateLimitWindow,
+            maxActionsPerWindow
+        );
+        emit FlashLoanProtectionEnabled();
+        emit TimestampProtectionEnabled();
+    }
+
+    /**
+     * @notice Modifier to check and record action
+     */
+    modifier flashLoanProtected() {
+        require(
+            _flashLoanProtection.checkAndRecordAction(msg.sender),
+            "Flash loan protection: action blocked"
+        );
+        _;
+    }
+
+    /**
+     * @notice Modifier to check interaction between parties
+     * @param counterparty The other party in the transaction
+     * @dev SECURITY FIX C-5: New modifier for Sybil protection
+     */
+    modifier flashLoanProtectedInteraction(address counterparty) {
+        require(
+            _flashLoanProtection.checkInteraction(msg.sender, counterparty),
+            "Flash loan protection: interaction blocked"
+        );
+        _;
+    }
+
+    /**
+     * @notice Modifier to prevent same-block completion
+     * @param actionId Unique action identifier
+     */
+    modifier noSameBlockCompletion(bytes32 actionId) {
+        require(
+            _flashLoanProtection.preventSameBlockCompletion(actionId),
+            "Flash loan protection: same-block completion blocked"
+        );
+        _;
+    }
+
+    /**
+     * @notice Enable flash loan protection
+     */
+    function _enableFlashLoanProtection() internal {
+        _flashLoanProtection.setEnabled(true);
+        emit FlashLoanProtectionEnabled();
+    }
+
+    /**
+     * @notice Disable flash loan protection
+     */
+    function _disableFlashLoanProtection() internal {
+        _flashLoanProtection.setEnabled(false);
+        emit FlashLoanProtectionDisabled();
+    }
+
+    /**
+     * @notice Enable timestamp-based protection
+     * @dev SECURITY FIX C-5: New function
+     */
+    function _enableTimestampProtection() internal {
+        _flashLoanProtection.setTimestampProtectionEnabled(true);
+        emit TimestampProtectionEnabled();
+    }
+
+    /**
+     * @notice Disable timestamp-based protection
+     * @dev SECURITY FIX C-5: New function
+     */
+    function _disableTimestampProtection() internal {
+        _flashLoanProtection.setTimestampProtectionEnabled(false);
+        emit TimestampProtectionDisabled();
+    }
+
+    /**
+     * @notice Update max actions per block
+     * @param newMax New maximum
+     */
+    function _updateMaxActionsPerBlock(uint256 newMax) internal {
+        uint256 oldMax = _flashLoanProtection.maxActionsPerBlock;
+        _flashLoanProtection.setMaxActions(newMax);
+        emit MaxActionsPerBlockUpdated(oldMax, newMax);
+    }
+
+    /**
+     * @notice Update minimum action delay
+     * @param delaySeconds New minimum delay in seconds
+     * @dev SECURITY FIX C-5: New function
+     */
+    function _updateMinActionDelay(uint256 delaySeconds) internal {
+        uint256 oldDelay = _flashLoanProtection.minActionDelay;
+        _flashLoanProtection.setMinActionDelay(delaySeconds);
+        emit MinActionDelayUpdated(oldDelay, delaySeconds);
+    }
+
+    /**
+     * @notice Update rate limit parameters
+     * @param windowSeconds Time window in seconds
+     * @param maxActions Maximum actions within window
+     * @dev SECURITY FIX C-5: New function
+     */
+    function _updateRateLimit(uint256 windowSeconds, uint256 maxActions) internal {
+        _flashLoanProtection.setRateLimit(windowSeconds, maxActions);
+        emit RateLimitUpdated(windowSeconds, maxActions);
+    }
+
+    /**
+     * @notice Get user's action count in current block
+     * @param user User address
+     * @return Action count
+     */
+    function _getActionCount(address user) internal view returns (uint256) {
+        return _flashLoanProtection.getActionCount(user);
+    }
+
+    /**
+     * @notice Get user's action count in current time window
+     * @param user User address
+     * @return Action count
+     * @dev SECURITY FIX C-5: New function
+     */
+    function _getActionCountInWindow(address user) internal view returns (uint256) {
+        return _flashLoanProtection.getActionCountInWindow(user);
+    }
+}

@@ -1,0 +1,275 @@
+import hre from "hardhat";
+import { ethers, upgrades } from "hardhat";
+import { getNetworkConfig, verifyContract, waitForConfirmations, saveDeployment } from "./helpers/config.js";
+
+async function main() {
+    const [deployer] = await ethers.getSigners();
+    const network = hre.network.name;
+    const config = getNetworkConfig(network);
+
+    console.log("🚀 Deploying Bancafi Debt Collection System");
+    console.log("==========================================");
+    console.log(`Network: ${network}`);
+    console.log(`Deployer: ${deployer.address}`);
+    console.log(`Balance: ${ethers.formatEther(await ethers.provider.getBalance(deployer.address))} ETH`);
+    console.log("");
+
+    const deployedContracts = {};
+
+    // ============ 1. Deploy BancafiToken ============
+    console.log("📝 Deploying BancafiToken...");
+    const BancafiToken = await ethers.getContractFactory("BancafiToken");
+    const token = await upgrades.deployProxy(
+        BancafiToken,
+        [deployer.address, ethers.parseEther(config.initialTokenSupply)],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await token.waitForDeployment();
+    const tokenAddress = await token.getAddress();
+    deployedContracts.bancafiToken = tokenAddress;
+    console.log(`✅ BancafiToken deployed to: ${tokenAddress}`);
+    console.log("");
+
+    // ============ 2. Deploy ReputationManager ============
+    console.log("📝 Deploying ReputationManager...");
+    const ReputationManager = await ethers.getContractFactory("ReputationManager");
+    const reputationManager = await upgrades.deployProxy(
+        ReputationManager,
+        [deployer.address],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await reputationManager.waitForDeployment();
+    const reputationAddress = await reputationManager.getAddress();
+    deployedContracts.reputationManager = reputationAddress;
+    console.log(`✅ ReputationManager deployed to: ${reputationAddress}`);
+    console.log("");
+
+    // ============ 3. Deploy ComplianceManager ============
+    console.log("📝 Deploying ComplianceManager...");
+    const ComplianceManager = await ethers.getContractFactory("ComplianceManager");
+    const complianceManager = await upgrades.deployProxy(
+        ComplianceManager,
+        [deployer.address],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await complianceManager.waitForDeployment();
+    const complianceAddress = await complianceManager.getAddress();
+    deployedContracts.complianceManager = complianceAddress;
+    console.log(`✅ ComplianceManager deployed to: ${complianceAddress}`);
+    console.log("");
+
+    // ============ 4. Deploy DebtToken ============
+    console.log("📝 Deploying DebtToken...");
+    const DebtToken = await ethers.getContractFactory("DebtToken");
+    const debtToken = await upgrades.deployProxy(
+        DebtToken,
+        ["Bancafi Debt Token", "BDT", deployer.address],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await debtToken.waitForDeployment();
+    const debtTokenAddress = await debtToken.getAddress();
+    deployedContracts.debtToken = debtTokenAddress;
+    console.log(`✅ DebtToken deployed to: ${debtTokenAddress}`);
+    console.log("");
+
+    // ============ 5. Deploy CollectionAutomator ============
+    console.log("📝 Deploying CollectionAutomator...");
+    const CollectionAutomator = await ethers.getContractFactory("CollectionAutomator");
+    const collectionAutomator = await upgrades.deployProxy(
+        CollectionAutomator,
+        [
+            deployer.address,
+            debtTokenAddress,
+            complianceAddress,
+            reputationAddress
+        ],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await collectionAutomator.waitForDeployment();
+    const automatorAddress = await collectionAutomator.getAddress();
+    deployedContracts.collectionAutomator = automatorAddress;
+    console.log(`✅ CollectionAutomator deployed to: ${automatorAddress}`);
+    console.log("");
+
+    // ============ 6. Deploy DebtMarketplace ============
+    console.log("📝 Deploying DebtMarketplace...");
+    const DebtMarketplace = await ethers.getContractFactory("DebtMarketplace");
+    const marketplace = await upgrades.deployProxy(
+        DebtMarketplace,
+        [
+            deployer.address,
+            debtTokenAddress,
+            complianceAddress,
+            deployer.address // Treasury (change to multisig in production)
+        ],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await marketplace.waitForDeployment();
+    const marketplaceAddress = await marketplace.getAddress();
+    deployedContracts.marketplace = marketplaceAddress;
+    console.log(`✅ DebtMarketplace deployed to: ${marketplaceAddress}`);
+    console.log("");
+
+    // ============ 7. Deploy TimelockController ============
+    console.log("📝 Deploying TimelockController...");
+    const TimelockController = await ethers.getContractFactory("TimelockControllerUpgradeable");
+    const timelock = await upgrades.deployProxy(
+        TimelockController,
+        [
+            config.timelockDelay,
+            [deployer.address], // proposers
+            [deployer.address], // executors
+            deployer.address    // admin
+        ],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await timelock.waitForDeployment();
+    const timelockAddress = await timelock.getAddress();
+    deployedContracts.timelock = timelockAddress;
+    console.log(`✅ TimelockController deployed to: ${timelockAddress}`);
+    console.log("");
+
+    // ============ 8. Deploy BancafiDAO ============
+    console.log("📝 Deploying BancafiDAO...");
+    const BancafiDAO = await ethers.getContractFactory("BancafiDAO");
+    const dao = await upgrades.deployProxy(
+        BancafiDAO,
+        [
+            tokenAddress,
+            timelockAddress,
+            config.votingDelay,
+            config.votingPeriod,
+            ethers.parseEther(config.proposalThreshold),
+            config.quorumPercentage
+        ],
+        {
+            initializer: "initialize",
+            kind: "uups"
+        }
+    );
+    await dao.waitForDeployment();
+    const daoAddress = await dao.getAddress();
+    deployedContracts.dao = daoAddress;
+    console.log(`✅ BancafiDAO deployed to: ${daoAddress}`);
+    console.log("");
+
+    // ============ Configuration Phase ============
+    console.log("⚙️  Configuring contracts...");
+    console.log("");
+
+    // Grant roles
+    console.log("Setting up roles...");
+    const MINTER_ROLE = await debtToken.MINTER_ROLE();
+    const OPERATOR_ROLE = await debtToken.OPERATOR_ROLE();
+
+    await debtToken.grantRole(MINTER_ROLE, deployer.address);
+    console.log("✅ Granted MINTER_ROLE to deployer");
+
+    await debtToken.grantRole(OPERATOR_ROLE, automatorAddress);
+    console.log("✅ Granted OPERATOR_ROLE to CollectionAutomator");
+
+    await collectionAutomator.grantRole(OPERATOR_ROLE, deployer.address);
+    console.log("✅ Granted OPERATOR_ROLE to deployer on CollectionAutomator");
+
+    await reputationManager.grantRole(OPERATOR_ROLE, automatorAddress);
+    console.log("✅ Granted OPERATOR_ROLE to CollectionAutomator on ReputationManager");
+    console.log("");
+
+    // Set contract references
+    console.log("Setting contract references...");
+    await debtToken.setComplianceManager(complianceAddress);
+    console.log("✅ Set ComplianceManager on DebtToken");
+
+    await debtToken.setCollectionAutomator(automatorAddress);
+    console.log("✅ Set CollectionAutomator on DebtToken");
+
+    await collectionAutomator.setMarketplace(marketplaceAddress);
+    console.log("✅ Set Marketplace on CollectionAutomator");
+    console.log("");
+
+    // Set parameters
+    console.log("Setting parameters...");
+    await debtToken.setMinPrincipalAmount(ethers.parseEther(config.minPrincipalAmount));
+    console.log(`✅ Set min principal amount: ${config.minPrincipalAmount} ETH`);
+
+    await debtToken.setMaxInterestRate(config.maxInterestRate);
+    console.log(`✅ Set max interest rate: ${config.maxInterestRate / 100}%`);
+
+    await marketplace.setTradingFee(config.tradingFee);
+    console.log(`✅ Set trading fee: ${config.tradingFee / 100}%`);
+
+    await marketplace.setListingDuration(config.minListingDuration, config.maxListingDuration);
+    console.log(`✅ Set listing duration: ${config.minListingDuration / 86400} - ${config.maxListingDuration / 86400} days`);
+
+    await collectionAutomator.setDefaultSecurityDeposit(ethers.parseEther(config.defaultSecurityDeposit));
+    console.log(`✅ Set security deposit: ${config.defaultSecurityDeposit} ETH`);
+
+    await collectionAutomator.setSlashingPercentage(config.slashingPercentage);
+    console.log(`✅ Set slashing percentage: ${config.slashingPercentage / 100}%`);
+
+    await collectionAutomator.setMaxWarnings(config.maxWarnings);
+    console.log(`✅ Set max warnings: ${config.maxWarnings}`);
+    console.log("");
+
+    // ============ Save Deployment ============
+    saveDeployment(network, {
+        deployer: deployer.address,
+        contracts: deployedContracts,
+        config
+    });
+
+    // ============ Summary ============
+    console.log("🎉 Deployment Complete!");
+    console.log("=======================");
+    console.log("Deployed Contracts:");
+    console.log(`  BancafiToken:         ${deployedContracts.bancafiToken}`);
+    console.log(`  ReputationManager:    ${deployedContracts.reputationManager}`);
+    console.log(`  ComplianceManager:    ${deployedContracts.complianceManager}`);
+    console.log(`  DebtToken:            ${deployedContracts.debtToken}`);
+    console.log(`  CollectionAutomator:  ${deployedContracts.collectionAutomator}`);
+    console.log(`  DebtMarketplace:      ${deployedContracts.marketplace}`);
+    console.log(`  TimelockController:   ${deployedContracts.timelock}`);
+    console.log(`  BancafiDAO:           ${deployedContracts.dao}`);
+    console.log("");
+
+    // ============ Verification (Testnet/Mainnet only) ============
+    if (network !== "localhost" && network !== "hardhat") {
+        console.log("⏳ Waiting before verification...");
+        await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds
+
+        console.log("🔍 Verifying contracts on Etherscan...");
+        // Note: Proxy verification is complex, we verify implementation contracts
+        console.log("Note: You may need to verify proxy contracts manually");
+    }
+
+    console.log("");
+    console.log("✅ All done! Happy deploying! 🚀");
+}
+
+main()
+    .then(() => process.exit(0))
+    .catch((error) => {
+        console.error(error);
+        process.exit(1);
+    });

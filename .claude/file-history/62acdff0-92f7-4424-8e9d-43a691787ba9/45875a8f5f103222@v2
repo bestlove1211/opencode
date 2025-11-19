@@ -1,0 +1,453 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/**
+ * @title BancafiTreasury
+ * @notice Advanced treasury management with budget allocations and multi-sig control
+ * @dev Handles ETH/token management, spending proposals, and budget tracking
+ */
+contract BancafiTreasury is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant TREASURER_ROLE = keccak256("TREASURER_ROLE");
+    bytes32 public constant BUDGET_MANAGER_ROLE = keccak256("BUDGET_MANAGER_ROLE");
+
+    enum ProposalStatus {
+        Pending,
+        Approved,
+        Rejected,
+        Executed,
+        Cancelled
+    }
+
+    enum BudgetCategory {
+        Development,
+        Marketing,
+        Operations,
+        Partnerships,
+        Grants,
+        Bailouts,
+        Insurance,
+        Reserves,
+        Other
+    }
+
+    struct SpendingProposal {
+        uint256 proposalId;
+        address proposer;
+        address recipient;
+        uint256 amount;
+        address token; // address(0) for ETH
+        BudgetCategory category;
+        string description;
+        ProposalStatus status;
+        uint256 approvalCount;
+        uint256 createdAt;
+        uint256 executedAt;
+        mapping(address => bool) approvals;
+    }
+
+    struct BudgetAllocation {
+        uint256 totalAllocated;
+        uint256 spent;
+        uint256 remaining;
+        bool active;
+    }
+
+    struct TreasuryStats {
+        uint256 totalETHReceived;
+        uint256 totalETHSpent;
+        uint256 totalProposals;
+        uint256 executedProposals;
+        uint256 currentETHBalance;
+    }
+
+    uint256 private _proposalIds;
+    mapping(uint256 => SpendingProposal) public proposals;
+    mapping(BudgetCategory => BudgetAllocation) public budgetAllocations;
+    mapping(address => uint256) public tokenBalances; // Track ERC20 balances
+
+    uint256 public requiredApprovals = 2; // Multi-sig threshold
+    uint256 public proposalExpiry = 7 days;
+    uint256 public maxSingleSpend = 100000 ether;
+
+    TreasuryStats public stats;
+
+    // Events
+    event ProposalCreated(
+        uint256 indexed proposalId,
+        address indexed proposer,
+        address recipient,
+        uint256 amount,
+        BudgetCategory category,
+        uint256 timestamp
+    );
+
+    event ProposalApproved(
+        uint256 indexed proposalId,
+        address indexed approver,
+        uint256 approvalCount,
+        uint256 timestamp
+    );
+
+    event ProposalExecuted(
+        uint256 indexed proposalId,
+        address indexed recipient,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event ProposalRejected(
+        uint256 indexed proposalId,
+        uint256 timestamp
+    );
+
+    event BudgetAllocated(
+        BudgetCategory indexed category,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event FundsReceived(
+        address indexed from,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event EmergencyWithdrawal(
+        address indexed to,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(TREASURER_ROLE, msg.sender);
+        _grantRole(BUDGET_MANAGER_ROLE, msg.sender);
+
+        _initializeBudgets();
+    }
+
+    /**
+     * @notice Initialize budget categories
+     */
+    function _initializeBudgets() internal {
+        budgetAllocations[BudgetCategory.Development].active = true;
+        budgetAllocations[BudgetCategory.Marketing].active = true;
+        budgetAllocations[BudgetCategory.Operations].active = true;
+        budgetAllocations[BudgetCategory.Partnerships].active = true;
+        budgetAllocations[BudgetCategory.Grants].active = true;
+        budgetAllocations[BudgetCategory.Bailouts].active = true;
+        budgetAllocations[BudgetCategory.Insurance].active = true;
+        budgetAllocations[BudgetCategory.Reserves].active = true;
+        budgetAllocations[BudgetCategory.Other].active = true;
+    }
+
+    /**
+     * @notice Allocate budget to category
+     */
+    function allocateBudget(
+        BudgetCategory category_,
+        uint256 amount_
+    ) external onlyRole(BUDGET_MANAGER_ROLE) {
+        require(amount_ > 0, "Invalid amount");
+        require(budgetAllocations[category_].active, "Category not active");
+
+        budgetAllocations[category_].totalAllocated += amount_;
+        budgetAllocations[category_].remaining += amount_;
+
+        emit BudgetAllocated(category_, amount_, block.timestamp);
+    }
+
+    /**
+     * @notice Create spending proposal
+     */
+    function createProposal(
+        address recipient_,
+        uint256 amount_,
+        address token_,
+        BudgetCategory category_,
+        string memory description_
+    ) external onlyRole(TREASURER_ROLE) whenNotPaused nonReentrant returns (uint256) {
+        require(recipient_ != address(0), "Invalid recipient");
+        require(amount_ > 0, "Invalid amount");
+        require(amount_ <= maxSingleSpend, "Exceeds max single spend");
+        require(budgetAllocations[category_].active, "Category not active");
+
+        // Check budget availability
+        BudgetAllocation storage budget = budgetAllocations[category_];
+        require(budget.remaining >= amount_, "Insufficient budget");
+
+        _proposalIds++;
+        uint256 newProposalId = _proposalIds;
+
+        SpendingProposal storage proposal = proposals[newProposalId];
+        proposal.proposalId = newProposalId;
+        proposal.proposer = msg.sender;
+        proposal.recipient = recipient_;
+        proposal.amount = amount_;
+        proposal.token = token_;
+        proposal.category = category_;
+        proposal.description = description_;
+        proposal.status = ProposalStatus.Pending;
+        proposal.approvalCount = 0;
+        proposal.createdAt = block.timestamp;
+        proposal.executedAt = 0;
+
+        stats.totalProposals++;
+
+        emit ProposalCreated(
+            newProposalId,
+            msg.sender,
+            recipient_,
+            amount_,
+            category_,
+            block.timestamp
+        );
+
+        return newProposalId;
+    }
+
+    /**
+     * @notice Approve spending proposal
+     */
+    function approveProposal(uint256 proposalId_) external onlyRole(TREASURER_ROLE) nonReentrant {
+        SpendingProposal storage proposal = proposals[proposalId_];
+
+        require(proposal.status == ProposalStatus.Pending, "Not pending");
+        require(!proposal.approvals[msg.sender], "Already approved");
+        require(block.timestamp <= proposal.createdAt + proposalExpiry, "Proposal expired");
+
+        proposal.approvals[msg.sender] = true;
+        proposal.approvalCount++;
+
+        emit ProposalApproved(
+            proposalId_,
+            msg.sender,
+            proposal.approvalCount,
+            block.timestamp
+        );
+
+        // Auto-execute if threshold reached
+        if (proposal.approvalCount >= requiredApprovals) {
+            _executeProposal(proposalId_);
+        }
+    }
+
+    /**
+     * @notice Execute approved proposal
+     */
+    function _executeProposal(uint256 proposalId_) internal {
+        SpendingProposal storage proposal = proposals[proposalId_];
+
+        require(proposal.status == ProposalStatus.Pending, "Not pending");
+        require(proposal.approvalCount >= requiredApprovals, "Insufficient approvals");
+
+        // Update budget
+        BudgetAllocation storage budget = budgetAllocations[proposal.category];
+        budget.spent += proposal.amount;
+        budget.remaining -= proposal.amount;
+
+        // Update proposal status
+        proposal.status = ProposalStatus.Executed;
+        proposal.executedAt = block.timestamp;
+
+        // Execute transfer
+        if (proposal.token == address(0)) {
+            // ETH transfer
+            require(address(this).balance >= proposal.amount, "Insufficient ETH");
+            stats.totalETHSpent += proposal.amount;
+            payable(proposal.recipient).transfer(proposal.amount);
+        } else {
+            // ERC20 transfer
+            IERC20 token = IERC20(proposal.token);
+            require(token.balanceOf(address(this)) >= proposal.amount, "Insufficient tokens");
+            require(token.transfer(proposal.recipient, proposal.amount), "Transfer failed");
+        }
+
+        stats.executedProposals++;
+
+        emit ProposalExecuted(
+            proposalId_,
+            proposal.recipient,
+            proposal.amount,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Reject proposal
+     */
+    function rejectProposal(uint256 proposalId_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        SpendingProposal storage proposal = proposals[proposalId_];
+
+        require(proposal.status == ProposalStatus.Pending, "Not pending");
+
+        proposal.status = ProposalStatus.Rejected;
+
+        emit ProposalRejected(proposalId_, block.timestamp);
+    }
+
+    /**
+     * @notice Emergency withdrawal (admin only)
+     */
+    function emergencyWithdraw(
+        address recipient_,
+        uint256 amount_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        require(recipient_ != address(0), "Invalid recipient");
+        require(address(this).balance >= amount_, "Insufficient balance");
+
+        payable(recipient_).transfer(amount_);
+
+        emit EmergencyWithdrawal(recipient_, amount_, block.timestamp);
+    }
+
+    /**
+     * @notice Withdraw ERC20 tokens
+     */
+    function withdrawToken(
+        address token_,
+        address recipient_,
+        uint256 amount_
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        require(recipient_ != address(0), "Invalid recipient");
+
+        IERC20 token = IERC20(token_);
+        require(token.balanceOf(address(this)) >= amount_, "Insufficient balance");
+        require(token.transfer(recipient_, amount_), "Transfer failed");
+    }
+
+    /**
+     * @notice Get budget allocation details
+     */
+    function getBudgetAllocation(BudgetCategory category_) external view returns (
+        uint256 totalAllocated,
+        uint256 spent,
+        uint256 remaining,
+        bool active
+    ) {
+        BudgetAllocation memory budget = budgetAllocations[category_];
+        return (
+            budget.totalAllocated,
+            budget.spent,
+            budget.remaining,
+            budget.active
+        );
+    }
+
+    /**
+     * @notice Get proposal details (without mappings)
+     */
+    function getProposalDetails(uint256 proposalId_) external view returns (
+        address proposer,
+        address recipient,
+        uint256 amount,
+        address token,
+        BudgetCategory category,
+        string memory description,
+        ProposalStatus status,
+        uint256 approvalCount,
+        uint256 createdAt
+    ) {
+        SpendingProposal storage proposal = proposals[proposalId_];
+        return (
+            proposal.proposer,
+            proposal.recipient,
+            proposal.amount,
+            proposal.token,
+            proposal.category,
+            proposal.description,
+            proposal.status,
+            proposal.approvalCount,
+            proposal.createdAt
+        );
+    }
+
+    /**
+     * @notice Check if address has approved proposal
+     */
+    function hasApproved(uint256 proposalId_, address approver_) external view returns (bool) {
+        return proposals[proposalId_].approvals[approver_];
+    }
+
+    /**
+     * @notice Get treasury statistics
+     */
+    function getTreasuryStats() external view returns (TreasuryStats memory) {
+        TreasuryStats memory currentStats = stats;
+        currentStats.currentETHBalance = address(this).balance;
+        return currentStats;
+    }
+
+    /**
+     * @notice Get token balance
+     */
+    function getTokenBalance(address token_) external view returns (uint256) {
+        return IERC20(token_).balanceOf(address(this));
+    }
+
+    /**
+     * @notice Update required approvals
+     */
+    function updateRequiredApprovals(uint256 required_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(required_ > 0, "Invalid threshold");
+        requiredApprovals = required_;
+    }
+
+    /**
+     * @notice Update max single spend
+     */
+    function updateMaxSingleSpend(uint256 max_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(max_ > 0, "Invalid max");
+        maxSingleSpend = max_;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    receive() external payable {
+        stats.totalETHReceived += msg.value;
+        emit FundsReceived(msg.sender, msg.value, block.timestamp);
+    }
+}

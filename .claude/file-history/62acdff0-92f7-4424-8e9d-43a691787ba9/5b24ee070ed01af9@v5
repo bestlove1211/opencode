@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+/**
+ * @title BancafiBailout
+ * @notice DAO-governed bailout mechanism for tokenized entities
+ */
+contract BancafiBailout is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable
+{
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant TREASURY_MANAGER_ROLE = keccak256("TREASURY_MANAGER_ROLE");
+    bytes32 public constant BAILOUT_APPROVER_ROLE = keccak256("BAILOUT_APPROVER_ROLE");
+
+    enum BailoutStatus {
+        Pending,
+        Approved,
+        Disbursed,
+        Repaying,
+        Completed,
+        Defaulted,
+        Rejected
+    }
+
+    struct BailoutRequest {
+        uint256 requestId;
+        address requester;
+        uint256 amount;
+        uint256 requestedAt;
+        uint256 approvedAt;
+        uint256 disbursedAt;
+        uint256 dueDate;
+        uint256 interestRate;
+        BailoutStatus status;
+        string reason;
+        string solvencyProof;
+        uint256 collateralTokenId;
+        uint256 repaidAmount;
+        address approver;
+    }
+
+    struct RepaymentSchedule {
+        uint256 bailoutId;
+        uint256 totalAmount;
+        uint256 amountPaid;
+        uint256 installmentAmount;
+        uint256 installmentCount;
+        uint256 nextPaymentDue;
+        uint256 paymentInterval;
+        bool isActive;
+    }
+
+    uint256 private _bailoutIds;
+    mapping(uint256 => BailoutRequest) public bailoutRequests;
+    mapping(uint256 => RepaymentSchedule) public repaymentSchedules;
+    mapping(address => uint256[]) public userBailouts;
+    mapping(address => uint256) public userActiveBailouts;
+
+    uint256 public treasuryBalance;
+    uint256 public totalDisbursed;
+    uint256 public totalRepaid;
+    uint256 public maxBailoutAmount;
+    uint256 public minCollateralRatio;
+
+    event BailoutRequested(uint256 indexed requestId, address indexed requester, uint256 amount, uint256 timestamp);
+    event BailoutApproved(uint256 indexed requestId, address indexed approver, uint256 amount, uint256 timestamp);
+    event BailoutDisbursed(uint256 indexed requestId, address indexed recipient, uint256 amount, uint256 timestamp);
+    event BailoutRepayment(uint256 indexed requestId, address indexed payer, uint256 amount, uint256 remainingBalance, uint256 timestamp);
+    event BailoutCompleted(uint256 indexed requestId, uint256 totalRepaid, uint256 timestamp);
+    event BailoutDefaulted(uint256 indexed requestId, uint256 outstandingAmount, uint256 timestamp);
+    event BailoutRejected(uint256 indexed requestId, address indexed rejector, string reason, uint256 timestamp);
+    event TreasuryDeposit(address indexed depositor, uint256 amount, uint256 newBalance, uint256 timestamp);
+    event TreasuryWithdrawal(address indexed recipient, uint256 amount, uint256 newBalance, uint256 timestamp);
+    event MaxBailoutAmountUpdated(uint256 oldAmount, uint256 newAmount, uint256 timestamp);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(uint256 maxBailoutAmount_, uint256 minCollateralRatio_) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(TREASURY_MANAGER_ROLE, msg.sender);
+        _grantRole(BAILOUT_APPROVER_ROLE, msg.sender);
+
+        maxBailoutAmount = maxBailoutAmount_;
+        minCollateralRatio = minCollateralRatio_;
+    }
+
+    function requestBailout(
+        uint256 amount_,
+        string memory reason_,
+        string memory solvencyProof_,
+        uint256 collateralTokenId_,
+        uint256 repaymentMonths_
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        require(amount_ > 0, "Amount must be > 0");
+        require(amount_ <= maxBailoutAmount, "Exceeds max bailout");
+        require(userActiveBailouts[msg.sender] == 0, "Active bailout exists");
+
+        _bailoutIds++;
+        uint256 requestId = _bailoutIds;
+
+        bailoutRequests[requestId] = BailoutRequest({
+            requestId: requestId,
+            requester: msg.sender,
+            amount: amount_,
+            requestedAt: block.timestamp,
+            approvedAt: 0,
+            disbursedAt: 0,
+            dueDate: block.timestamp + (repaymentMonths_ * 30 days),
+            interestRate: 500,
+            status: BailoutStatus.Pending,
+            reason: reason_,
+            solvencyProof: solvencyProof_,
+            collateralTokenId: collateralTokenId_,
+            repaidAmount: 0,
+            approver: address(0)
+        });
+
+        userBailouts[msg.sender].push(requestId);
+        userActiveBailouts[msg.sender] = requestId;
+
+        emit BailoutRequested(requestId, msg.sender, amount_, block.timestamp);
+        return requestId;
+    }
+
+    function depositToTreasury() external payable whenNotPaused nonReentrant {
+        require(msg.value > 0, "Amount must be > 0");
+        treasuryBalance += msg.value;
+        emit TreasuryDeposit(msg.sender, msg.value, treasuryBalance, block.timestamp);
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+
+    receive() external payable {
+        treasuryBalance += msg.value;
+        emit TreasuryDeposit(msg.sender, msg.value, treasuryBalance, block.timestamp);
+    }
+}

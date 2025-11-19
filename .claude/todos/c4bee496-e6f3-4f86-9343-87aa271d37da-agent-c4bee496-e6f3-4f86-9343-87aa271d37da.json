@@ -1,0 +1,22 @@
+[
+  {
+    "content": "Create .gitignore for the repository",
+    "status": "completed",
+    "activeForm": "Creating .gitignore file"
+  },
+  {
+    "content": "Stage and commit CLAUDE.md and .gitignore",
+    "status": "completed",
+    "activeForm": "Staging and committing files"
+  },
+  {
+    "content": "Create feature branch for documentation update",
+    "status": "in_progress",
+    "activeForm": "Creating feature branch"
+  },
+  {
+    "content": "Push branches and create pull request",
+    "status": "pending",
+    "activeForm": "Creating pull request"
+  }
+]

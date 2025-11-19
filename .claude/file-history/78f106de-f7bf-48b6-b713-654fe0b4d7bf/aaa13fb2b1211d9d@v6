@@ -1,0 +1,349 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("Bailout Workflow - Integration Test", function () {
+  let governanceToken, assetToken, bailout, insurance, dao, timelock;
+  let owner, borrower, voter1, voter2;
+
+  beforeEach(async function () {
+    [owner, borrower, voter1, voter2] = await ethers.getSigners();
+
+    // Deploy Governance Token
+    const GovernanceToken = await ethers.getContractFactory("BancafiGovernanceToken");
+    governanceToken = await upgrades.deployProxy(
+      GovernanceToken,
+      ["Bancafi Governance", "BGT", ethers.parseEther("2000000"), ethers.parseEther("2000000"), owner.address],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Deploy Timelock
+    const Timelock = await ethers.getContractFactory("BancafiTimelock");
+    timelock = await Timelock.deploy(
+      2 * 24 * 60 * 60,
+      [owner.address],
+      [owner.address],
+      owner.address
+    );
+
+    // Deploy DAO
+    const DAO = await ethers.getContractFactory("BancafiDAO");
+    dao = await upgrades.deployProxy(
+      DAO,
+      [await governanceToken.getAddress(), await timelock.getAddress(), 1, 50400, ethers.parseEther("1000"), 4],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Deploy Asset Token
+    const AssetToken = await ethers.getContractFactory("BancafiAssetToken");
+    assetToken = await upgrades.deployProxy(
+      AssetToken,
+      ["Bancafi Assets", "BRWA"],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Deploy Bailout
+    const Bailout = await ethers.getContractFactory("BancafiBailout");
+    bailout = await upgrades.deployProxy(
+      Bailout,
+      [ethers.parseEther("1000000"), 15000],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Deploy Insurance
+    const Insurance = await ethers.getContractFactory("BancafiInsurance");
+    insurance = await upgrades.deployProxy(
+      Insurance,
+      [],
+      { initializer: "initialize", kind: "uups" }
+    );
+
+    // Setup roles
+    const BAILOUT_APPROVER_ROLE = await bailout.BAILOUT_APPROVER_ROLE();
+    await bailout.grantRole(BAILOUT_APPROVER_ROLE, owner.address);
+
+    const VERIFIER_ROLE = await assetToken.VERIFIER_ROLE();
+    await assetToken.grantRole(VERIFIER_ROLE, owner.address);
+
+    const MINTER_ROLE = await assetToken.MINTER_ROLE();
+    await assetToken.grantRole(MINTER_ROLE, owner.address);
+    await assetToken.grantRole(MINTER_ROLE, borrower.address);
+
+    // Fund bailout treasury
+    await bailout.depositToTreasury({ value: ethers.parseEther("100") });
+
+    // Distribute governance tokens
+    await governanceToken.transfer(voter1.address, ethers.parseEther("50000"));
+    await governanceToken.transfer(voter2.address, ethers.parseEther("50000"));
+  });
+
+  describe("Complete Bailout Lifecycle", function () {
+    let tokenId;
+
+    beforeEach(async function () {
+      // Create and verify asset (borrower creates and owns it)
+      await assetToken.connect(borrower).tokenizeAsset(
+        borrower.address,
+        0, // RealEstate
+        ethers.parseEther("2000000"),
+        "Commercial Building Location",
+        "ipfs://propertyDetails"
+      );
+      tokenId = 1;
+
+      await assetToken.verifyAsset(tokenId);
+
+      // Borrower fractionalizes their own asset
+      await assetToken.connect(borrower).fractionalizeAsset(tokenId, 1000);
+    });
+
+    it("Should complete full bailout workflow with collateral", async function () {
+      const bailoutAmount = ethers.parseEther("50");
+
+      // Step 1: Borrower requests bailout
+      await assetToken.connect(borrower).approve(await bailout.getAddress(), tokenId);
+
+      const tx = await bailout.connect(borrower).requestBailout(
+        bailoutAmount,
+        "Market downturn emergency",
+        "ipfs://financialProof",
+        tokenId,
+        12 // 12 months
+      );
+
+      // Event has 4 args: requestId, requester, amount, timestamp
+      await expect(tx)
+        .to.emit(bailout, "BailoutRequested");
+
+      // Verify collateral locked
+      const asset = await assetToken.assetMetadata(tokenId);
+      expect(asset.status).to.equal(3); // Locked (0=Pending, 1=Verified, 2=Active, 3=Locked)
+
+      // Verify borrower no longer owns NFT
+      expect(await assetToken.ownerOf(tokenId)).to.equal(await bailout.getAddress());
+
+      // Step 2: Approve bailout
+      await expect(
+        bailout.approveBailout(1, 500) // 5% interest
+      )
+        .to.emit(bailout, "BailoutApproved")
+        .withArgs(1, owner.address, 500);
+
+      const request = await bailout.bailoutRequests(1);
+      expect(request.status).to.equal(1); // Approved
+
+      // Step 3: Disburse funds
+      const TREASURY_MANAGER = await bailout.TREASURY_MANAGER_ROLE();
+      await bailout.grantRole(TREASURY_MANAGER, owner.address);
+
+      const borrowerBalanceBefore = await ethers.provider.getBalance(borrower.address);
+
+      await expect(
+        bailout.disburseBailout(1, 12)
+      )
+        .to.emit(bailout, "BailoutDisbursed");
+
+      const borrowerBalanceAfter = await ethers.provider.getBalance(borrower.address);
+      expect(borrowerBalanceAfter - borrowerBalanceBefore).to.equal(bailoutAmount);
+
+      // Verify repayment schedule created
+      const schedule = await bailout.repaymentSchedules(1);
+      expect(schedule.totalAmount).to.be.gt(bailoutAmount); // Includes interest
+      expect(schedule.installmentCount).to.equal(12);
+    });
+
+    it("Should handle repayment and unlock collateral", async function () {
+      const bailoutAmount = ethers.parseEther("50"); // Smaller for easy repayment
+
+      // Request and approve
+      await assetToken.connect(borrower).approve(await bailout.getAddress(), tokenId);
+      await bailout.connect(borrower).requestBailout(
+        bailoutAmount,
+        "Emergency",
+        "ipfs://proof",
+        tokenId,
+        12
+      );
+
+      await bailout.approveBailout(1, 500);
+
+      // Disburse
+      const TREASURY_MANAGER = await bailout.TREASURY_MANAGER_ROLE();
+      await bailout.grantRole(TREASURY_MANAGER, owner.address);
+      await bailout.disburseBailout(1, 12);
+
+      // Get repayment details
+      const schedule = await bailout.repaymentSchedules(1);
+      const installmentAmount = schedule.installmentAmount;
+
+      // Repay all installments
+      for (let i = 0; i < 12; i++) {
+        await bailout.connect(borrower).repayBailout(1, {
+          value: installmentAmount
+        });
+      }
+
+      // Verify fully repaid
+      const finalSchedule = await bailout.repaymentSchedules(1);
+      expect(finalSchedule.repaidAmount).to.equal(finalSchedule.totalAmount);
+
+      // Verify collateral returned
+      expect(await assetToken.ownerOf(tokenId)).to.equal(borrower.address);
+
+      // Verify asset unlocked
+      const asset = await assetToken.assetMetadata(tokenId);
+      expect(asset.status).to.equal(1); // Verified (unlocked)
+    });
+
+    it("Should handle default and transfer collateral to treasury", async function () {
+      const bailoutAmount = ethers.parseEther("50");
+
+      // Request, approve, disburse
+      await assetToken.connect(borrower).approve(await bailout.getAddress(), tokenId);
+      await bailout.connect(borrower).requestBailout(
+        bailoutAmount,
+        "Emergency",
+        "ipfs://proof",
+        tokenId,
+        3 // 3 months
+      );
+
+      await bailout.approveBailout(1, 500);
+
+      const TREASURY_MANAGER = await bailout.TREASURY_MANAGER_ROLE();
+      await bailout.grantRole(TREASURY_MANAGER, owner.address);
+      await bailout.disburseBailout(1, 3);
+
+      // Don't repay - let it default
+      // Fast forward past grace period
+      await ethers.provider.send("evm_increaseTime", [60 * 24 * 60 * 60]); // 60 days
+      await ethers.provider.send("evm_mine");
+
+      // Trigger default check
+      await bailout.checkDefault(1);
+
+      // Verify asset transferred to treasury address
+      const TREASURY = await bailout.TREASURY();
+      expect(await assetToken.ownerOf(tokenId)).to.equal(TREASURY);
+
+      // Verify asset marked as defaulted
+      const asset = await assetToken.assetMetadata(tokenId);
+      expect(asset.status).to.equal(3); // Defaulted
+    });
+  });
+
+  describe("Insurance Integration with Bailout", function () {
+    let tokenId;
+
+    beforeEach(async function () {
+      await assetToken.tokenizeAsset(
+        owner.address,
+        0,
+        ethers.parseEther("10000"),
+        "Insured Property Location",
+        "ipfs://property"
+      );
+      tokenId = 1;
+
+      await assetToken.verifyAsset(tokenId);
+      await assetToken.fractionalizeAsset(tokenId, 1000);
+      await assetToken.transferFrom(owner.address, borrower.address, tokenId);
+    });
+
+    it("Should allow insurance claim on bailout default", async function () {
+      // Create insurance policy
+      const coverageAmount = ethers.parseEther("50");
+      const duration = 365 * 24 * 60 * 60;
+      const annualPremium = (coverageAmount * BigInt(500)) / BigInt(10000);
+      const premium = (annualPremium * BigInt(duration)) / BigInt(365 * 24 * 60 * 60);
+
+      await insurance.connect(borrower).createPolicy(
+        tokenId,
+        coverageAmount,
+        duration,
+        { value: premium }
+      );
+
+      const policyId = 1;
+
+      // Request and approve bailout
+      await assetToken.connect(borrower).approve(await bailout.getAddress(), tokenId);
+      await bailout.connect(borrower).requestBailout(
+        ethers.parseEther("300000"),
+        "Emergency",
+        "ipfs://proof",
+        tokenId,
+        6
+      );
+
+      await bailout.approveBailout(1, 500);
+
+      const TREASURY_MANAGER = await bailout.TREASURY_MANAGER_ROLE();
+      await bailout.grantRole(TREASURY_MANAGER, owner.address);
+      await bailout.disburseBailout(1, 6);
+
+      // Default on bailout
+      await ethers.provider.send("evm_increaseTime", [60 * 24 * 60 * 60]);
+      await ethers.provider.send("evm_mine");
+      await bailout.checkDefault(1);
+
+      // File insurance claim for bailout default
+      await expect(
+        insurance.connect(borrower).submitClaim(
+          policyId,
+          0, // BailoutDefault
+          ethers.parseEther("300000")
+        )
+      )
+        .to.emit(insurance, "ClaimSubmitted")
+        .withArgs(1, policyId, ethers.parseEther("300000"));
+
+      // Process and approve claim
+      const CLAIMS_MANAGER = await insurance.CLAIMS_MANAGER_ROLE();
+      await insurance.grantRole(CLAIMS_MANAGER, owner.address);
+
+      await insurance.processClaim(1, true, ethers.parseEther("300000"));
+      await insurance.payClaim(1);
+
+      // Verify claim paid
+      const claim = await insurance.claims(1);
+      expect(claim.status).to.equal(4); // Paid
+    });
+  });
+
+  describe("Treasury Balance Management", function () {
+    it("Should track treasury balance correctly across operations", async function () {
+      const initialDeposit = ethers.parseEther("100");
+
+      // Check initial balance
+      const balanceBefore = await bailout.treasuryBalance();
+      expect(balanceBefore).to.equal(initialDeposit);
+
+      // Create asset and request bailout
+      await assetToken.tokenizeAsset(owner.address, 0, ethers.parseEther("500000"), "Property Location", "ipfs://test");
+      await assetToken.verifyAsset(1);
+      await assetToken.approve(await bailout.getAddress(), 1);
+
+      const bailoutAmount = ethers.parseEther("100");
+
+      await bailout.requestBailout(
+        bailoutAmount,
+        "Emergency",
+        "ipfs://proof",
+        1,
+        6
+      );
+
+      await bailout.approveBailout(1, 500);
+
+      const TREASURY_MANAGER = await bailout.TREASURY_MANAGER_ROLE();
+      await bailout.grantRole(TREASURY_MANAGER, owner.address);
+      await bailout.disburseBailout(1, 6);
+
+      // Check balance after disbursement
+      const balanceAfter = await bailout.treasuryBalance();
+      const disbursedTotal = await bailout.totalDisbursed();
+      expect(balanceAfter).to.equal(initialDeposit - bailoutAmount);
+      expect(disbursedTotal).to.equal(bailoutAmount);
+    });
+  });
+});

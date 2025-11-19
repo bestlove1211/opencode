@@ -1,0 +1,316 @@
+const { expect } = require("chai");
+const { ethers, upgrades } = require("hardhat");
+
+describe("BancafiLending", function () {
+  let lending, collateralManager, creditScore, priceOracle;
+  let owner, borrower, lender, liquidator;
+  let mockUSDC, mockWETH;
+
+  beforeEach(async function () {
+    [owner, borrower, lender, liquidator] = await ethers.getSigners();
+
+    // Deploy mock ERC20 tokens
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    mockUSDC = await MockERC20.deploy("Mock USDC", "USDC", 6);
+    mockWETH = await MockERC20.deploy("Mock WETH", "WETH", 18);
+    await mockUSDC.waitForDeployment();
+    await mockWETH.waitForDeployment();
+
+    // Deploy Price Oracle
+    const BancafiPriceOracle = await ethers.getContractFactory("BancafiPriceOracle");
+    priceOracle = await upgrades.deployProxy(BancafiPriceOracle, [], {
+      initializer: "initialize",
+      kind: "uups"
+    });
+    await priceOracle.waitForDeployment();
+
+    // Deploy Credit Score
+    const CreditScore = await ethers.getContractFactory("CreditScore");
+    creditScore = await upgrades.deployProxy(CreditScore, [], {
+      initializer: "initialize",
+      kind: "uups"
+    });
+    await creditScore.waitForDeployment();
+
+    // Deploy Collateral Manager
+    const CollateralManager = await ethers.getContractFactory("CollateralManager");
+    collateralManager = await upgrades.deployProxy(CollateralManager, [], {
+      initializer: "initialize",
+      kind: "uups"
+    });
+    await collateralManager.waitForDeployment();
+
+    // Deploy Lending
+    const BancafiLending = await ethers.getContractFactory("BancafiLending");
+    lending = await upgrades.deployProxy(
+      BancafiLending,
+      [
+        await collateralManager.getAddress(),
+        await creditScore.getAddress(),
+        await priceOracle.getAddress()
+      ],
+      { initializer: "initialize", kind: "uups" }
+    );
+    await lending.waitForDeployment();
+
+    // Setup permissions
+    await collateralManager.setAuthorizedCaller(await lending.getAddress(), true);
+    await creditScore.setAuthorizedCaller(await lending.getAddress(), true);
+
+    // Configure assets
+    await collateralManager.configureAsset(
+      await mockWETH.getAddress(),
+      true,
+      8000, // 80% liquidation threshold
+      15000, // 150% min collateral ratio
+      ethers.ZeroAddress
+    );
+
+    await collateralManager.updateAssetPrice(
+      await mockWETH.getAddress(),
+      ethers.parseEther("2000") // $2000 per ETH
+    );
+
+    await collateralManager.updateAssetPrice(
+      await mockUSDC.getAddress(),
+      ethers.parseUnits("1", 18) // $1 per USDC
+    );
+
+    // Mint tokens to users
+    await mockUSDC.mint(lender.address, ethers.parseUnits("100000", 6)); // 100k USDC
+    await mockWETH.mint(borrower.address, ethers.parseEther("10")); // 10 ETH
+  });
+
+  describe("Deployment", function () {
+    it("Should set the correct owner", async function () {
+      expect(await lending.owner()).to.equal(owner.address);
+    });
+
+    it("Should set correct addresses", async function () {
+      expect(await lending.collateralManager()).to.equal(await collateralManager.getAddress());
+      expect(await lending.creditScoreContract()).to.equal(await creditScore.getAddress());
+    });
+
+    it("Should start with zero loans", async function () {
+      const stats = await lending.getPlatformStats();
+      expect(stats.totalLoans).to.equal(0);
+      expect(stats.activeLoans).to.equal(0);
+    });
+  });
+
+  describe("Borrow Requests", function () {
+    it("Should create a borrow request", async function () {
+      const loanAmount = ethers.parseUnits("1000", 6); // 1000 USDC
+      const collateralAmount = ethers.parseEther("1"); // 1 ETH
+      const interestRate = 1000; // 10%
+      const duration = 30 * 24 * 60 * 60; // 30 days
+
+      await mockWETH.connect(borrower).approve(await lending.getAddress(), collateralAmount);
+
+      await expect(
+        lending.connect(borrower).createBorrowRequest(
+          await mockUSDC.getAddress(),
+          loanAmount,
+          await mockWETH.getAddress(),
+          collateralAmount,
+          interestRate,
+          duration
+        )
+      ).to.emit(lending, "BorrowRequestCreated");
+    });
+
+    it("Should reject borrow request with zero amount", async function () {
+      await expect(
+        lending.connect(borrower).createBorrowRequest(
+          await mockUSDC.getAddress(),
+          0,
+          await mockWETH.getAddress(),
+          ethers.parseEther("1"),
+          1000,
+          30 * 24 * 60 * 60
+        )
+      ).to.be.revertedWith("Amount must be positive");
+    });
+
+    it("Should reject borrow request with invalid duration", async function () {
+      await expect(
+        lending.connect(borrower).createBorrowRequest(
+          await mockUSDC.getAddress(),
+          ethers.parseUnits("1000", 6),
+          await mockWETH.getAddress(),
+          ethers.parseEther("1"),
+          1000,
+          0
+        )
+      ).to.be.revertedWith("Invalid duration");
+    });
+  });
+
+  describe("Loan Acceptance", function () {
+    let requestId;
+
+    beforeEach(async function () {
+      const loanAmount = ethers.parseUnits("1000", 6);
+      const collateralAmount = ethers.parseEther("1");
+
+      await mockWETH.connect(borrower).approve(await lending.getAddress(), collateralAmount);
+
+      const tx = await lending.connect(borrower).createBorrowRequest(
+        await mockUSDC.getAddress(),
+        loanAmount,
+        await mockWETH.getAddress(),
+        collateralAmount,
+        1000, // 10%
+        30 * 24 * 60 * 60
+      );
+
+      const receipt = await tx.wait();
+      const event = receipt.logs.find(log => {
+        try {
+          return lending.interface.parseLog(log).name === "BorrowRequestCreated";
+        } catch {
+          return false;
+        }
+      });
+      requestId = lending.interface.parseLog(event).args.requestId;
+    });
+
+    it("Should accept a borrow request and create loan", async function () {
+      const loanAmount = ethers.parseUnits("1000", 6);
+
+      await mockUSDC.connect(lender).approve(await lending.getAddress(), loanAmount);
+
+      await expect(
+        lending.connect(lender).acceptBorrowRequest(requestId, 1000)
+      ).to.emit(lending, "LoanCreated");
+    });
+
+    it("Should transfer collateral to contract on acceptance", async function () {
+      const loanAmount = ethers.parseUnits("1000", 6);
+      await mockUSDC.connect(lender).approve(await lending.getAddress(), loanAmount);
+
+      const collateralBefore = await mockWETH.balanceOf(await lending.getAddress());
+
+      await lending.connect(lender).acceptBorrowRequest(requestId, 1000);
+
+      const collateralAfter = await mockWETH.balanceOf(await lending.getAddress());
+      expect(collateralAfter).to.be.gt(collateralBefore);
+    });
+  });
+
+  describe("Loan Repayment", function () {
+    let loanId;
+
+    beforeEach(async function () {
+      const loanAmount = ethers.parseUnits("1000", 6);
+      const collateralAmount = ethers.parseEther("1");
+
+      await mockWETH.connect(borrower).approve(await lending.getAddress(), collateralAmount);
+      await mockUSDC.connect(lender).approve(await lending.getAddress(), loanAmount);
+
+      const tx1 = await lending.connect(borrower).createBorrowRequest(
+        await mockUSDC.getAddress(),
+        loanAmount,
+        await mockWETH.getAddress(),
+        collateralAmount,
+        1000,
+        30 * 24 * 60 * 60
+      );
+
+      const receipt1 = await tx1.wait();
+      const event1 = receipt1.logs.find(log => {
+        try {
+          return lending.interface.parseLog(log).name === "BorrowRequestCreated";
+        } catch {
+          return false;
+        }
+      });
+      const requestId = lending.interface.parseLog(event1).args.requestId;
+
+      const tx2 = await lending.connect(lender).acceptBorrowRequest(requestId, 1000);
+      const receipt2 = await tx2.wait();
+      const event2 = receipt2.logs.find(log => {
+        try {
+          return lending.interface.parseLog(log).name === "LoanCreated";
+        } catch {
+          return false;
+        }
+      });
+      loanId = lending.interface.parseLog(event2).args.loanId;
+
+      // Give borrower USDC for repayment
+      await mockUSDC.mint(borrower.address, ethers.parseUnits("2000", 6));
+    });
+
+    it("Should allow partial repayment", async function () {
+      const repayAmount = ethers.parseUnits("500", 6);
+      await mockUSDC.connect(borrower).approve(await lending.getAddress(), repayAmount);
+
+      await expect(
+        lending.connect(borrower).repayLoan(loanId, repayAmount)
+      ).to.emit(lending, "LoanRepaid");
+    });
+
+    it("Should allow full repayment and release collateral", async function () {
+      const loan = await lending.loans(loanId);
+      const totalOwed = loan.amount + loan.interest;
+
+      await mockUSDC.connect(borrower).approve(await lending.getAddress(), totalOwed);
+
+      const collateralBefore = await mockWETH.balanceOf(borrower.address);
+
+      await lending.connect(borrower).repayLoan(loanId, totalOwed);
+
+      const collateralAfter = await mockWETH.balanceOf(borrower.address);
+      expect(collateralAfter).to.be.gt(collateralBefore);
+    });
+  });
+
+  describe("Platform Statistics", function () {
+    it("Should track total loans", async function () {
+      const loanAmount = ethers.parseUnits("1000", 6);
+      const collateralAmount = ethers.parseEther("1");
+
+      await mockWETH.connect(borrower).approve(await lending.getAddress(), collateralAmount);
+      await mockUSDC.connect(lender).approve(await lending.getAddress(), loanAmount);
+
+      await lending.connect(borrower).createBorrowRequest(
+        await mockUSDC.getAddress(),
+        loanAmount,
+        await mockWETH.getAddress(),
+        collateralAmount,
+        1000,
+        30 * 24 * 60 * 60
+      );
+
+      const stats = await lending.getPlatformStats();
+      expect(stats.totalLoans).to.be.gt(0);
+    });
+  });
+
+  describe("Access Control", function () {
+    it("Should only allow owner to pause", async function () {
+      await expect(
+        lending.connect(borrower).pause()
+      ).to.be.reverted;
+
+      await lending.connect(owner).pause();
+      expect(await lending.paused()).to.be.true;
+    });
+
+    it("Should reject operations when paused", async function () {
+      await lending.pause();
+
+      await expect(
+        lending.connect(borrower).createBorrowRequest(
+          await mockUSDC.getAddress(),
+          ethers.parseUnits("1000", 6),
+          await mockWETH.getAddress(),
+          ethers.parseEther("1"),
+          1000,
+          30 * 24 * 60 * 60
+        )
+      ).to.be.reverted;
+    });
+  });
+});

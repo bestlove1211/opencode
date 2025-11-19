@@ -1,0 +1,695 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/ICreditScore.sol";
+
+/**
+ * @title BancafiPrivateCreditLine
+ * @notice Private credit line facility with competitive 5-7% APY for qualified borrowers
+ * @dev Provides revolving credit lines with dynamic interest rates based on creditworthiness
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiPrivateCreditLine is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20 for IERC20;
+
+    // ============ Enums ============
+
+    enum CreditLineStatus {
+        Pending,      // Application pending approval
+        Active,       // Credit line is active and available
+        Frozen,       // Temporarily frozen due to late payment
+        Closed,       // Permanently closed
+        Defaulted     // Defaulted, in collection
+    }
+
+    enum TierLevel {
+        Bronze,   // 7.0% APY, up to $10k
+        Silver,   // 6.5% APY, up to $50k
+        Gold,     // 6.0% APY, up to $100k
+        Platinum, // 5.5% APY, up to $250k
+        Diamond   // 5.0% APY, up to $500k+
+    }
+
+    // ============ Structs ============
+
+    struct CreditLine {
+        uint256 id;
+        address borrower;
+        address asset;
+        uint256 creditLimit;
+        uint256 availableCredit;
+        uint256 utilizedCredit;
+        uint256 interestRate; // Annual rate in basis points
+        uint256 minMonthlyPayment;
+        uint256 outstandingBalance;
+        uint256 accruedInterest;
+        uint256 lastInterestAccrual;
+        uint256 openedAt;
+        uint256 lastPaymentDate;
+        uint256 nextPaymentDue;
+        CreditLineStatus status;
+        TierLevel tier;
+        uint256 missedPayments;
+        uint256 totalBorrowed;
+        uint256 totalRepaid;
+    }
+
+    struct DrawRequest {
+        uint256 creditLineId;
+        uint256 amount;
+        uint256 timestamp;
+        bool approved;
+        bool processed;
+    }
+
+    struct PaymentHistory {
+        uint256 creditLineId;
+        uint256 amount;
+        uint256 timestamp;
+        uint256 principalPaid;
+        uint256 interestPaid;
+        bool onTime;
+    }
+
+    // ============ Constants ============
+
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MIN_APY = 500;  // 5.0%
+    uint256 public constant MAX_APY = 700;  // 7.0%
+    uint256 public constant SECONDS_PER_YEAR = 365 days;
+    uint256 public constant MIN_CREDIT_SCORE = 650;
+    uint256 public constant PAYMENT_PERIOD = 30 days;
+
+    // Tier configurations
+    uint256 public constant BRONZE_LIMIT = 10_000e18;
+    uint256 public constant SILVER_LIMIT = 50_000e18;
+    uint256 public constant GOLD_LIMIT = 100_000e18;
+    uint256 public constant PLATINUM_LIMIT = 250_000e18;
+    uint256 public constant DIAMOND_LIMIT = 500_000e18;
+
+    // ============ State Variables ============
+
+    ICreditScore public creditScoreContract;
+
+    uint256 public nextCreditLineId;
+    uint256 public nextDrawRequestId;
+    uint256 public totalCreditIssued;
+    uint256 public totalOutstanding;
+    uint256 public totalInterestEarned;
+
+    // Interest rates by tier (in basis points)
+    mapping(TierLevel => uint256) public tierInterestRates;
+    mapping(TierLevel => uint256) public tierLimits;
+
+    mapping(uint256 => CreditLine) public creditLines;
+    mapping(address => uint256[]) public userCreditLines;
+    mapping(uint256 => DrawRequest[]) public drawRequests;
+    mapping(uint256 => PaymentHistory[]) public paymentHistory;
+    mapping(address => bool) public supportedAssets;
+    mapping(address => uint256) public poolLiquidity; // Available liquidity per asset
+
+    // ============ Events ============
+
+    event CreditLineOpened(
+        uint256 indexed creditLineId,
+        address indexed borrower,
+        uint256 creditLimit,
+        uint256 interestRate,
+        TierLevel tier
+    );
+
+    event CreditLineStatusChanged(
+        uint256 indexed creditLineId,
+        CreditLineStatus oldStatus,
+        CreditLineStatus newStatus
+    );
+
+    event CreditDrawn(
+        uint256 indexed creditLineId,
+        address indexed borrower,
+        uint256 amount,
+        uint256 newBalance
+    );
+
+    event PaymentMade(
+        uint256 indexed creditLineId,
+        address indexed borrower,
+        uint256 amount,
+        uint256 principalPaid,
+        uint256 interestPaid,
+        bool onTime
+    );
+
+    event InterestAccrued(
+        uint256 indexed creditLineId,
+        uint256 interestAmount,
+        uint256 timestamp
+    );
+
+    event CreditLimitIncreased(
+        uint256 indexed creditLineId,
+        uint256 oldLimit,
+        uint256 newLimit
+    );
+
+    event CreditLineClosed(
+        uint256 indexed creditLineId,
+        address indexed borrower,
+        string reason
+    );
+
+    event TierUpgraded(
+        uint256 indexed creditLineId,
+        TierLevel oldTier,
+        TierLevel newTier,
+        uint256 newRate
+    );
+
+    event LiquidityAdded(address indexed asset, uint256 amount, address indexed provider);
+    event LiquidityRemoved(address indexed asset, uint256 amount, address indexed recipient);
+
+    event MissedPaymentRecorded(
+        uint256 indexed creditLineId,
+        uint256 missedPayments,
+        uint256 daysOverdue
+    );
+
+    // ============ Modifiers ============
+
+    modifier onlySupportedAsset(address asset) {
+        require(supportedAssets[asset], "Asset not supported");
+        _;
+    }
+
+    modifier validCreditLine(uint256 creditLineId) {
+        require(creditLineId > 0 && creditLineId < nextCreditLineId, "Invalid credit line ID");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(address _creditScoreContract) public initializer {
+        require(_creditScoreContract != address(0), "Invalid credit score address");
+
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        creditScoreContract = ICreditScore(_creditScoreContract);
+        nextCreditLineId = 1;
+        nextDrawRequestId = 1;
+
+        // Initialize tier rates (in basis points)
+        tierInterestRates[TierLevel.Bronze] = 700;    // 7.0%
+        tierInterestRates[TierLevel.Silver] = 650;    // 6.5%
+        tierInterestRates[TierLevel.Gold] = 600;      // 6.0%
+        tierInterestRates[TierLevel.Platinum] = 550;  // 5.5%
+        tierInterestRates[TierLevel.Diamond] = 500;   // 5.0%
+
+        // Initialize tier limits
+        tierLimits[TierLevel.Bronze] = BRONZE_LIMIT;
+        tierLimits[TierLevel.Silver] = SILVER_LIMIT;
+        tierLimits[TierLevel.Gold] = GOLD_LIMIT;
+        tierLimits[TierLevel.Platinum] = PLATINUM_LIMIT;
+        tierLimits[TierLevel.Diamond] = DIAMOND_LIMIT;
+    }
+
+    // ============ Credit Line Application ============
+
+    /**
+     * @notice Apply for a private credit line
+     * @param asset Asset to borrow
+     * @param requestedLimit Requested credit limit
+     * @return creditLineId The created credit line ID
+     */
+    function applyForCreditLine(
+        address asset,
+        uint256 requestedLimit
+    ) external nonReentrant whenNotPaused onlySupportedAsset(asset) returns (uint256) {
+        require(requestedLimit > 0, "Limit must be positive");
+
+        // Check credit score
+        uint256 creditScore = creditScoreContract.getCreditScore(msg.sender);
+        require(creditScore >= MIN_CREDIT_SCORE, "Credit score too low");
+
+        // Determine tier and rate based on credit score and requested limit
+        (TierLevel tier, uint256 approvedLimit, uint256 interestRate) = _determineTierAndLimit(
+            creditScore,
+            requestedLimit
+        );
+
+        uint256 creditLineId = nextCreditLineId++;
+        uint256 minPayment = (approvedLimit * 3) / 100; // 3% of limit as min monthly payment
+
+        creditLines[creditLineId] = CreditLine({
+            id: creditLineId,
+            borrower: msg.sender,
+            asset: asset,
+            creditLimit: approvedLimit,
+            availableCredit: approvedLimit,
+            utilizedCredit: 0,
+            interestRate: interestRate,
+            minMonthlyPayment: minPayment,
+            outstandingBalance: 0,
+            accruedInterest: 0,
+            lastInterestAccrual: block.timestamp,
+            openedAt: block.timestamp,
+            lastPaymentDate: 0,
+            nextPaymentDue: block.timestamp + PAYMENT_PERIOD,
+            status: CreditLineStatus.Active,
+            tier: tier,
+            missedPayments: 0,
+            totalBorrowed: 0,
+            totalRepaid: 0
+        });
+
+        userCreditLines[msg.sender].push(creditLineId);
+        totalCreditIssued += approvedLimit;
+
+        emit CreditLineOpened(creditLineId, msg.sender, approvedLimit, interestRate, tier);
+
+        return creditLineId;
+    }
+
+    // ============ Borrowing Functions ============
+
+    /**
+     * @notice Draw from credit line
+     * @param creditLineId Credit line ID
+     * @param amount Amount to draw
+     */
+    function drawCredit(
+        uint256 creditLineId,
+        uint256 amount
+    ) external nonReentrant whenNotPaused validCreditLine(creditLineId) {
+        CreditLine storage line = creditLines[creditLineId];
+        require(msg.sender == line.borrower, "Not credit line owner");
+        require(line.status == CreditLineStatus.Active, "Credit line not active");
+        require(amount > 0 && amount <= line.availableCredit, "Invalid draw amount");
+        require(poolLiquidity[line.asset] >= amount, "Insufficient liquidity");
+
+        // Accrue interest before draw
+        _accrueInterest(creditLineId);
+
+        // Update credit line
+        line.availableCredit -= amount;
+        line.utilizedCredit += amount;
+        line.outstandingBalance += amount;
+        line.totalBorrowed += amount;
+
+        // Update pool liquidity
+        poolLiquidity[line.asset] -= amount;
+        totalOutstanding += amount;
+
+        // Transfer funds to borrower
+        IERC20(line.asset).safeTransfer(msg.sender, amount);
+
+        emit CreditDrawn(creditLineId, msg.sender, amount, line.outstandingBalance);
+    }
+
+    /**
+     * @notice Make a payment towards credit line
+     * @param creditLineId Credit line ID
+     * @param amount Payment amount
+     */
+    function makePayment(
+        uint256 creditLineId,
+        uint256 amount
+    ) external nonReentrant validCreditLine(creditLineId) {
+        CreditLine storage line = creditLines[creditLineId];
+        require(msg.sender == line.borrower, "Not credit line owner");
+        require(amount > 0, "Amount must be positive");
+
+        // Accrue interest before payment
+        _accrueInterest(creditLineId);
+
+        uint256 totalOwed = line.outstandingBalance + line.accruedInterest;
+        require(amount <= totalOwed, "Payment exceeds balance");
+
+        // Apply payment to interest first, then principal
+        uint256 interestPaid = 0;
+        uint256 principalPaid = 0;
+        uint256 remainingPayment = amount;
+
+        if (line.accruedInterest > 0) {
+            if (remainingPayment >= line.accruedInterest) {
+                interestPaid = line.accruedInterest;
+                remainingPayment -= line.accruedInterest;
+                line.accruedInterest = 0;
+            } else {
+                interestPaid = remainingPayment;
+                line.accruedInterest -= remainingPayment;
+                remainingPayment = 0;
+            }
+        }
+
+        if (remainingPayment > 0) {
+            principalPaid = remainingPayment;
+            line.outstandingBalance -= remainingPayment;
+            line.utilizedCredit -= remainingPayment;
+            line.availableCredit += remainingPayment;
+            totalOutstanding -= remainingPayment;
+        }
+
+        // Update payment tracking
+        bool onTime = block.timestamp <= line.nextPaymentDue;
+        line.lastPaymentDate = block.timestamp;
+        line.totalRepaid += amount;
+
+        if (onTime && amount >= line.minMonthlyPayment) {
+            line.missedPayments = 0;
+            line.nextPaymentDue = block.timestamp + PAYMENT_PERIOD;
+        }
+
+        // Record interest earned
+        totalInterestEarned += interestPaid;
+
+        // Transfer payment
+        IERC20(line.asset).safeTransferFrom(msg.sender, address(this), amount);
+        poolLiquidity[line.asset] += amount;
+
+        // Record payment history
+        paymentHistory[creditLineId].push(PaymentHistory({
+            creditLineId: creditLineId,
+            amount: amount,
+            timestamp: block.timestamp,
+            principalPaid: principalPaid,
+            interestPaid: interestPaid,
+            onTime: onTime
+        }));
+
+        emit PaymentMade(creditLineId, msg.sender, amount, principalPaid, interestPaid, onTime);
+
+        // Check for tier upgrade
+        _checkTierUpgrade(creditLineId);
+
+        // Unfreeze if was frozen and payment brings current
+        if (line.status == CreditLineStatus.Frozen && line.missedPayments == 0) {
+            _updateCreditLineStatus(creditLineId, CreditLineStatus.Active);
+        }
+    }
+
+    // ============ Management Functions ============
+
+    /**
+     * @notice Close a credit line
+     * @param creditLineId Credit line ID
+     */
+    function closeCreditLine(uint256 creditLineId) external validCreditLine(creditLineId) {
+        CreditLine storage line = creditLines[creditLineId];
+        require(msg.sender == line.borrower || msg.sender == owner(), "Not authorized");
+        require(line.outstandingBalance == 0 && line.accruedInterest == 0, "Outstanding balance exists");
+
+        _updateCreditLineStatus(creditLineId, CreditLineStatus.Closed);
+
+        emit CreditLineClosed(creditLineId, line.borrower, "Voluntarily closed");
+    }
+
+    /**
+     * @notice Request credit limit increase
+     * @param creditLineId Credit line ID
+     * @param newLimit Requested new limit
+     */
+    function requestCreditIncrease(
+        uint256 creditLineId,
+        uint256 newLimit
+    ) external validCreditLine(creditLineId) {
+        CreditLine storage line = creditLines[creditLineId];
+        require(msg.sender == line.borrower, "Not credit line owner");
+        require(line.status == CreditLineStatus.Active, "Credit line not active");
+        require(newLimit > line.creditLimit, "New limit must be higher");
+        require(line.missedPayments == 0, "Cannot increase with missed payments");
+
+        // Check credit score
+        uint256 creditScore = creditScoreContract.getCreditScore(msg.sender);
+        require(creditScore >= MIN_CREDIT_SCORE, "Credit score too low");
+
+        // Determine if eligible for increase
+        (TierLevel newTier, uint256 approvedLimit, uint256 newRate) = _determineTierAndLimit(
+            creditScore,
+            newLimit
+        );
+
+        require(approvedLimit >= line.creditLimit, "Not eligible for increase");
+
+        uint256 oldLimit = line.creditLimit;
+        uint256 increase = approvedLimit - oldLimit;
+
+        line.creditLimit = approvedLimit;
+        line.availableCredit += increase;
+
+        if (newTier != line.tier) {
+            TierLevel oldTier = line.tier;
+            line.tier = newTier;
+            line.interestRate = newRate;
+            emit TierUpgraded(creditLineId, oldTier, newTier, newRate);
+        }
+
+        totalCreditIssued += increase;
+
+        emit CreditLimitIncreased(creditLineId, oldLimit, approvedLimit);
+    }
+
+    // ============ Interest Management ============
+
+    /**
+     * @notice Accrue interest on a credit line
+     * @param creditLineId Credit line ID
+     */
+    function accrueInterest(uint256 creditLineId) external validCreditLine(creditLineId) {
+        _accrueInterest(creditLineId);
+    }
+
+    /**
+     * @notice Check for missed payments and update status
+     * @param creditLineId Credit line ID
+     */
+    function checkMissedPayment(uint256 creditLineId) external validCreditLine(creditLineId) {
+        CreditLine storage line = creditLines[creditLineId];
+
+        if (block.timestamp > line.nextPaymentDue && line.outstandingBalance > 0) {
+            line.missedPayments++;
+            uint256 daysOverdue = (block.timestamp - line.nextPaymentDue) / 1 days;
+
+            emit MissedPaymentRecorded(creditLineId, line.missedPayments, daysOverdue);
+
+            // Freeze after 2 missed payments
+            if (line.missedPayments >= 2 && line.status == CreditLineStatus.Active) {
+                _updateCreditLineStatus(creditLineId, CreditLineStatus.Frozen);
+            }
+
+            // Default after 3 missed payments
+            if (line.missedPayments >= 3) {
+                _updateCreditLineStatus(creditLineId, CreditLineStatus.Defaulted);
+            }
+
+            // Move next payment due forward
+            line.nextPaymentDue = block.timestamp + PAYMENT_PERIOD;
+        }
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get credit line details
+     */
+    function getCreditLine(uint256 creditLineId) external view validCreditLine(creditLineId) returns (CreditLine memory) {
+        return creditLines[creditLineId];
+    }
+
+    /**
+     * @notice Get user's credit lines
+     */
+    function getUserCreditLines(address user) external view returns (uint256[] memory) {
+        return userCreditLines[user];
+    }
+
+    /**
+     * @notice Get payment history
+     */
+    function getPaymentHistory(uint256 creditLineId) external view returns (PaymentHistory[] memory) {
+        return paymentHistory[creditLineId];
+    }
+
+    /**
+     * @notice Calculate current outstanding balance including accrued interest
+     */
+    function getCurrentBalance(uint256 creditLineId) external view validCreditLine(creditLineId) returns (uint256) {
+        CreditLine memory line = creditLines[creditLineId];
+        uint256 pendingInterest = _calculatePendingInterest(creditLineId);
+        return line.outstandingBalance + line.accruedInterest + pendingInterest;
+    }
+
+    /**
+     * @notice Get platform statistics
+     */
+    function getPlatformStats() external view returns (
+        uint256 totalCredit,
+        uint256 outstanding,
+        uint256 interestEarned,
+        uint256 activeCreditLines
+    ) {
+        uint256 activeCount = 0;
+        for (uint256 i = 1; i < nextCreditLineId; i++) {
+            if (creditLines[i].status == CreditLineStatus.Active) {
+                activeCount++;
+            }
+        }
+
+        return (totalCreditIssued, totalOutstanding, totalInterestEarned, activeCount);
+    }
+
+    // ============ Liquidity Management (Admin) ============
+
+    /**
+     * @notice Add liquidity to the pool
+     */
+    function addLiquidity(address asset, uint256 amount) external onlyOwner onlySupportedAsset(asset) {
+        require(amount > 0, "Amount must be positive");
+        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+        poolLiquidity[asset] += amount;
+        emit LiquidityAdded(asset, amount, msg.sender);
+    }
+
+    /**
+     * @notice Remove liquidity from the pool
+     */
+    function removeLiquidity(
+        address asset,
+        uint256 amount,
+        address recipient
+    ) external onlyOwner {
+        require(amount > 0, "Amount must be positive");
+        require(poolLiquidity[asset] >= amount, "Insufficient liquidity");
+        require(recipient != address(0), "Invalid recipient");
+
+        poolLiquidity[asset] -= amount;
+        IERC20(asset).safeTransfer(recipient, amount);
+        emit LiquidityRemoved(asset, amount, recipient);
+    }
+
+    /**
+     * @notice Set asset support status
+     */
+    function setAssetSupport(address asset, bool supported) external onlyOwner {
+        require(asset != address(0), "Invalid asset");
+        supportedAssets[asset] = supported;
+    }
+
+    /**
+     * @notice Update tier interest rate
+     */
+    function updateTierRate(TierLevel tier, uint256 newRate) external onlyOwner {
+        require(newRate >= MIN_APY && newRate <= MAX_APY, "Rate out of range");
+        tierInterestRates[tier] = newRate;
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ============ Internal Functions ============
+
+    function _accrueInterest(uint256 creditLineId) internal {
+        CreditLine storage line = creditLines[creditLineId];
+
+        if (line.outstandingBalance == 0) {
+            line.lastInterestAccrual = block.timestamp;
+            return;
+        }
+
+        uint256 pendingInterest = _calculatePendingInterest(creditLineId);
+
+        if (pendingInterest > 0) {
+            line.accruedInterest += pendingInterest;
+            line.lastInterestAccrual = block.timestamp;
+
+            emit InterestAccrued(creditLineId, pendingInterest, block.timestamp);
+        }
+    }
+
+    function _calculatePendingInterest(uint256 creditLineId) internal view returns (uint256) {
+        CreditLine memory line = creditLines[creditLineId];
+
+        if (line.outstandingBalance == 0) {
+            return 0;
+        }
+
+        uint256 timeElapsed = block.timestamp - line.lastInterestAccrual;
+        uint256 interest = (line.outstandingBalance * line.interestRate * timeElapsed) / (SECONDS_PER_YEAR * BASIS_POINTS);
+
+        return interest;
+    }
+
+    function _determineTierAndLimit(
+        uint256 creditScore,
+        uint256 requestedLimit
+    ) internal view returns (TierLevel tier, uint256 approvedLimit, uint256 interestRate) {
+        // Determine tier based on credit score
+        if (creditScore >= 900) {
+            tier = TierLevel.Diamond;
+        } else if (creditScore >= 800) {
+            tier = TierLevel.Platinum;
+        } else if (creditScore >= 750) {
+            tier = TierLevel.Gold;
+        } else if (creditScore >= 700) {
+            tier = TierLevel.Silver;
+        } else {
+            tier = TierLevel.Bronze;
+        }
+
+        uint256 maxLimit = tierLimits[tier];
+        approvedLimit = requestedLimit > maxLimit ? maxLimit : requestedLimit;
+        interestRate = tierInterestRates[tier];
+    }
+
+    function _checkTierUpgrade(uint256 creditLineId) internal {
+        CreditLine storage line = creditLines[creditLineId];
+
+        uint256 creditScore = creditScoreContract.getCreditScore(line.borrower);
+        (TierLevel newTier, , uint256 newRate) = _determineTierAndLimit(creditScore, line.creditLimit);
+
+        if (newTier != line.tier && uint8(newTier) > uint8(line.tier)) {
+            TierLevel oldTier = line.tier;
+            line.tier = newTier;
+            line.interestRate = newRate;
+
+            emit TierUpgraded(creditLineId, oldTier, newTier, newRate);
+        }
+    }
+
+    function _updateCreditLineStatus(uint256 creditLineId, CreditLineStatus newStatus) internal {
+        CreditLine storage line = creditLines[creditLineId];
+        CreditLineStatus oldStatus = line.status;
+        line.status = newStatus;
+
+        emit CreditLineStatusChanged(creditLineId, oldStatus, newStatus);
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    uint256[50] private __gap;
+}

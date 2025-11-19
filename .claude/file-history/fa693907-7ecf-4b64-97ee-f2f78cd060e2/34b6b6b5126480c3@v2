@@ -1,0 +1,638 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "./interfaces/IDebtCollection.sol";
+
+/**
+ * @title BancafiInsurance
+ * @notice Shared insurance pool to cover defaulted loans and reduce lender risk
+ * @dev Liquidity providers earn fees, lenders get protection coverage
+ * @custom:security-contact security@bancafi.com
+ */
+contract BancafiInsurance is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    // ============ Structs ============
+
+    struct InsurancePolicy {
+        uint256 id;
+        address lender;
+        uint256 loanId;
+        address loanAsset;
+        uint256 coverageAmount;
+        uint256 premiumPaid;
+        uint256 startTime;
+        uint256 duration;
+        PolicyStatus status;
+        bool hasClaimed;
+    }
+
+    struct LiquidityProvider {
+        address provider;
+        uint256 stakedAmount;
+        uint256 stakedAt;
+        uint256 rewardsEarned;
+        uint256 lastClaimTime;
+        bool isActive;
+    }
+
+    struct Claim {
+        uint256 id;
+        uint256 policyId;
+        uint256 loanId;
+        address claimant;
+        uint256 claimAmount;
+        uint256 submittedAt;
+        uint256 processedAt;
+        ClaimStatus status;
+        string rejectionReason;
+    }
+
+    struct PoolMetrics {
+        uint256 totalStaked;
+        uint256 totalCoverage;
+        uint256 totalPremiums;
+        uint256 totalClaims;
+        uint256 utilizationRate; // in basis points
+        uint256 availableLiquidity;
+    }
+
+    enum PolicyStatus {
+        Active,
+        Expired,
+        Claimed,
+        Cancelled
+    }
+
+    enum ClaimStatus {
+        Pending,
+        Approved,
+        Rejected,
+        Paid
+    }
+
+    // ============ State Variables ============
+
+    IDebtCollection public debtCollectionContract;
+
+    uint256 public nextPolicyId;
+    uint256 public nextClaimId;
+
+    uint256 public poolBalance;
+    uint256 public totalStaked;
+    uint256 public totalRewardsDistributed;
+
+    uint256 public premiumRate; // Premium as % of coverage (basis points)
+    uint256 public minCoverageRatio; // Min pool/coverage ratio (basis points)
+    uint256 public maxCoveragePerPolicy; // Max coverage per policy
+
+    uint256 public constant BASIS_POINTS = 10000;
+    uint256 public constant MIN_PREMIUM_RATE = 50; // 0.5%
+    uint256 public constant MAX_PREMIUM_RATE = 1000; // 10%
+    uint256 public constant MIN_STAKE_AMOUNT = 1000e18; // 1000 tokens min
+    uint256 public constant MIN_COVERAGE_RATIO = 15000; // 150% coverage requirement
+
+    mapping(uint256 => InsurancePolicy) public policies;
+    mapping(uint256 => Claim) public claims;
+    mapping(address => LiquidityProvider) public liquidityProviders;
+    mapping(address => uint256[]) public lenderPolicies;
+    mapping(address => uint256[]) public providerStakes;
+    mapping(uint256 => bool) public coveredLoans; // loanId => covered
+
+    address[] public allProviders;
+
+    // ============ Events ============
+
+    event PolicyPurchased(
+        uint256 indexed policyId,
+        address indexed lender,
+        uint256 indexed loanId,
+        uint256 coverageAmount,
+        uint256 premiumPaid
+    );
+
+    event PolicyExpired(
+        uint256 indexed policyId,
+        uint256 timestamp
+    );
+
+    event PolicyCancelled(
+        uint256 indexed policyId,
+        address indexed lender,
+        uint256 refundAmount
+    );
+
+    event ClaimSubmitted(
+        uint256 indexed claimId,
+        uint256 indexed policyId,
+        address indexed claimant,
+        uint256 claimAmount
+    );
+
+    event ClaimApproved(
+        uint256 indexed claimId,
+        uint256 approvedAmount,
+        uint256 timestamp
+    );
+
+    event ClaimRejected(
+        uint256 indexed claimId,
+        string reason,
+        uint256 timestamp
+    );
+
+    event ClaimPaid(
+        uint256 indexed claimId,
+        address indexed recipient,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event LiquidityAdded(
+        address indexed provider,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event LiquidityRemoved(
+        address indexed provider,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event RewardsClaimed(
+        address indexed provider,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event PremiumRateUpdated(uint256 oldRate, uint256 newRate);
+    event MaxCoverageUpdated(uint256 oldMax, uint256 newMax);
+
+    // ============ Modifiers ============
+
+    modifier validPolicy(uint256 policyId) {
+        require(policyId > 0 && policyId < nextPolicyId, "Invalid policy ID");
+        _;
+    }
+
+    modifier validClaim(uint256 claimId) {
+        require(claimId > 0 && claimId < nextClaimId, "Invalid claim ID");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ============ Initializer ============
+
+    function initialize(
+        address _debtCollectionContract,
+        uint256 _premiumRate,
+        uint256 _maxCoveragePerPolicy
+    ) public initializer {
+        require(_debtCollectionContract != address(0), "Invalid debt collection address");
+        require(_premiumRate >= MIN_PREMIUM_RATE && _premiumRate <= MAX_PREMIUM_RATE, "Invalid premium rate");
+        require(_maxCoveragePerPolicy > 0, "Invalid max coverage");
+
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+
+        debtCollectionContract = IDebtCollection(_debtCollectionContract);
+        premiumRate = _premiumRate;
+        maxCoveragePerPolicy = _maxCoveragePerPolicy;
+        minCoverageRatio = MIN_COVERAGE_RATIO;
+
+        nextPolicyId = 1;
+        nextClaimId = 1;
+    }
+
+    // ============ Policy Functions ============
+
+    /**
+     * @notice Purchase insurance coverage for a loan
+     * @param loanId Loan ID to insure
+     * @param coverageAmount Amount of coverage desired
+     * @param duration Coverage duration in seconds
+     * @return policyId Created policy ID
+     */
+    function purchasePolicy(
+        uint256 loanId,
+        address loanAsset,
+        uint256 coverageAmount,
+        uint256 duration
+    ) external payable nonReentrant whenNotPaused returns (uint256) {
+        require(coverageAmount > 0 && coverageAmount <= maxCoveragePerPolicy, "Invalid coverage amount");
+        require(duration > 0, "Invalid duration");
+        require(!coveredLoans[loanId], "Loan already covered");
+
+        // Check pool capacity
+        require(_hasCapacityForCoverage(coverageAmount), "Insufficient pool capacity");
+
+        // Calculate premium
+        uint256 premium = (coverageAmount * premiumRate * duration) / (365 days * BASIS_POINTS);
+        require(msg.value >= premium, "Insufficient premium payment");
+
+        uint256 policyId = nextPolicyId++;
+
+        policies[policyId] = InsurancePolicy({
+            id: policyId,
+            lender: msg.sender,
+            loanId: loanId,
+            loanAsset: loanAsset,
+            coverageAmount: coverageAmount,
+            premiumPaid: premium,
+            startTime: block.timestamp,
+            duration: duration,
+            status: PolicyStatus.Active,
+            hasClaimed: false
+        });
+
+        coveredLoans[loanId] = true;
+        lenderPolicies[msg.sender].push(policyId);
+
+        // Add premium to pool
+        poolBalance += premium;
+
+        emit PolicyPurchased(policyId, msg.sender, loanId, coverageAmount, premium);
+
+        // Refund excess
+        if (msg.value > premium) {
+            payable(msg.sender).transfer(msg.value - premium);
+        }
+
+        return policyId;
+    }
+
+    /**
+     * @notice Cancel policy before expiration
+     * @param policyId Policy ID to cancel
+     */
+    function cancelPolicy(uint256 policyId) external nonReentrant validPolicy(policyId) {
+        InsurancePolicy storage policy = policies[policyId];
+        require(msg.sender == policy.lender, "Not policy owner");
+        require(policy.status == PolicyStatus.Active, "Policy not active");
+        require(!policy.hasClaimed, "Cannot cancel claimed policy");
+
+        uint256 elapsed = block.timestamp - policy.startTime;
+        uint256 refundRatio = ((policy.duration - elapsed) * BASIS_POINTS) / policy.duration;
+        uint256 refundAmount = (policy.premiumPaid * refundRatio) / BASIS_POINTS;
+
+        policy.status = PolicyStatus.Cancelled;
+        coveredLoans[policy.loanId] = false;
+
+        if (refundAmount > 0 && poolBalance >= refundAmount) {
+            poolBalance -= refundAmount;
+            payable(msg.sender).transfer(refundAmount);
+        }
+
+        emit PolicyCancelled(policyId, msg.sender, refundAmount);
+    }
+
+    // ============ Claims Functions ============
+
+    /**
+     * @notice Submit insurance claim for defaulted loan
+     * @param policyId Policy ID
+     * @param claimAmount Amount to claim
+     * @return claimId Created claim ID
+     */
+    function submitClaim(
+        uint256 policyId,
+        uint256 claimAmount
+    ) external nonReentrant validPolicy(policyId) returns (uint256) {
+        InsurancePolicy storage policy = policies[policyId];
+        require(msg.sender == policy.lender, "Not policy owner");
+        require(policy.status == PolicyStatus.Active, "Policy not active");
+        require(!policy.hasClaimed, "Already claimed");
+        require(claimAmount <= policy.coverageAmount, "Claim exceeds coverage");
+
+        // Verify loan is in collection (defaulted)
+        require(
+            debtCollectionContract.isInCollection(policy.loanId),
+            "Loan not defaulted"
+        );
+
+        uint256 claimId = nextClaimId++;
+
+        claims[claimId] = Claim({
+            id: claimId,
+            policyId: policyId,
+            loanId: policy.loanId,
+            claimant: msg.sender,
+            claimAmount: claimAmount,
+            submittedAt: block.timestamp,
+            processedAt: 0,
+            status: ClaimStatus.Pending,
+            rejectionReason: ""
+        });
+
+        emit ClaimSubmitted(claimId, policyId, msg.sender, claimAmount);
+
+        return claimId;
+    }
+
+    /**
+     * @notice Approve insurance claim (admin)
+     * @param claimId Claim ID to approve
+     * @param approvedAmount Approved claim amount
+     */
+    function approveClaim(
+        uint256 claimId,
+        uint256 approvedAmount
+    ) external onlyOwner validClaim(claimId) {
+        Claim storage claim = claims[claimId];
+        require(claim.status == ClaimStatus.Pending, "Claim not pending");
+        require(approvedAmount <= claim.claimAmount, "Approved exceeds claim");
+        require(poolBalance >= approvedAmount, "Insufficient pool balance");
+
+        InsurancePolicy storage policy = policies[claim.policyId];
+
+        claim.status = ClaimStatus.Approved;
+        claim.processedAt = block.timestamp;
+
+        emit ClaimApproved(claimId, approvedAmount, block.timestamp);
+
+        // Pay claim
+        _payClaim(claimId, approvedAmount);
+    }
+
+    /**
+     * @notice Reject insurance claim (admin)
+     * @param claimId Claim ID to reject
+     * @param reason Rejection reason
+     */
+    function rejectClaim(
+        uint256 claimId,
+        string calldata reason
+    ) external onlyOwner validClaim(claimId) {
+        Claim storage claim = claims[claimId];
+        require(claim.status == ClaimStatus.Pending, "Claim not pending");
+
+        claim.status = ClaimStatus.Rejected;
+        claim.rejectionReason = reason;
+        claim.processedAt = block.timestamp;
+
+        emit ClaimRejected(claimId, reason, block.timestamp);
+    }
+
+    // ============ Liquidity Provider Functions ============
+
+    /**
+     * @notice Stake liquidity in insurance pool
+     * @param amount Amount to stake
+     */
+    function stakeLiquidity(uint256 amount) external payable nonReentrant whenNotPaused {
+        require(amount >= MIN_STAKE_AMOUNT, "Amount below minimum");
+        require(msg.value >= amount, "Insufficient value");
+
+        LiquidityProvider storage provider = liquidityProviders[msg.sender];
+
+        if (!provider.isActive) {
+            provider.provider = msg.sender;
+            provider.stakedAt = block.timestamp;
+            provider.lastClaimTime = block.timestamp;
+            provider.isActive = true;
+            allProviders.push(msg.sender);
+        }
+
+        provider.stakedAmount += amount;
+        totalStaked += amount;
+        poolBalance += amount;
+
+        emit LiquidityAdded(msg.sender, amount, block.timestamp);
+
+        // Refund excess
+        if (msg.value > amount) {
+            payable(msg.sender).transfer(msg.value - amount);
+        }
+    }
+
+    /**
+     * @notice Unstake liquidity from pool
+     * @param amount Amount to unstake
+     */
+    function unstakeLiquidity(uint256 amount) external nonReentrant {
+        LiquidityProvider storage provider = liquidityProviders[msg.sender];
+        require(provider.isActive, "Not a provider");
+        require(amount <= provider.stakedAmount, "Amount exceeds stake");
+
+        // Check if pool can handle withdrawal
+        uint256 utilization = getPoolUtilization();
+        require(utilization < 8000, "Pool utilization too high"); // Must be below 80%
+
+        provider.stakedAmount -= amount;
+        totalStaked -= amount;
+        poolBalance -= amount;
+
+        if (provider.stakedAmount == 0) {
+            provider.isActive = false;
+        }
+
+        payable(msg.sender).transfer(amount);
+
+        emit LiquidityRemoved(msg.sender, amount, block.timestamp);
+    }
+
+    /**
+     * @notice Claim accumulated rewards
+     */
+    function claimRewards() external nonReentrant {
+        LiquidityProvider storage provider = liquidityProviders[msg.sender];
+        require(provider.isActive, "Not a provider");
+
+        uint256 rewards = _calculateRewards(msg.sender);
+        require(rewards > 0, "No rewards available");
+
+        provider.rewardsEarned += rewards;
+        provider.lastClaimTime = block.timestamp;
+        totalRewardsDistributed += rewards;
+
+        payable(msg.sender).transfer(rewards);
+
+        emit RewardsClaimed(msg.sender, rewards, block.timestamp);
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get policy details
+     */
+    function getPolicy(uint256 policyId) external view validPolicy(policyId) returns (InsurancePolicy memory) {
+        return policies[policyId];
+    }
+
+    /**
+     * @notice Get claim details
+     */
+    function getClaim(uint256 claimId) external view validClaim(claimId) returns (Claim memory) {
+        return claims[claimId];
+    }
+
+    /**
+     * @notice Get lender's policies
+     */
+    function getLenderPolicies(address lender) external view returns (uint256[] memory) {
+        return lenderPolicies[lender];
+    }
+
+    /**
+     * @notice Get liquidity provider info
+     */
+    function getProviderInfo(address provider) external view returns (LiquidityProvider memory) {
+        return liquidityProviders[provider];
+    }
+
+    /**
+     * @notice Get pool metrics
+     */
+    function getPoolMetrics() external view returns (PoolMetrics memory) {
+        uint256 totalCoverage = _getTotalActiveCoverage();
+
+        return PoolMetrics({
+            totalStaked: totalStaked,
+            totalCoverage: totalCoverage,
+            totalPremiums: poolBalance,
+            totalClaims: totalRewardsDistributed,
+            utilizationRate: getPoolUtilization(),
+            availableLiquidity: poolBalance
+        });
+    }
+
+    /**
+     * @notice Get pool utilization rate
+     */
+    function getPoolUtilization() public view returns (uint256) {
+        if (poolBalance == 0) return 0;
+
+        uint256 totalCoverage = _getTotalActiveCoverage();
+        return (totalCoverage * BASIS_POINTS) / poolBalance;
+    }
+
+    /**
+     * @notice Calculate pending rewards for provider
+     */
+    function calculatePendingRewards(address provider) external view returns (uint256) {
+        return _calculateRewards(provider);
+    }
+
+    /**
+     * @notice Get all liquidity providers
+     */
+    function getAllProviders() external view returns (address[] memory) {
+        return allProviders;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update premium rate
+     */
+    function updatePremiumRate(uint256 newRate) external onlyOwner {
+        require(newRate >= MIN_PREMIUM_RATE && newRate <= MAX_PREMIUM_RATE, "Invalid rate");
+
+        uint256 oldRate = premiumRate;
+        premiumRate = newRate;
+
+        emit PremiumRateUpdated(oldRate, newRate);
+    }
+
+    /**
+     * @notice Update max coverage per policy
+     */
+    function updateMaxCoverage(uint256 newMax) external onlyOwner {
+        require(newMax > 0, "Invalid max coverage");
+
+        uint256 oldMax = maxCoveragePerPolicy;
+        maxCoveragePerPolicy = newMax;
+
+        emit MaxCoverageUpdated(oldMax, newMax);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ============ Internal Functions ============
+
+    function _payClaim(uint256 claimId, uint256 amount) internal {
+        Claim storage claim = claims[claimId];
+        InsurancePolicy storage policy = policies[claim.policyId];
+
+        claim.status = ClaimStatus.Paid;
+        policy.status = PolicyStatus.Claimed;
+        policy.hasClaimed = true;
+
+        poolBalance -= amount;
+
+        payable(claim.claimant).transfer(amount);
+
+        emit ClaimPaid(claimId, claim.claimant, amount, block.timestamp);
+    }
+
+    function _calculateRewards(address provider) internal view returns (uint256) {
+        LiquidityProvider memory providerInfo = liquidityProviders[provider];
+
+        if (!providerInfo.isActive || providerInfo.stakedAmount == 0) {
+            return 0;
+        }
+
+        uint256 timeStaked = block.timestamp - providerInfo.lastClaimTime;
+        uint256 providerShare = (providerInfo.stakedAmount * BASIS_POINTS) / totalStaked;
+
+        // Rewards = premiums collected * provider's share * time factor
+        uint256 rewards = (poolBalance * providerShare * timeStaked) / (365 days * BASIS_POINTS);
+
+        return rewards;
+    }
+
+    function _getTotalActiveCoverage() internal view returns (uint256) {
+        uint256 totalCoverage = 0;
+
+        for (uint256 i = 1; i < nextPolicyId; i++) {
+            if (policies[i].status == PolicyStatus.Active) {
+                totalCoverage += policies[i].coverageAmount;
+            }
+        }
+
+        return totalCoverage;
+    }
+
+    function _hasCapacityForCoverage(uint256 coverageAmount) internal view returns (bool) {
+        uint256 totalCoverage = _getTotalActiveCoverage();
+        uint256 newTotalCoverage = totalCoverage + coverageAmount;
+
+        uint256 requiredBalance = (newTotalCoverage * minCoverageRatio) / BASIS_POINTS;
+
+        return poolBalance >= requiredBalance;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    receive() external payable {
+        poolBalance += msg.value;
+    }
+
+    uint256[50] private __gap;
+}

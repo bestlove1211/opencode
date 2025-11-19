@@ -1,0 +1,68 @@
+const { DataTypes } = require('sequelize');
+
+module.exports = (sequelize) => {
+  const Account = sequelize.define('Account', {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true
+    },
+    userId: {
+      type: DataTypes.UUID,
+      allowNull: false,
+      references: {
+        model: 'users',
+        key: 'id'
+      }
+    },
+    tokenAddress: {
+      type: DataTypes.STRING,
+      allowNull: false
+    },
+    balance: {
+      type: DataTypes.DECIMAL(78, 0), // Big number support
+      defaultValue: 0
+    },
+    totalInterestEarned: {
+      type: DataTypes.DECIMAL(78, 0),
+      defaultValue: 0
+    },
+    currentAPY: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: true
+    },
+    accountOpenDate: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    lastInterestUpdate: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    isActive: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false
+    },
+    chainId: {
+      type: DataTypes.INTEGER,
+      allowNull: false
+    }
+  }, {
+    tableName: 'accounts',
+    timestamps: true,
+    indexes: [
+      {
+        unique: true,
+        fields: ['userId', 'tokenAddress', 'chainId']
+      },
+      {
+        fields: ['isActive']
+      },
+      {
+        fields: ['tokenAddress']
+      }
+    ]
+  });
+
+  return Account;
+};

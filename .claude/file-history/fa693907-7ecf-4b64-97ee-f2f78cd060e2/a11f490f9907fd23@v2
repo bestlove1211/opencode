@@ -1,0 +1,381 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+/**
+ * @title FlashLoanProtection
+ * @notice Library to protect against flash loan attacks
+ * @dev Implements multiple protection mechanisms against flash loan exploits
+ */
+library FlashLoanProtection {
+    // ============ Structs ============
+
+    struct ProtectionState {
+        mapping(address => uint256) lastActionBlock;
+        mapping(address => uint256) actionCountInBlock;
+        mapping(bytes32 => bool) completedInSameBlock;
+        uint256 maxActionsPerBlock;
+        bool enabled;
+    }
+
+    // ============ Events ============
+
+    event FlashLoanAttemptBlocked(
+        address indexed user,
+        string reason,
+        uint256 blockNumber
+    );
+
+    event SuspiciousActivity(
+        address indexed user,
+        uint256 actionCount,
+        uint256 blockNumber
+    );
+
+    // ============ Constants ============
+
+    uint256 private constant DEFAULT_MAX_ACTIONS = 3;
+
+    // ============ Core Protection Functions ============
+
+    /**
+     * @notice Initialize protection state
+     * @param self ProtectionState storage
+     * @param maxActionsPerBlock Maximum actions allowed per block
+     */
+    function initialize(
+        ProtectionState storage self,
+        uint256 maxActionsPerBlock
+    ) internal {
+        self.maxActionsPerBlock = maxActionsPerBlock > 0 ? maxActionsPerBlock : DEFAULT_MAX_ACTIONS;
+        self.enabled = true;
+    }
+
+    /**
+     * @notice Check and record action (prevents same-block exploitation)
+     * @param self ProtectionState storage
+     * @param user User address
+     * @return allowed Whether action is allowed
+     */
+    function checkAndRecordAction(
+        ProtectionState storage self,
+        address user
+    ) internal returns (bool allowed) {
+        if (!self.enabled) {
+            return true;
+        }
+
+        uint256 currentBlock = block.number;
+
+        // Reset counter if new block
+        if (self.lastActionBlock[user] != currentBlock) {
+            self.actionCountInBlock[user] = 0;
+            self.lastActionBlock[user] = currentBlock;
+        }
+
+        // Increment action count
+        self.actionCountInBlock[user]++;
+
+        // Check if exceeded max actions
+        if (self.actionCountInBlock[user] > self.maxActionsPerBlock) {
+            emit FlashLoanAttemptBlocked(
+                user,
+                "Too many actions in single block",
+                currentBlock
+            );
+            return false;
+        }
+
+        // Alert if suspicious
+        if (self.actionCountInBlock[user] >= self.maxActionsPerBlock) {
+            emit SuspiciousActivity(
+                user,
+                self.actionCountInBlock[user],
+                currentBlock
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * @notice Prevent borrow and repay in same block
+     * @param self ProtectionState storage
+     * @param actionId Unique action identifier
+     * @return allowed Whether action is allowed
+     */
+    function preventSameBlockCompletion(
+        ProtectionState storage self,
+        bytes32 actionId
+    ) internal returns (bool allowed) {
+        if (!self.enabled) {
+            return true;
+        }
+
+        // Check if action already completed this block
+        if (self.completedInSameBlock[actionId]) {
+            emit FlashLoanAttemptBlocked(
+                msg.sender,
+                "Action already completed in same block",
+                block.number
+            );
+            return false;
+        }
+
+        // Mark as completed this block
+        self.completedInSameBlock[actionId] = true;
+
+        return true;
+    }
+
+    /**
+     * @notice Clear same-block completion flag (call in next block)
+     * @param self ProtectionState storage
+     * @param actionId Unique action identifier
+     */
+    function clearCompletionFlag(
+        ProtectionState storage self,
+        bytes32 actionId
+    ) internal {
+        delete self.completedInSameBlock[actionId];
+    }
+
+    /**
+     * @notice Get user action count in current block
+     * @param self ProtectionState storage
+     * @param user User address
+     * @return Action count
+     */
+    function getActionCount(
+        ProtectionState storage self,
+        address user
+    ) internal view returns (uint256) {
+        if (self.lastActionBlock[user] == block.number) {
+            return self.actionCountInBlock[user];
+        }
+        return 0;
+    }
+
+    /**
+     * @notice Enable/disable protection
+     * @param self ProtectionState storage
+     * @param enabled Whether protection is enabled
+     */
+    function setEnabled(
+        ProtectionState storage self,
+        bool enabled
+    ) internal {
+        self.enabled = enabled;
+    }
+
+    /**
+     * @notice Update max actions per block
+     * @param self ProtectionState storage
+     * @param maxActions New maximum
+     */
+    function setMaxActions(
+        ProtectionState storage self,
+        uint256 maxActions
+    ) internal {
+        require(maxActions > 0, "Max actions must be positive");
+        self.maxActionsPerBlock = maxActions;
+    }
+
+    // ============ Advanced Protection Functions ============
+
+    /**
+     * @notice Check for flash loan pattern (borrow -> action -> repay)
+     * @param borrowBlock Block when borrowed
+     * @param repayBlock Block when repaying
+     * @return isFlashLoan Whether this matches flash loan pattern
+     */
+    function detectFlashLoanPattern(
+        uint256 borrowBlock,
+        uint256 repayBlock
+    ) internal view returns (bool isFlashLoan) {
+        return borrowBlock == repayBlock;
+    }
+
+    /**
+     * @notice Calculate time-weighted action score (detect rapid transactions)
+     * @param lastActionTime Last action timestamp
+     * @param actionCount Number of actions
+     * @return suspicionScore Score indicating suspicious activity (0-100)
+     */
+    function calculateSuspicionScore(
+        uint256 lastActionTime,
+        uint256 actionCount
+    ) internal view returns (uint256 suspicionScore) {
+        if (actionCount == 0) {
+            return 0;
+        }
+
+        uint256 timeSinceLastAction = block.timestamp - lastActionTime;
+
+        // Score based on frequency
+        if (timeSinceLastAction < 1 minutes) {
+            if (actionCount >= 5) return 100; // Very suspicious
+            if (actionCount >= 3) return 75;  // Suspicious
+            if (actionCount >= 2) return 50;  // Moderately suspicious
+        } else if (timeSinceLastAction < 5 minutes) {
+            if (actionCount >= 10) return 75;
+            if (actionCount >= 5) return 50;
+        }
+
+        return 25; // Low suspicion
+    }
+
+    /**
+     * @notice Verify oracle price hasn't been manipulated
+     * @param currentPrice Current price
+     * @param lastPrice Last known price
+     * @param maxDeviationBps Maximum allowed deviation in basis points
+     * @return isValid Whether price change is within acceptable range
+     */
+    function validatePriceChange(
+        uint256 currentPrice,
+        uint256 lastPrice,
+        uint256 maxDeviationBps
+    ) internal pure returns (bool isValid) {
+        if (lastPrice == 0 || currentPrice == 0) {
+            return false;
+        }
+
+        uint256 priceDiff;
+        if (currentPrice > lastPrice) {
+            priceDiff = currentPrice - lastPrice;
+        } else {
+            priceDiff = lastPrice - currentPrice;
+        }
+
+        uint256 deviationBps = (priceDiff * 10000) / lastPrice;
+
+        return deviationBps <= maxDeviationBps;
+    }
+
+    /**
+     * @notice Check if transaction is likely from a flash loan bot
+     * @param gasPrice Transaction gas price
+     * @param averageGasPrice Network average gas price
+     * @return isLikelyBot Whether transaction characteristics match bot behavior
+     */
+    function detectBotBehavior(
+        uint256 gasPrice,
+        uint256 averageGasPrice
+    ) internal pure returns (bool isLikelyBot) {
+        // Bots often use very high gas prices for MEV
+        if (gasPrice > averageGasPrice * 3) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ============ Helper Functions ============
+
+    /**
+     * @notice Generate unique action ID
+     * @param user User address
+     * @param actionType Type of action
+     * @param nonce Action nonce
+     * @return actionId Unique identifier
+     */
+    function generateActionId(
+        address user,
+        string memory actionType,
+        uint256 nonce
+    ) internal pure returns (bytes32 actionId) {
+        return keccak256(abi.encodePacked(user, actionType, nonce));
+    }
+
+    /**
+     * @notice Check if same block as deployment (protect against same-block exploits)
+     * @param deploymentBlock Block contract was deployed
+     * @return isSameBlock Whether current block equals deployment block
+     */
+    function isSameBlockAsDeployment(
+        uint256 deploymentBlock
+    ) internal view returns (bool isSameBlock) {
+        return block.number == deploymentBlock;
+    }
+}
+
+/**
+ * @title FlashLoanGuard
+ * @notice Abstract contract to inherit flash loan protection
+ */
+abstract contract FlashLoanGuard {
+    using FlashLoanProtection for FlashLoanProtection.ProtectionState;
+
+    FlashLoanProtection.ProtectionState internal _flashLoanProtection;
+
+    event FlashLoanProtectionEnabled();
+    event FlashLoanProtectionDisabled();
+    event MaxActionsPerBlockUpdated(uint256 oldMax, uint256 newMax);
+
+    /**
+     * @notice Initialize flash loan protection
+     * @param maxActionsPerBlock Maximum actions per block
+     */
+    function _initializeFlashLoanProtection(uint256 maxActionsPerBlock) internal {
+        _flashLoanProtection.initialize(maxActionsPerBlock);
+        emit FlashLoanProtectionEnabled();
+    }
+
+    /**
+     * @notice Modifier to check and record action
+     */
+    modifier flashLoanProtected() {
+        require(
+            _flashLoanProtection.checkAndRecordAction(msg.sender),
+            "Flash loan protection: action blocked"
+        );
+        _;
+    }
+
+    /**
+     * @notice Modifier to prevent same-block completion
+     * @param actionId Unique action identifier
+     */
+    modifier noSameBlockCompletion(bytes32 actionId) {
+        require(
+            _flashLoanProtection.preventSameBlockCompletion(actionId),
+            "Flash loan protection: same-block completion blocked"
+        );
+        _;
+    }
+
+    /**
+     * @notice Enable flash loan protection
+     */
+    function _enableFlashLoanProtection() internal {
+        _flashLoanProtection.setEnabled(true);
+        emit FlashLoanProtectionEnabled();
+    }
+
+    /**
+     * @notice Disable flash loan protection
+     */
+    function _disableFlashLoanProtection() internal {
+        _flashLoanProtection.setEnabled(false);
+        emit FlashLoanProtectionDisabled();
+    }
+
+    /**
+     * @notice Update max actions per block
+     * @param newMax New maximum
+     */
+    function _updateMaxActionsPerBlock(uint256 newMax) internal {
+        uint256 oldMax = _flashLoanProtection.maxActionsPerBlock;
+        _flashLoanProtection.setMaxActions(newMax);
+        emit MaxActionsPerBlockUpdated(oldMax, newMax);
+    }
+
+    /**
+     * @notice Get user's action count in current block
+     * @param user User address
+     * @return Action count
+     */
+    function _getActionCount(address user) internal view returns (uint256) {
+        return _flashLoanProtection.getActionCount(user);
+    }
+}

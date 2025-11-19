@@ -1,0 +1,621 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/proxy/Clones.sol";
+
+interface IBondToken {
+    function initialize(
+        address identityRegistry_,
+        address compliance_,
+        string memory name_,
+        string memory symbol_,
+        uint8 decimals_,
+        bytes memory metadata_
+    ) external;
+}
+
+interface IBondRegistry {
+    function registerBond(
+        address bondToken,
+        string memory isin,
+        string memory name,
+        string memory symbol,
+        address issuer,
+        address custodian,
+        string memory metadata
+    ) external;
+}
+
+interface ICollateralManager {
+    function registerBond(
+        address bondToken,
+        address custodian,
+        address priceFeed,
+        uint256 liquidationThreshold,
+        uint256 targetHealthRatio
+    ) external;
+}
+
+/**
+ * @title BondFactory
+ * @dev Factory contract for standardized bond token deployment
+ * @notice Provides a streamlined process to deploy new bond tokens with
+ * consistent configuration and automatic registration with other system contracts
+ */
+contract BondFactory is AccessControl, Pausable {
+
+    using Clones for address;
+
+    bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    struct BondTemplate {
+        uint256 templateId;
+        string templateName;
+        address implementation;         // Bond token implementation address
+        BondType bondType;
+        bool isActive;
+        uint256 createdAt;
+        bytes defaultConfig;            // Default configuration parameters
+    }
+
+    struct DeploymentRequest {
+        uint256 requestId;
+        address requester;
+        uint256 templateId;
+        BondParameters params;
+        DeploymentStatus status;
+        address deployedBond;
+        uint256 requestedAt;
+        uint256 deployedAt;
+        string rejectionReason;
+    }
+
+    struct BondParameters {
+        string name;
+        string symbol;
+        uint8 decimals;
+        string isin;
+        string cusip;
+        uint256 faceValue;
+        uint256 couponRate;            // In basis points
+        uint256 issueDate;
+        uint256 maturityDate;
+        uint256 frequency;             // Coupon frequency
+        address issuer;
+        address custodian;
+        address identityRegistry;
+        address complianceModule;
+        address priceFeed;
+        string documentHash;           // IPFS hash
+        string jurisdiction;
+        uint256 minInvestment;
+        uint256 maxInvestment;
+        bool requiresAccreditation;
+    }
+
+    enum BondType {
+        GOVERNMENT,
+        CORPORATE,
+        MUNICIPAL,
+        AGENCY,
+        SUPRANATIONAL,
+        COVERED,
+        CONVERTIBLE
+    }
+
+    enum DeploymentStatus {
+        PENDING,
+        APPROVED,
+        DEPLOYED,
+        REJECTED,
+        CANCELLED
+    }
+
+    // State variables
+    uint256 public nextTemplateId;
+    uint256 public nextRequestId;
+
+    mapping(uint256 => BondTemplate) public templates;
+    mapping(uint256 => DeploymentRequest) public deploymentRequests;
+    mapping(address => uint256[]) public issuerRequests;
+    mapping(address => bool) public isDeployedBond;
+    mapping(string => address) public isinToBond;
+
+    address[] public allDeployedBonds;
+
+    // External contract addresses
+    address public bondRegistry;
+    address public collateralManager;
+    address public complianceEngine;
+
+    // Configuration
+    uint256 public deploymentFee;
+    address public feeCollector;
+    uint256 public minMaturityPeriod = 30 days;
+    uint256 public maxMaturityPeriod = 50 * 365 days; // 50 years
+
+    // Statistics
+    uint256 public totalBondsDeployed;
+    uint256 public totalDeploymentFees;
+
+    // Events
+    event TemplateAdded(
+        uint256 indexed templateId,
+        string templateName,
+        address implementation,
+        BondType bondType
+    );
+    event TemplateUpdated(uint256 indexed templateId);
+    event DeploymentRequested(
+        uint256 indexed requestId,
+        address indexed requester,
+        uint256 indexed templateId
+    );
+    event DeploymentApproved(uint256 indexed requestId);
+    event BondDeployed(
+        uint256 indexed requestId,
+        address indexed bondToken,
+        address indexed issuer,
+        string isin
+    );
+    event DeploymentRejected(uint256 indexed requestId, string reason);
+    event DeploymentCancelled(uint256 indexed requestId);
+
+    constructor(
+        address _bondRegistry,
+        address _collateralManager,
+        address _complianceEngine,
+        address _feeCollector
+    ) {
+        require(_bondRegistry != address(0), "Invalid registry");
+        require(_collateralManager != address(0), "Invalid collateral manager");
+        require(_complianceEngine != address(0), "Invalid compliance engine");
+        require(_feeCollector != address(0), "Invalid fee collector");
+
+        bondRegistry = _bondRegistry;
+        collateralManager = _collateralManager;
+        complianceEngine = _complianceEngine;
+        feeCollector = _feeCollector;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+    }
+
+    /**
+     * @dev Add bond template
+     */
+    function addTemplate(
+        string memory templateName,
+        address implementation,
+        BondType bondType,
+        bytes memory defaultConfig
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) returns (uint256) {
+        require(implementation != address(0), "Invalid implementation");
+
+        uint256 templateId = nextTemplateId++;
+
+        templates[templateId] = BondTemplate({
+            templateId: templateId,
+            templateName: templateName,
+            implementation: implementation,
+            bondType: bondType,
+            isActive: true,
+            createdAt: block.timestamp,
+            defaultConfig: defaultConfig
+        });
+
+        emit TemplateAdded(templateId, templateName, implementation, bondType);
+
+        return templateId;
+    }
+
+    /**
+     * @dev Update template status
+     */
+    function updateTemplateStatus(uint256 templateId, bool isActive)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(templates[templateId].implementation != address(0), "Template not found");
+        templates[templateId].isActive = isActive;
+        emit TemplateUpdated(templateId);
+    }
+
+    /**
+     * @dev Request bond deployment
+     */
+    function requestDeployment(
+        uint256 templateId,
+        BondParameters memory params
+    ) external payable whenNotPaused returns (uint256) {
+        require(templates[templateId].isActive, "Template not active");
+        require(msg.value >= deploymentFee, "Insufficient fee");
+        require(
+            hasRole(ISSUER_ROLE, msg.sender) || hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
+            "Not authorized"
+        );
+
+        // Validate parameters
+        _validateBondParameters(params);
+
+        // Check ISIN uniqueness
+        require(isinToBond[params.isin] == address(0), "ISIN already exists");
+
+        uint256 requestId = nextRequestId++;
+
+        deploymentRequests[requestId] = DeploymentRequest({
+            requestId: requestId,
+            requester: msg.sender,
+            templateId: templateId,
+            params: params,
+            status: DeploymentStatus.PENDING,
+            deployedBond: address(0),
+            requestedAt: block.timestamp,
+            deployedAt: 0,
+            rejectionReason: ""
+        });
+
+        issuerRequests[msg.sender].push(requestId);
+
+        // Collect fee
+        totalDeploymentFees += msg.value;
+        (bool success, ) = feeCollector.call{value: msg.value}("");
+        require(success, "Fee transfer failed");
+
+        emit DeploymentRequested(requestId, msg.sender, templateId);
+
+        return requestId;
+    }
+
+    /**
+     * @dev Approve and deploy bond (operator only)
+     */
+    function approveAndDeploy(uint256 requestId)
+        external
+        onlyRole(OPERATOR_ROLE)
+        whenNotPaused
+        returns (address)
+    {
+        DeploymentRequest storage request = deploymentRequests[requestId];
+
+        require(request.status == DeploymentStatus.PENDING, "Invalid status");
+        require(templates[request.templateId].isActive, "Template not active");
+
+        // Mark as approved
+        request.status = DeploymentStatus.APPROVED;
+        emit DeploymentApproved(requestId);
+
+        // Deploy bond token
+        address bondToken = _deployBond(requestId);
+
+        // Update request
+        request.deployedBond = bondToken;
+        request.status = DeploymentStatus.DEPLOYED;
+        request.deployedAt = block.timestamp;
+
+        // Track deployment
+        allDeployedBonds.push(bondToken);
+        isDeployedBond[bondToken] = true;
+        isinToBond[request.params.isin] = bondToken;
+        totalBondsDeployed++;
+
+        emit BondDeployed(
+            requestId,
+            bondToken,
+            request.params.issuer,
+            request.params.isin
+        );
+
+        return bondToken;
+    }
+
+    /**
+     * @dev Internal function to deploy bond
+     */
+    function _deployBond(uint256 requestId) internal returns (address) {
+        DeploymentRequest storage request = deploymentRequests[requestId];
+        BondTemplate memory template = templates[request.templateId];
+        BondParameters memory params = request.params;
+
+        // Clone bond token implementation
+        address bondToken = template.implementation.clone();
+
+        // Encode bond metadata
+        bytes memory metadata = abi.encode(
+            params.isin,
+            params.cusip,
+            params.faceValue,
+            params.couponRate,
+            params.issueDate,
+            params.maturityDate,
+            params.frequency,
+            params.issuer,
+            uint8(template.bondType),
+            "",  // rating - to be set later
+            params.jurisdiction,
+            params.documentHash
+        );
+
+        // Initialize bond token
+        IBondToken(bondToken).initialize(
+            params.identityRegistry,
+            params.complianceModule,
+            params.name,
+            params.symbol,
+            params.decimals,
+            metadata
+        );
+
+        // Register with BondRegistry
+        IBondRegistry(bondRegistry).registerBond(
+            bondToken,
+            params.isin,
+            params.name,
+            params.symbol,
+            params.issuer,
+            params.custodian,
+            params.documentHash
+        );
+
+        // Register with CollateralManager
+        ICollateralManager(collateralManager).registerBond(
+            bondToken,
+            params.custodian,
+            params.priceFeed,
+            9500,  // 95% liquidation threshold
+            10500  // 105% target health ratio
+        );
+
+        return bondToken;
+    }
+
+    /**
+     * @dev Reject deployment request
+     */
+    function rejectDeployment(uint256 requestId, string memory reason)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        DeploymentRequest storage request = deploymentRequests[requestId];
+
+        require(request.status == DeploymentStatus.PENDING, "Invalid status");
+
+        request.status = DeploymentStatus.REJECTED;
+        request.rejectionReason = reason;
+
+        emit DeploymentRejected(requestId, reason);
+    }
+
+    /**
+     * @dev Cancel deployment request (requester only)
+     */
+    function cancelDeployment(uint256 requestId) external {
+        DeploymentRequest storage request = deploymentRequests[requestId];
+
+        require(msg.sender == request.requester, "Not requester");
+        require(request.status == DeploymentStatus.PENDING, "Invalid status");
+
+        request.status = DeploymentStatus.CANCELLED;
+
+        emit DeploymentCancelled(requestId);
+    }
+
+    /**
+     * @dev Validate bond parameters
+     */
+    function _validateBondParameters(BondParameters memory params) internal view {
+        require(bytes(params.name).length > 0, "Invalid name");
+        require(bytes(params.symbol).length > 0, "Invalid symbol");
+        require(bytes(params.isin).length == 12, "Invalid ISIN format");
+        require(params.decimals <= 18, "Invalid decimals");
+        require(params.faceValue > 0, "Invalid face value");
+        require(params.couponRate <= 10000, "Invalid coupon rate"); // Max 100%
+        require(params.issueDate < params.maturityDate, "Invalid dates");
+        require(
+            params.maturityDate >= params.issueDate + minMaturityPeriod,
+            "Maturity too short"
+        );
+        require(
+            params.maturityDate <= params.issueDate + maxMaturityPeriod,
+            "Maturity too long"
+        );
+        require(
+            params.frequency == 1 || params.frequency == 2 || params.frequency == 4,
+            "Invalid frequency"
+        );
+        require(params.issuer != address(0), "Invalid issuer");
+        require(params.custodian != address(0), "Invalid custodian");
+        require(params.identityRegistry != address(0), "Invalid identity registry");
+        require(params.complianceModule != address(0), "Invalid compliance module");
+        require(params.priceFeed != address(0), "Invalid price feed");
+    }
+
+    /**
+     * @dev Batch deploy multiple bonds
+     */
+    function batchDeploy(uint256[] memory requestIds)
+        external
+        onlyRole(OPERATOR_ROLE)
+        returns (address[] memory)
+    {
+        address[] memory deployedBonds = new address[](requestIds.length);
+
+        for (uint256 i = 0; i < requestIds.length; i++) {
+            deployedBonds[i] = approveAndDeploy(requestIds[i]);
+        }
+
+        return deployedBonds;
+    }
+
+    /**
+     * @dev Get issuer's deployment requests
+     */
+    function getIssuerRequests(address issuer)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        return issuerRequests[issuer];
+    }
+
+    /**
+     * @dev Get all deployed bonds
+     */
+    function getAllDeployedBonds() external view returns (address[] memory) {
+        return allDeployedBonds;
+    }
+
+    /**
+     * @dev Get deployed bonds by type
+     */
+    function getBondsByType(BondType bondType)
+        external
+        view
+        returns (address[] memory)
+    {
+        uint256 count = 0;
+
+        // Count matching bonds
+        for (uint256 i = 0; i < allDeployedBonds.length; i++) {
+            address bondToken = allDeployedBonds[i];
+            // Get request that deployed this bond
+            for (uint256 j = 0; j < nextRequestId; j++) {
+                if (deploymentRequests[j].deployedBond == bondToken) {
+                    uint256 templateId = deploymentRequests[j].templateId;
+                    if (templates[templateId].bondType == bondType) {
+                        count++;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Populate array
+        address[] memory bonds = new address[](count);
+        uint256 index = 0;
+
+        for (uint256 i = 0; i < allDeployedBonds.length; i++) {
+            address bondToken = allDeployedBonds[i];
+            for (uint256 j = 0; j < nextRequestId; j++) {
+                if (deploymentRequests[j].deployedBond == bondToken) {
+                    uint256 templateId = deploymentRequests[j].templateId;
+                    if (templates[templateId].bondType == bondType) {
+                        bonds[index] = bondToken;
+                        index++;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return bonds;
+    }
+
+    /**
+     * @dev Get bond by ISIN
+     */
+    function getBondByISIN(string memory isin)
+        external
+        view
+        returns (address)
+    {
+        return isinToBond[isin];
+    }
+
+    /**
+     * @dev Get factory statistics
+     */
+    function getFactoryStats()
+        external
+        view
+        returns (
+            uint256 _totalBondsDeployed,
+            uint256 _totalDeploymentFees,
+            uint256 _pendingRequests,
+            uint256 _totalTemplates
+        )
+    {
+        uint256 pending = 0;
+        for (uint256 i = 0; i < nextRequestId; i++) {
+            if (deploymentRequests[i].status == DeploymentStatus.PENDING) {
+                pending++;
+            }
+        }
+
+        return (
+            totalBondsDeployed,
+            totalDeploymentFees,
+            pending,
+            nextTemplateId
+        );
+    }
+
+    /**
+     * @dev Update external contract addresses
+     */
+    function updateExternalContracts(
+        address _bondRegistry,
+        address _collateralManager,
+        address _complianceEngine
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_bondRegistry != address(0), "Invalid registry");
+        require(_collateralManager != address(0), "Invalid collateral manager");
+        require(_complianceEngine != address(0), "Invalid compliance engine");
+
+        bondRegistry = _bondRegistry;
+        collateralManager = _collateralManager;
+        complianceEngine = _complianceEngine;
+    }
+
+    /**
+     * @dev Update deployment fee
+     */
+    function updateDeploymentFee(uint256 newFee)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        deploymentFee = newFee;
+    }
+
+    /**
+     * @dev Update fee collector
+     */
+    function updateFeeCollector(address newCollector)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(newCollector != address(0), "Invalid collector");
+        feeCollector = newCollector;
+    }
+
+    /**
+     * @dev Update maturity period limits
+     */
+    function updateMaturityLimits(uint256 minPeriod, uint256 maxPeriod)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(minPeriod < maxPeriod, "Invalid limits");
+        minMaturityPeriod = minPeriod;
+        maxMaturityPeriod = maxPeriod;
+    }
+
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @dev Receive function to accept ETH
+     */
+    receive() external payable {}
+}

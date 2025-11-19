@@ -1,0 +1,37 @@
+[
+  {
+    "content": "Plan backend API architecture with MCP",
+    "status": "completed",
+    "activeForm": "Planning backend architecture"
+  },
+  {
+    "content": "Set up backend project structure",
+    "status": "completed",
+    "activeForm": "Setting up project structure"
+  },
+  {
+    "content": "Implement MCP server for blockchain integration",
+    "status": "completed",
+    "activeForm": "Implementing MCP server"
+  },
+  {
+    "content": "Create API endpoints for contract interactions",
+    "status": "in_progress",
+    "activeForm": "Creating API endpoints"
+  },
+  {
+    "content": "Create remaining controllers (bailouts, DAO, staking, analytics)",
+    "status": "pending",
+    "activeForm": "Creating controllers"
+  },
+  {
+    "content": "Set up event monitoring service",
+    "status": "pending",
+    "activeForm": "Setting up event monitoring"
+  },
+  {
+    "content": "Install dependencies and test API",
+    "status": "pending",
+    "activeForm": "Testing API"
+  }
+]

@@ -1,0 +1,271 @@
+const { ethers, upgrades } = require("hardhat");
+
+async function main() {
+  console.log("🚀 BANCAFI COMPLETE SYSTEM DEPLOYMENT\n");
+  console.log("=".repeat(80));
+
+  const [deployer] = await ethers.getSigners();
+  console.log("Deployer:", deployer.address);
+  console.log("Balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH\n");
+
+  const addresses = {};
+
+  // ========== CORE CONTRACTS ==========
+  console.log("\n📦 DEPLOYING CORE CONTRACTS");
+  console.log("=".repeat(80));
+
+  // 1. Governance Token
+  console.log("\n1️⃣ Deploying Governance Token...");
+  const GovernanceToken = await ethers.getContractFactory("BancafiGovernanceToken");
+  const governanceToken = await upgrades.deployProxy(
+    GovernanceToken,
+    ["Bancafi Governance Token", "BGT", ethers.parseEther("2000000"), ethers.parseEther("2000000"), deployer.address],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await governanceToken.waitForDeployment();
+  addresses.governanceToken = await governanceToken.getAddress();
+  console.log("✅ Governance Token:", addresses.governanceToken);
+
+  // 2. Timelock
+  console.log("\n2️⃣ Deploying Timelock...");
+  const Timelock = await ethers.getContractFactory("BancafiTimelock");
+  const timelock = await Timelock.deploy(
+    2 * 24 * 60 * 60,
+    [deployer.address],
+    [deployer.address],
+    deployer.address
+  );
+  await timelock.waitForDeployment();
+  addresses.timelock = await timelock.getAddress();
+  console.log("✅ Timelock:", addresses.timelock);
+
+  // 3. DAO
+  console.log("\n3️⃣ Deploying DAO...");
+  const DAO = await ethers.getContractFactory("BancafiDAO");
+  const dao = await upgrades.deployProxy(
+    DAO,
+    [addresses.governanceToken, addresses.timelock, 1, 50400, ethers.parseEther("1000"), 4],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await dao.waitForDeployment();
+  addresses.dao = await dao.getAddress();
+  console.log("✅ DAO:", addresses.dao);
+
+  // 4. Asset Token
+  console.log("\n4️⃣ Deploying Asset Token...");
+  const AssetToken = await ethers.getContractFactory("BancafiAssetToken");
+  const assetToken = await upgrades.deployProxy(
+    AssetToken,
+    ["Bancafi Real World Assets", "BRWA"],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await assetToken.waitForDeployment();
+  addresses.assetToken = await assetToken.getAddress();
+  console.log("✅ Asset Token:", addresses.assetToken);
+
+  // 5. Bailout
+  console.log("\n5️⃣ Deploying Bailout...");
+  const Bailout = await ethers.getContractFactory("BancafiBailout");
+  const bailout = await upgrades.deployProxy(
+    Bailout,
+    [ethers.parseEther("10000000"), 15000],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await bailout.waitForDeployment();
+  addresses.bailout = await bailout.getAddress();
+  console.log("✅ Bailout:", addresses.bailout);
+
+  // 6. Rental Income
+  console.log("\n6️⃣ Deploying Rental Income...");
+  const RentalIncome = await ethers.getContractFactory("BancafiRentalIncome");
+  const rentalIncome = await upgrades.deployProxy(
+    RentalIncome,
+    [addresses.assetToken],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await rentalIncome.waitForDeployment();
+  addresses.rentalIncome = await rentalIncome.getAddress();
+  console.log("✅ Rental Income:", addresses.rentalIncome);
+
+  // 7. Institutional
+  console.log("\n7️⃣ Deploying Institutional...");
+  const Institutional = await ethers.getContractFactory("BancafiInstitutional");
+  const institutional = await upgrades.deployProxy(
+    Institutional,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await institutional.waitForDeployment();
+  addresses.institutional = await institutional.getAddress();
+  console.log("✅ Institutional:", addresses.institutional);
+
+  // ========== NEW ADVANCED CONTRACTS ==========
+  console.log("\n\n📦 DEPLOYING ADVANCED CONTRACTS");
+  console.log("=".repeat(80));
+
+  // 8. KYC
+  console.log("\n8️⃣ Deploying KYC...");
+  const KYC = await ethers.getContractFactory("BancafiKYC");
+  const kyc = await upgrades.deployProxy(
+    KYC,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await kyc.waitForDeployment();
+  addresses.kyc = await kyc.getAddress();
+  console.log("✅ KYC:", addresses.kyc);
+
+  // 9. Marketplace
+  console.log("\n9️⃣ Deploying Marketplace...");
+  const Marketplace = await ethers.getContractFactory("BancafiMarketplace");
+  const marketplace = await upgrades.deployProxy(
+    Marketplace,
+    [addresses.assetToken],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await marketplace.waitForDeployment();
+  addresses.marketplace = await marketplace.getAddress();
+  console.log("✅ Marketplace:", addresses.marketplace);
+
+  // 10. Liquidity Pool
+  console.log("\n🔟 Deploying Liquidity Pool...");
+  const LiquidityPool = await ethers.getContractFactory("BancafiLiquidityPool");
+  const liquidityPool = await upgrades.deployProxy(
+    LiquidityPool,
+    [addresses.assetToken],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await liquidityPool.waitForDeployment();
+  addresses.liquidityPool = await liquidityPool.getAddress();
+  console.log("✅ Liquidity Pool:", addresses.liquidityPool);
+
+  // 11. Oracle
+  console.log("\n1️⃣1️⃣ Deploying Oracle (Chainlink)...");
+  const Oracle = await ethers.getContractFactory("BancafiOracle");
+  const oracle = await upgrades.deployProxy(
+    Oracle,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await oracle.waitForDeployment();
+  addresses.oracle = await oracle.getAddress();
+  console.log("✅ Oracle:", addresses.oracle);
+
+  // 12. Staking
+  console.log("\n1️⃣2️⃣ Deploying Staking...");
+  const Staking = await ethers.getContractFactory("BancafiStaking");
+  const staking = await upgrades.deployProxy(
+    Staking,
+    [addresses.governanceToken, addresses.governanceToken, ethers.parseEther("1")],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await staking.waitForDeployment();
+  addresses.staking = await staking.getAddress();
+  console.log("✅ Staking:", addresses.staking);
+
+  // 13. Insurance
+  console.log("\n1️⃣3️⃣ Deploying Insurance...");
+  const Insurance = await ethers.getContractFactory("BancafiInsurance");
+  const insurance = await upgrades.deployProxy(
+    Insurance,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await insurance.waitForDeployment();
+  addresses.insurance = await insurance.getAddress();
+  console.log("✅ Insurance:", addresses.insurance);
+
+  // 14. Vesting
+  console.log("\n1️⃣4️⃣ Deploying Vesting...");
+  const Vesting = await ethers.getContractFactory("BancafiVesting");
+  const vesting = await upgrades.deployProxy(
+    Vesting,
+    [addresses.governanceToken],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await vesting.waitForDeployment();
+  addresses.vesting = await vesting.getAddress();
+  console.log("✅ Vesting:", addresses.vesting);
+
+  // 15. Treasury
+  console.log("\n1️⃣5️⃣ Deploying Treasury...");
+  const Treasury = await ethers.getContractFactory("BancafiTreasury");
+  const treasury = await upgrades.deployProxy(
+    Treasury,
+    [],
+    { initializer: "initialize", kind: "uups" }
+  );
+  await treasury.waitForDeployment();
+  addresses.treasury = await treasury.getAddress();
+  console.log("✅ Treasury:", addresses.treasury);
+
+  // ========== CONFIGURE ROLES ==========
+  console.log("\n\n🔐 CONFIGURING ROLES & PERMISSIONS");
+  console.log("=".repeat(80));
+
+  // Grant DAO roles
+  const PROPOSER_ROLE = await timelock.PROPOSER_ROLE();
+  const EXECUTOR_ROLE = await timelock.EXECUTOR_ROLE();
+  await timelock.grantRole(PROPOSER_ROLE, addresses.dao);
+  await timelock.grantRole(EXECUTOR_ROLE, addresses.dao);
+  console.log("✅ DAO granted Timelock roles");
+
+  await bailout.grantRole(await bailout.BAILOUT_APPROVER_ROLE(), addresses.dao);
+  console.log("✅ DAO granted Bailout approver role");
+
+  await governanceToken.delegate(deployer.address);
+  console.log("✅ Deployer delegated voting power");
+
+  // Deposit treasury
+  console.log("\n💰 Depositing initial treasury funds...");
+  await bailout.depositToTreasury({ value: ethers.parseEther("1000") });
+  console.log("✅ Deposited 1000 ETH to bailout treasury");
+
+  // ========== SUMMARY ==========
+  console.log("\n\n" + "=".repeat(80));
+  console.log("🎉 COMPLETE BANCAFI SYSTEM DEPLOYED!");
+  console.log("=".repeat(80));
+
+  console.log("\n📋 CONTRACT ADDRESSES:\n");
+  console.log("CORE CONTRACTS:");
+  console.log("  1. Governance Token:", addresses.governanceToken);
+  console.log("  2. Timelock:        ", addresses.timelock);
+  console.log("  3. DAO:             ", addresses.dao);
+  console.log("  4. Asset Token:     ", addresses.assetToken);
+  console.log("  5. Bailout:         ", addresses.bailout);
+  console.log("  6. Rental Income:   ", addresses.rentalIncome);
+  console.log("  7. Institutional:   ", addresses.institutional);
+
+  console.log("\nADVANCED CONTRACTS:");
+  console.log("  8. KYC:             ", addresses.kyc);
+  console.log("  9. Marketplace:     ", addresses.marketplace);
+  console.log(" 10. Liquidity Pool:  ", addresses.liquidityPool);
+  console.log(" 11. Oracle:          ", addresses.oracle);
+  console.log(" 12. Staking:         ", addresses.staking);
+  console.log(" 13. Insurance:       ", addresses.insurance);
+  console.log(" 14. Vesting:         ", addresses.vesting);
+  console.log(" 15. Treasury:        ", addresses.treasury);
+
+  console.log("\n" + "=".repeat(80));
+
+  // Save deployment
+  const fs = require("fs");
+  fs.writeFileSync(
+    "deployment-complete.json",
+    JSON.stringify({
+      network: "localhost",
+      chainId: 1337,
+      deployer: deployer.address,
+      timestamp: new Date().toISOString(),
+      contracts: addresses
+    }, null, 2)
+  );
+  console.log("\n✅ Deployment info saved to deployment-complete.json\n");
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
