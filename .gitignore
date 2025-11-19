@@ -1,0 +1,95 @@
+# OS and System Files
+.VirtualBox/
+AppData/
+Contacts/
+Documents/
+Downloads/
+Favorites/
+IntelGraphicsProfiles/
+Links/
+OneDrive/
+Searches/
+Temp/
+Saved Games/
+NTUSER.DAT*
+ntuser.dat*
+.dotnet/
+.cache/
+.local/
+.vscode/
+.ssh/
+.gnupg/
+
+# Development Tools
+.bito/
+.bitowingman/
+.bun/
+.chocolatey/
+.claude-server-commander/
+.gk/
+.opencode/
+.platformio/
+.qodo/
+.redhat/
+vscode-remote-wsl/
+
+# Node
+node_modules/
+package-lock.json
+
+# Hardhat
+artifacts/
+cache/
+typechain/
+typechain-types/
+
+# Misc
+*.log
+.DS_Store
+*.swp
+*.swo
+*~
+.env
+.env.local
+
+# SSH Keys
+*.ssh
+*.ssh.pub
+id_rsa
+id_rsa.pub
+blow.ssh
+blow.ssh.pub
+document
+document.pub
+home
+home.pub
+noook
+
+# Temporary files
+0
+600
+amount
+compilation-report.txt
+compile_output.txt
+gas-report.txt
+*.tar.gz
+
+# User-specific files (keep documentation)
+# These are actual user files, not project files
+.gitconfig
+Untitled-*.js
+script.js
+styles.css
+index.html
+google.html
+bwmp-types.ts
+*.txt
+remappings.txt
+
+# Problematic filenames
+Auction)
+Loan)
+ssh-keygen -t rsa
+ssh-keygen -t rsa.pub
+casino*
+Userstvibancafi-contracts

@@ -1,0 +1,22 @@
+{
+  "name": "bttb-contracts",
+  "version": "1.0.0",
+  "description": "Bancafi Transitional Token Bonds - Smart Contracts",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "clean": "hardhat clean"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.1.0",
+    "@openzeppelin/contracts-upgradeable": "^5.1.0",
+    "@chainlink/contracts": "^1.1.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^3.0.0",
+    "hardhat": "^2.19.0"
+  },
+  "keywords": ["blockchain", "bonds", "tokenization", "solidity"],
+  "author": "BTTB Team",
+  "license": "MIT"
+}
