@@ -37,6 +37,8 @@ vscode-remote-wsl/
 .claude/config.json
 .claude/.credentials.json
 .claude/debug/
+.claude/mcp.json
+.mcp.json
 
 # Node
 node_modules/
